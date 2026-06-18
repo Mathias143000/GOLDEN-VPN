@@ -13,9 +13,11 @@ CERT_DIR="/etc/letsencrypt/live/${DOMAIN:-}"
 VLESS_XHTTP_SOCKET="/dev/shm/xray-vless-xhttp.sock"
 RESUME_INSTALL_DIR="/root/vpn-stack-resume"
 RESUME_INSTALL_SCRIPT="${RESUME_INSTALL_DIR}/install-vpn-stack.sh"
-RESUME_INSTALL_ENV="${RESUME_INSTALL_DIR}/env"
+RESUME_INSTALL_ENV_DIR="/etc/golden-vpn-installer"
+RESUME_INSTALL_ENV="${RESUME_INSTALL_ENV_DIR}/install.env"
 RESUME_INSTALL_RUNNER="/usr/local/sbin/vpn-stack-resume-install.sh"
-RESUME_INSTALL_UNIT="/etc/systemd/system/vpn-stack-resume-install.service"
+RESUME_INSTALL_SERVICE="vpn-stack-resume-install.service"
+RESUME_INSTALL_UNIT="/etc/systemd/system/${RESUME_INSTALL_SERVICE}"
 RESUME_INSTALL_LOG="/var/log/vpn-stack-resume-install.log"
 PUBLIC_IPV4=""
 EXT_IFACE=""
@@ -148,15 +150,34 @@ installer_self_path() {
 }
 
 write_resume_env() {
+  install -d -m 0700 "${RESUME_INSTALL_ENV_DIR}"
   {
-    printf 'export DOMAIN=%q\n' "${DOMAIN}"
-    printf 'export EMAIL=%q\n' "${EMAIL}"
-    printf 'export CF_Token=%q\n' "${CF_Token}"
-    [[ -n "${CF_Zone_ID:-}" ]] && printf 'export CF_Zone_ID=%q\n' "${CF_Zone_ID}"
-    [[ -n "${CF_Account_ID:-}" ]] && printf 'export CF_Account_ID=%q\n' "${CF_Account_ID}"
-    printf 'export VPN_STACK_RESUMED=1\n'
+    printf 'DOMAIN=%q\n' "${DOMAIN}"
+    printf 'EMAIL=%q\n' "${EMAIL}"
+    printf 'CF_Token=%q\n' "${CF_Token}"
+    [[ -n "${CF_Zone_ID:-}" ]] && printf 'CF_Zone_ID=%q\n' "${CF_Zone_ID}"
+    [[ -n "${CF_Account_ID:-}" ]] && printf 'CF_Account_ID=%q\n' "${CF_Account_ID}"
+    printf 'VPN_STACK_RESUMED=1\n'
+    printf 'DEBIAN_FRONTEND=noninteractive\n'
   } >"${RESUME_INSTALL_ENV}"
   chmod 0600 "${RESUME_INSTALL_ENV}"
+}
+
+cleanup_resume_install_state() {
+  local had_state=0
+  for path in "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}"; do
+    [[ -e "${path}" ]] && had_state=1
+  done
+
+  systemctl disable "${RESUME_INSTALL_SERVICE}" >/dev/null 2>&1 || true
+  rm -f "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}"
+  rmdir "${RESUME_INSTALL_DIR}" 2>/dev/null || true
+  rmdir "${RESUME_INSTALL_ENV_DIR}" 2>/dev/null || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  if [[ "${had_state}" == "1" ]]; then
+    log "One-time resume state removed."
+  fi
 }
 
 schedule_resume_install_once() {
@@ -171,42 +192,54 @@ schedule_resume_install_once() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+service="${RESUME_INSTALL_SERVICE}"
 unit="${RESUME_INSTALL_UNIT}"
 runner="${RESUME_INSTALL_RUNNER}"
 env_file="${RESUME_INSTALL_ENV}"
+env_dir="${RESUME_INSTALL_ENV_DIR}"
 installer="${RESUME_INSTALL_SCRIPT}"
 resume_dir="${RESUME_INSTALL_DIR}"
 log_file="${RESUME_INSTALL_LOG}"
 
-{
-  printf '%s resume start\n' "\$(date -Is)"
-  systemctl disable vpn-stack-resume-install.service >/dev/null 2>&1 || true
-  rm -f "\${unit}"
+mkdir -p "\$(dirname "\${log_file}")"
+touch "\${log_file}"
+chmod 0600 "\${log_file}" || true
+exec > >(tee -a "\${log_file}") 2>&1
+
+printf '%s resume start\n' "\$(date -Is)"
+
+if [[ ! -r "\${env_file}" || ! -x "\${installer}" ]]; then
+  printf '%s missing resume env or installer; keeping service for diagnostics\n' "\$(date -Is)"
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+source "\${env_file}"
+set +a
+export VPN_STACK_RESUMED=1
+export DEBIAN_FRONTEND=noninteractive
+
+printf '%s resume env loaded from %s\n' "\$(date -Is)" "\${env_file}"
+
+set +e
+bash "\${installer}"
+status="\$?"
+set -e
+
+if [[ "\${status}" -eq 0 ]]; then
+  printf '%s resume install succeeded; removing one-time unit and saved env\n' "\$(date -Is)"
+  systemctl disable "\${service}" >/dev/null 2>&1 || true
+  rm -f "\${unit}" "\${env_file}" "\${installer}" "\${runner}"
+  rmdir "\${resume_dir}" 2>/dev/null || true
+  rmdir "\${env_dir}" 2>/dev/null || true
   systemctl daemon-reload >/dev/null 2>&1 || true
+else
+  printf '%s resume install failed; keeping unit/env for next boot or manual retry\n' "\$(date -Is)"
+fi
 
-  if [[ ! -r "\${env_file}" || ! -x "\${installer}" ]]; then
-    printf '%s missing resume env or installer\n' "\$(date -Is)"
-    exit 1
-  fi
-
-  # shellcheck disable=SC1090
-  source "\${env_file}"
-  rm -f "\${env_file}"
-  export VPN_STACK_RESUMED=1
-
-  set +e
-  bash "\${installer}"
-  status="\$?"
-  set -e
-
-  if [[ "\${status}" -eq 0 ]]; then
-    rm -f "\${installer}" "\${runner}"
-    rmdir "\${resume_dir}" 2>/dev/null || true
-  fi
-
-  printf '%s resume exit status=%s\n' "\$(date -Is)" "\${status}"
-  exit "\${status}"
-} >>"\${log_file}" 2>&1
+printf '%s resume exit status=%s\n' "\$(date -Is)" "\${status}"
+exit "\${status}"
 EOF
   chmod 0700 "${RESUME_INSTALL_RUNNER}"
 
@@ -216,11 +249,15 @@ Description=Resume Golden VPN installer once after reboot
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=${RESUME_INSTALL_SCRIPT}
+ConditionPathExists=${RESUME_INSTALL_ENV}
 
 [Service]
 Type=oneshot
+EnvironmentFile=${RESUME_INSTALL_ENV}
+ExecStartPre=/bin/sleep 15
 ExecStart=${RESUME_INSTALL_RUNNER}
 TimeoutStartSec=0
+RemainAfterExit=no
 
 [Install]
 WantedBy=multi-user.target
@@ -228,9 +265,11 @@ EOF
   chmod 0644 "${RESUME_INSTALL_UNIT}"
 
   systemctl daemon-reload
-  systemctl enable vpn-stack-resume-install.service
-  log "One-time resume service installed: vpn-stack-resume-install.service"
+  systemctl enable "${RESUME_INSTALL_SERVICE}"
+  log "One-time resume service installed: ${RESUME_INSTALL_SERVICE}"
+  log "Resume env saved: ${RESUME_INSTALL_ENV}"
   log "Resume log after reboot: ${RESUME_INSTALL_LOG}"
+  log "Resume journal after reboot: journalctl -u ${RESUME_INSTALL_SERVICE} -b --no-pager"
 }
 
 auto_reboot_resume_enabled() {
@@ -2026,6 +2065,7 @@ main() {
   enable_and_start_services
   wait_for_expected_listeners 90
   final_checks
+  cleanup_resume_install_state
   log "Golden VPN stack installation complete."
 }
 

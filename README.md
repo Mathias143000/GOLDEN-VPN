@@ -55,7 +55,14 @@ export VPN_STACK_AUTO_REBOOT_RESUME=1
 ./install-vpn-stack.sh
 ```
 
-If a kernel reboot is required for AmneziaWG DKMS, the interactive installer can create a one-time systemd resume unit, reboot, and continue automatically after the VPS comes back. The resume unit removes itself before running, so it does not start after later reboots.
+If a kernel reboot is required for AmneziaWG DKMS, the interactive installer can create a one-time systemd resume unit, reboot, and continue automatically after the VPS comes back. The installer saves the entered values in the systemd `EnvironmentFile` `/etc/golden-vpn-installer/install.env` with `0600` permissions, runs `/root/vpn-stack-resume/install-vpn-stack.sh` once after boot through `vpn-stack-resume-install.service`, and removes the unit, copied installer, and saved env only after the installation finishes successfully.
+
+Resume logs:
+
+```bash
+journalctl -u vpn-stack-resume-install.service -b --no-pager
+cat /var/log/vpn-stack-resume-install.log
+```
 
 ## Install With Git
 
