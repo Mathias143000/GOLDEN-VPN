@@ -28,17 +28,29 @@ apt-get install -y curl
 curl -fsSL https://raw.githubusercontent.com/Mathias143000/GOLDEN-VPN/main/install-vpn-stack.sh -o install-vpn-stack.sh
 chmod +x install-vpn-stack.sh
 
-export DOMAIN="s5.super-lemming.online"
-export EMAIL="teriomta@gmail.com"
-export CF_Token="CLOUDFLARE_DNS_TOKEN"
-
 ./install-vpn-stack.sh
 ```
 
-If the Cloudflare token cannot read the zone ID automatically, also set:
+The installer asks for:
+
+```text
+DOMAIN
+EMAIL
+CF_Token
+```
+
+`CF_Token` input is hidden. If the token cannot read the Cloudflare zone ID automatically, the installer also asks for `CF_Zone_ID`.
+
+For unattended install, export variables before running:
 
 ```bash
+export DOMAIN="s5.super-lemming.online"
+export EMAIL="teriomta@gmail.com"
+export CF_Token="CLOUDFLARE_DNS_TOKEN"
+# Optional fallback:
 export CF_Zone_ID="CLOUDFLARE_ZONE_ID"
+
+./install-vpn-stack.sh
 ```
 
 ## Install With Git
@@ -50,10 +62,6 @@ apt-get install -y git
 git clone https://github.com/Mathias143000/GOLDEN-VPN.git
 cd GOLDEN-VPN
 chmod +x install-vpn-stack.sh
-
-export DOMAIN="s5.super-lemming.online"
-export EMAIL="teriomta@gmail.com"
-export CF_Token="CLOUDFLARE_DNS_TOKEN"
 
 ./install-vpn-stack.sh
 ```

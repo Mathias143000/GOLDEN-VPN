@@ -57,11 +57,55 @@ on_error() {
 }
 trap 'on_error "$LINENO"' ERR
 
+have_tty() {
+  [[ -r /dev/tty && -w /dev/tty ]]
+}
+
+trim_value() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "${value}"
+}
+
+prompt_required_var() {
+  local var="$1"
+  local label="$2"
+  local secret="${3:-0}"
+  local value
+
+  if [[ -n "${!var:-}" ]]; then
+    return 0
+  fi
+
+  have_tty || die "${var} is empty and no interactive terminal is available. Export ${var}=... before running."
+
+  while true; do
+    if [[ "${secret}" == "1" ]]; then
+      printf '%s: ' "${label}" >/dev/tty
+      IFS= read -r -s value </dev/tty || die "Could not read ${var}."
+      printf '\n' >/dev/tty
+    else
+      printf '%s: ' "${label}" >/dev/tty
+      IFS= read -r value </dev/tty || die "Could not read ${var}."
+    fi
+
+    value="$(trim_value "${value}")"
+    if [[ -n "${value}" ]]; then
+      printf -v "${var}" '%s' "${value}"
+      export "${var}"
+      return 0
+    fi
+
+    printf '%s cannot be empty.\n' "${var}" >/dev/tty
+  done
+}
+
 require_root_and_env() {
   [[ "${EUID}" -eq 0 ]] || die "Run this script as root."
-  [[ -n "${DOMAIN:-}" ]] || die "DOMAIN is empty. Example: export DOMAIN=\"s5.example.com\""
-  [[ -n "${EMAIL:-}" ]] || die "EMAIL is empty. Example: export EMAIL=\"admin@example.com\""
-  [[ -n "${CF_Token:-}" ]] || die "CF_Token is empty. Export a Cloudflare DNS API token."
+  prompt_required_var DOMAIN "DOMAIN, without https://, example s5.example.com"
+  prompt_required_var EMAIL "EMAIL for ZeroSSL/acme.sh"
+  prompt_required_var CF_Token "Cloudflare DNS API token (hidden input)" 1
   CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 }
 
@@ -171,7 +215,10 @@ install_acme_certificate() {
   export CF_Token
   if [[ -z "${CF_Zone_ID:-}" && -z "${CF_Account_ID:-}" ]]; then
     CF_Zone_ID="$(cloudflare_zone_from_domain "${DOMAIN}" || true)"
-    [[ -n "${CF_Zone_ID}" ]] || die "Could not auto-detect Cloudflare zone. Token needs Zone:Read plus DNS:Edit, or export CF_Zone_ID."
+    if [[ -z "${CF_Zone_ID}" ]]; then
+      warn "Could not auto-detect Cloudflare zone. Token may not have Zone:Read permission."
+      prompt_required_var CF_Zone_ID "Cloudflare Zone ID"
+    fi
     export CF_Zone_ID
   fi
 
