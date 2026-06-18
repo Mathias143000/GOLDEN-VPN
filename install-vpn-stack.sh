@@ -10,6 +10,7 @@ XRAY_DIR="${STACK_DIR}/xray"
 HYSTERIA_DIR="${STACK_DIR}/hysteria"
 LOG_DIR="/var/log/vpn-stack"
 CERT_DIR="/etc/letsencrypt/live/${DOMAIN:-}"
+VLESS_XHTTP_SOCKET="/dev/shm/xray-vless-xhttp.sock"
 PUBLIC_IPV4=""
 EXT_IFACE=""
 SWAP_RESULT="not checked"
@@ -282,63 +283,62 @@ rand_hex() {
   openssl rand -hex "$1"
 }
 
-generate_xray_reality_keys() {
-  local output private public
-  output="$(/usr/local/bin/xray x25519)"
-  private="$(printf '%s\n' "${output}" | awk -F': ' '/Private key|PrivateKey|Private/{print $2; exit}')"
-  public="$(printf '%s\n' "${output}" | awk -F': ' '/Public key|PublicKey|Password/{print $2; exit}')"
-  [[ -n "${private}" && -n "${public}" ]] || die "Could not parse xray x25519 output."
-  printf '%s\n%s\n' "${private}" "${public}"
-}
-
 uri_encode() {
   python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+pick_decoy_value() {
+  local count="$#"
+  local idx
+  [[ "${count}" -gt 0 ]] || return 1
+  idx="$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')"
+  idx=$((idx % count + 1))
+  while ((idx > 1)); do
+    shift
+    idx=$((idx - 1))
+  done
+  printf '%s' "$1"
 }
 
 write_vless_link() {
   local uuid="$1"
   local name="$2"
-  local domain public_key short_id path encoded_path fragment link
+  local domain path encoded_path fragment link
   domain="$(<"${STACK_DIR}/domain.txt")"
-  public_key="$(<"${STACK_DIR}/vless-reality-public-key.txt")"
-  short_id="$(<"${STACK_DIR}/vless-reality-short-id.txt")"
-  path="$(<"${STACK_DIR}/vless-reality-path.txt")"
+  path="$(<"${STACK_DIR}/vless-xhttp-path.txt")"
   encoded_path="$(uri_encode "${path}")"
-  fragment="$(uri_encode "VLESS-REALITY-XHTTP-${name}")"
-  link="vless://${uuid}@${domain}:443?security=reality&type=xhttp&encryption=none&path=${encoded_path}&mode=stream-one&sni=www.vk.com&fp=chrome&pbk=${public_key}&sid=${short_id}&spx=%2F#${fragment}"
-  install -d -m 0700 "${KEY_DIR}/vless-reality"
-  printf '%s\n' "${link}" >"${KEY_DIR}/vless-reality/${name}.txt"
-  chmod 0600 "${KEY_DIR}/vless-reality/${name}.txt"
+  fragment="$(uri_encode "VLESS-XHTTP-TLS-${name}")"
+  link="vless://${uuid}@${domain}:443?security=tls&type=xhttp&encryption=none&path=${encoded_path}&mode=stream-one&sni=${domain}&host=${domain}&fp=chrome&alpn=h2%2Chttp%2F1.1#${fragment}"
+  install -d -m 0700 "${KEY_DIR}/vless"
+  printf '%s\n' "${link}" >"${KEY_DIR}/vless/${name}.txt"
+  chmod 0600 "${KEY_DIR}/vless/${name}.txt"
   printf '%s\n' "${link}"
 }
 
 configure_xray() {
-  log "Configuring VLESS REALITY XHTTP."
-  install -d -m 0700 "${STACK_DIR}" "${XRAY_DIR}" "${LOG_DIR}" "${KEY_DIR}/vless-reality"
+  log "Configuring VLESS XHTTP TLS backend."
+  install -d -m 0700 "${STACK_DIR}" "${XRAY_DIR}" "${LOG_DIR}" "${KEY_DIR}/vless"
   printf '%s\n' "${DOMAIN}" >"${STACK_DIR}/domain.txt"
   printf '%s\n' "${PUBLIC_IPV4}" >"${STACK_DIR}/public-ipv4.txt"
   printf '%s\n' "${EXT_IFACE}" >"${STACK_DIR}/external-interface.txt"
 
-  local uuid path short_id keys private public
+  local uuid path
   uuid="$(/usr/local/bin/xray uuid)"
   path="/$(rand_hex 8)/$(rand_hex 8)/"
-  short_id="$(openssl rand -hex 8)"
-  keys="$(generate_xray_reality_keys)"
-  private="$(printf '%s\n' "${keys}" | sed -n '1p')"
-  public="$(printf '%s\n' "${keys}" | sed -n '2p')"
 
-  printf '%s\n' "${uuid}" >"${STACK_DIR}/vless-reality-uuid.txt"
-  printf '%s\n' "${path}" >"${STACK_DIR}/vless-reality-path.txt"
-  printf '%s\n' "${private}" >"${STACK_DIR}/vless-reality-private-key.txt"
-  printf '%s\n' "${public}" >"${STACK_DIR}/vless-reality-public-key.txt"
-  printf '%s\n' "${short_id}" >"${STACK_DIR}/vless-reality-short-id.txt"
-  chmod 0600 "${STACK_DIR}"/vless-reality-*.txt
+  printf '%s\n' "${uuid}" >"${STACK_DIR}/vless-xhttp-uuid.txt"
+  printf '%s\n' "${path}" >"${STACK_DIR}/vless-xhttp-path.txt"
+  printf '%s\n' "${VLESS_XHTTP_SOCKET}" >"${STACK_DIR}/vless-xhttp-socket.txt"
+  chmod 0600 "${STACK_DIR}"/vless-xhttp-*.txt
+  rm -f "${VLESS_XHTTP_SOCKET}"
+  rm -f "${STACK_DIR}"/vless-reality-*.txt
+  systemctl disable --now xray-vless-reality-xhttp.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/xray-vless-reality-xhttp.service
 
   jq -n \
     --arg uuid "${uuid}" \
     --arg path "${path}" \
-    --arg private "${private}" \
-    --arg sid "${short_id}" \
+    --arg listen "${VLESS_XHTTP_SOCKET},0666" \
     '{
       log: {
         loglevel: "warning",
@@ -347,30 +347,20 @@ configure_xray() {
       },
       inbounds: [
         {
-          tag: "vless-reality-xhttp",
-          listen: "127.0.0.1",
-          port: 10443,
+          tag: "vless-xhttp-tls",
+          listen: $listen,
           protocol: "vless",
           settings: {
             clients: [
-              { id: $uuid, email: "main-reality" }
+              { id: $uuid, email: "main-vless" }
             ],
             decryption: "none"
           },
           streamSettings: {
             network: "xhttp",
-            security: "reality",
             xhttpSettings: {
               path: $path,
               mode: "stream-one"
-            },
-            realitySettings: {
-              show: false,
-              target: "www.vk.com:443",
-              xver: 0,
-              serverNames: ["www.vk.com", "vk.com"],
-              privateKey: $private,
-              shortIds: [$sid]
             }
           },
           sniffing: {
@@ -386,118 +376,225 @@ configure_xray() {
     }' >"${XRAY_DIR}/config.json"
   chmod 0600 "${XRAY_DIR}/config.json"
 
-  cat >/etc/systemd/system/xray-vless-reality-xhttp.service <<EOF
+  cat >/etc/systemd/system/xray-vless-xhttp-tls.service <<EOF
 [Unit]
-Description=Xray VLESS REALITY XHTTP backend
+Description=Xray VLESS XHTTP TLS backend
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
+ExecStartPre=/usr/bin/rm -f ${VLESS_XHTTP_SOCKET}
 ExecStart=/usr/local/bin/xray run -config ${XRAY_DIR}/config.json
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=1048576
+RuntimeDirectory=xray-vless-xhttp
+RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  chmod 0644 /etc/systemd/system/xray-vless-reality-xhttp.service
+  chmod 0644 /etc/systemd/system/xray-vless-xhttp-tls.service
 
   /usr/local/bin/xray run -test -config "${XRAY_DIR}/config.json"
-  write_vless_link "${uuid}" "main-reality" >/dev/null
+  write_vless_link "${uuid}" "main-vless" >/dev/null
 }
 
 configure_nginx() {
-  log "Configuring nginx stream router and local decoy HTTPS backend."
-  install -d -m 0755 /var/www/decoy /etc/nginx/stream-conf.d /etc/nginx/sites-available /etc/nginx/sites-enabled
+  log "Configuring nginx HTTPS decoy and VLESS XHTTP TLS path."
+  install -d -m 0755 /var/www/decoy/assets /etc/nginx/stream-conf.d /etc/nginx/sites-available /etc/nginx/sites-enabled
 
-  cat >/var/www/decoy/index.html <<'EOF'
+  local vless_path brand tagline focus region primary accent bg surface build_id status_note docs_title
+  vless_path="$(<"${STACK_DIR}/vless-xhttp-path.txt")"
+  brand="$(pick_decoy_value "Netwatch" "Pulsegrid" "Uplink Labs" "Signal Harbor" "Lattice Monitor" "Northstar Systems")"
+  tagline="$(pick_decoy_value "Lightweight network availability monitoring." "Practical uptime checks for distributed teams." "Quiet visibility for service availability." "Simple status signals for operations teams.")"
+  focus="$(pick_decoy_value "availability checks" "edge route checks" "latency snapshots" "incident notes" "maintenance windows")"
+  region="$(pick_decoy_value "EU-West" "North Atlantic" "Central Europe" "Edge Group 7" "Global Relay")"
+  primary="$(pick_decoy_value "#0f766e" "#2563eb" "#334155" "#047857" "#4f46e5")"
+  accent="$(pick_decoy_value "#f59e0b" "#06b6d4" "#22c55e" "#f97316" "#64748b")"
+  bg="$(pick_decoy_value "#f8fafc" "#f5f7fb" "#f7f7f2" "#f4f7f5")"
+  surface="$(pick_decoy_value "#ffffff" "#fbfdff" "#fffdf7")"
+  build_id="$(rand_hex 4)"
+  status_note="$(pick_decoy_value "All public endpoints are responding normally." "No active maintenance windows are scheduled." "Regional checks are within normal operating range." "Availability sampling is operating normally.")"
+  docs_title="$(pick_decoy_value "Operator notes" "Check catalog" "Availability guide" "Reference notes")"
+
+  printf '%s\n' "${brand}" >"${STACK_DIR}/decoy-brand.txt"
+  printf '%s\n' "${build_id}" >"${STACK_DIR}/decoy-build-id.txt"
+  chmod 0600 "${STACK_DIR}/decoy-brand.txt" "${STACK_DIR}/decoy-build-id.txt"
+
+  cat >/var/www/decoy/assets/style.css <<EOF
+:root {
+  --primary: ${primary};
+  --accent: ${accent};
+  --bg: ${bg};
+  --surface: ${surface};
+  --text: #172033;
+  --muted: #607086;
+  --line: #d9e1ea;
+}
+
+* { box-sizing: border-box; }
+html { min-height: 100%; background: var(--bg); }
+body { margin: 0; min-height: 100vh; font-family: Arial, Helvetica, sans-serif; color: var(--text); background: var(--bg); }
+a { color: inherit; text-decoration: none; }
+.site-header { border-bottom: 1px solid var(--line); background: rgba(255,255,255,.82); }
+.wrap { width: min(1040px, calc(100% - 40px)); margin: 0 auto; }
+.nav { display: flex; align-items: center; justify-content: space-between; min-height: 72px; gap: 24px; }
+.brand { display: flex; align-items: center; gap: 12px; font-weight: 700; }
+.mark { width: 34px; height: 34px; border-radius: 8px; background: linear-gradient(135deg, var(--primary), var(--accent)); }
+.nav-links { display: flex; align-items: center; gap: 18px; color: var(--muted); font-size: 14px; }
+.hero { padding: 72px 0 50px; }
+.hero-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr); gap: 42px; align-items: center; }
+.eyebrow { color: var(--primary); font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+h1 { margin: 14px 0 18px; font-size: clamp(36px, 7vw, 62px); line-height: 1.02; letter-spacing: 0; }
+.lead { max-width: 640px; color: var(--muted); font-size: 18px; line-height: 1.7; }
+.panel { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: 24px; }
+.metric { display: grid; grid-template-columns: 1fr auto; gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.metric:last-child { border-bottom: 0; }
+.metric span { color: var(--muted); }
+.ok { color: var(--primary); font-weight: 700; }
+.section { padding: 42px 0; }
+.cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+.card { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: 22px; }
+.card h2, .card h3 { margin: 0 0 10px; }
+.card p, .body-copy { color: var(--muted); line-height: 1.65; }
+.footer { border-top: 1px solid var(--line); color: var(--muted); padding: 28px 0; font-size: 14px; }
+@media (max-width: 760px) {
+  .nav { align-items: flex-start; flex-direction: column; padding: 18px 0; }
+  .nav-links { flex-wrap: wrap; }
+  .hero { padding-top: 44px; }
+  .hero-grid, .cards { grid-template-columns: 1fr; }
+}
+EOF
+
+  cat >/var/www/decoy/index.html <<EOF
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Service status</title>
-  <style>
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: Arial, sans-serif; color: #1f2937; background: #f8fafc; }
-    main { width: min(560px, calc(100% - 40px)); }
-    h1 { font-size: 28px; margin: 0 0 12px; }
-    p { margin: 8px 0; line-height: 1.5; }
-  </style>
+  <title>${brand} - Availability Monitoring</title>
+  <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
-  <main>
-    <h1>Service status</h1>
-    <p>This service is online.</p>
-    <p>Maintenance and availability monitoring endpoint.</p>
+  <header class="site-header">
+    <div class="wrap nav">
+      <a class="brand" href="/"><span class="mark"></span><span>${brand}</span></a>
+      <nav class="nav-links"><a href="/status">Status</a><a href="/docs">Docs</a><a href="/privacy">Privacy</a></nav>
+    </div>
+  </header>
+  <main class="hero">
+    <div class="wrap hero-grid">
+      <section>
+        <div class="eyebrow">${region} / build ${build_id}</div>
+        <h1>${tagline}</h1>
+        <p class="lead">${brand} provides a compact public surface for ${focus}, maintenance messages, and simple service availability snapshots.</p>
+      </section>
+      <aside class="panel">
+        <div class="metric"><span>Public endpoint</span><strong class="ok">Online</strong></div>
+        <div class="metric"><span>Sampling window</span><strong>60 sec</strong></div>
+        <div class="metric"><span>Signal region</span><strong>${region}</strong></div>
+        <div class="metric"><span>Incident feed</span><strong class="ok">Clear</strong></div>
+      </aside>
+    </div>
   </main>
+  <section class="section"><div class="wrap cards"><article class="card"><h3>Endpoint checks</h3><p>Small availability checks help teams confirm that public service surfaces are reachable.</p></article><article class="card"><h3>Maintenance notes</h3><p>Planned work and operational windows are recorded as concise status updates.</p></article><article class="card"><h3>Route samples</h3><p>Regional signal snapshots make routine network behavior easier to compare over time.</p></article></div></section>
+  <footer class="footer"><div class="wrap">(c) 2026 ${brand}. Operational reference ${build_id}.</div></footer>
 </body>
 </html>
 EOF
-  chmod 0644 /var/www/decoy/index.html
+
+  cat >/var/www/decoy/status.html <<EOF
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Status - ${brand}</title><link rel="stylesheet" href="/assets/style.css"></head>
+<body>
+  <header class="site-header"><div class="wrap nav"><a class="brand" href="/"><span class="mark"></span><span>${brand}</span></a><nav class="nav-links"><a href="/status">Status</a><a href="/docs">Docs</a><a href="/privacy">Privacy</a></nav></div></header>
+  <main class="section"><div class="wrap"><div class="eyebrow">Status</div><h1>Service status</h1><p class="lead">${status_note}</p><div class="panel"><div class="metric"><span>HTTPS surface</span><strong class="ok">Operational</strong></div><div class="metric"><span>Monitoring schedule</span><strong class="ok">Operational</strong></div><div class="metric"><span>Incident queue</span><strong>Empty</strong></div></div></div></main>
+  <footer class="footer"><div class="wrap">Last generated reference ${build_id}.</div></footer>
+</body>
+</html>
+EOF
+
+  cat >/var/www/decoy/docs.html <<EOF
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Docs - ${brand}</title><link rel="stylesheet" href="/assets/style.css"></head>
+<body>
+  <header class="site-header"><div class="wrap nav"><a class="brand" href="/"><span class="mark"></span><span>${brand}</span></a><nav class="nav-links"><a href="/status">Status</a><a href="/docs">Docs</a><a href="/privacy">Privacy</a></nav></div></header>
+  <main class="section"><div class="wrap"><div class="eyebrow">${docs_title}</div><h1>Availability reference</h1><p class="body-copy">This static reference describes the public status surface, sampling cadence, and maintenance message format used by ${brand}. It does not collect visitor input and does not require an account.</p><div class="cards"><article class="card"><h3>Checks</h3><p>Endpoint checks are lightweight and intended for availability confirmation.</p></article><article class="card"><h3>Updates</h3><p>Maintenance updates are short, timestamped, and human reviewed.</p></article><article class="card"><h3>Retention</h3><p>Public operational notes are kept compact and rotated periodically.</p></article></div></div></main>
+  <footer class="footer"><div class="wrap">Reference ${build_id}.</div></footer>
+</body>
+</html>
+EOF
+
+  cat >/var/www/decoy/privacy.html <<EOF
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Privacy - ${brand}</title><link rel="stylesheet" href="/assets/style.css"></head>
+<body>
+  <header class="site-header"><div class="wrap nav"><a class="brand" href="/"><span class="mark"></span><span>${brand}</span></a><nav class="nav-links"><a href="/status">Status</a><a href="/docs">Docs</a><a href="/privacy">Privacy</a></nav></div></header>
+  <main class="section"><div class="wrap"><div class="eyebrow">Privacy</div><h1>Minimal public page</h1><p class="lead">${brand} is a static informational surface. It has no forms, no accounts, no cookies, and no browser analytics.</p><div class="panel"><p class="body-copy">Standard web server logs may record request time, IP address, user agent, and requested path for security and operational troubleshooting.</p></div></div></main>
+  <footer class="footer"><div class="wrap">Policy reference ${build_id}.</div></footer>
+</body>
+</html>
+EOF
+
+  cat >/var/www/decoy/404.html <<EOF
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Not found - ${brand}</title><link rel="stylesheet" href="/assets/style.css"></head>
+<body><main class="section"><div class="wrap"><div class="eyebrow">404</div><h1>Page not found</h1><p class="lead">The requested reference page is not available.</p><p><a href="/">Return to ${brand}</a></p></div></main></body>
+</html>
+EOF
+
+  cat >/var/www/decoy/robots.txt <<'EOF'
+User-agent: *
+Allow: /
+Disallow: /assets/
+EOF
+  chmod 0644 /var/www/decoy/assets/style.css /var/www/decoy/index.html /var/www/decoy/status.html /var/www/decoy/docs.html /var/www/decoy/privacy.html /var/www/decoy/404.html /var/www/decoy/robots.txt
 
   rm -f /etc/nginx/sites-enabled/default
+  rm -f /etc/nginx/sites-enabled/decoy-8444.conf /etc/nginx/sites-available/decoy-8444.conf
+  rm -f /etc/nginx/stream-conf.d/vpn-stack.conf
 
-  cat >/etc/nginx/sites-available/decoy-8444.conf <<EOF
+  cat >/etc/nginx/sites-available/decoy-443.conf <<EOF
 server {
-    listen 127.0.0.1:8444 ssl http2;
+    listen 443 ssl http2;
     server_name ${DOMAIN};
 
     ssl_certificate ${CERT_DIR}/fullchain.pem;
     ssl_certificate_key ${CERT_DIR}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
 
     root /var/www/decoy;
     index index.html;
 
+    location ^~ ${vless_path} {
+        client_max_body_size 0;
+        client_body_timeout 5m;
+        grpc_read_timeout 315s;
+        grpc_send_timeout 5m;
+        grpc_set_header Host \$host;
+        grpc_set_header X-Real-IP \$remote_addr;
+        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        grpc_pass unix:${VLESS_XHTTP_SOCKET};
+    }
+
     location / {
-        try_files \$uri \$uri/ =404;
+        try_files \$uri \$uri.html \$uri/ /404.html;
     }
+
+    error_page 404 /404.html;
 }
 EOF
-  chmod 0644 /etc/nginx/sites-available/decoy-8444.conf
-  ln -sf /etc/nginx/sites-available/decoy-8444.conf /etc/nginx/sites-enabled/decoy-8444.conf
-
-  cat >/etc/nginx/stream-conf.d/vpn-stack.conf <<'EOF'
-stream {
-    map $ssl_preread_server_name $vpn_backend {
-        www.vk.com xray_reality;
-        vk.com xray_reality;
-        default decoy_https;
-    }
-
-    upstream xray_reality {
-        server 127.0.0.1:10443;
-    }
-
-    upstream decoy_https {
-        server 127.0.0.1:8444;
-    }
-
-    server {
-        listen 443;
-        proxy_pass $vpn_backend;
-        ssl_preread on;
-    }
-}
-EOF
-  chmod 0644 /etc/nginx/stream-conf.d/vpn-stack.conf
-
-  if ! grep -q 'stream-conf.d' /etc/nginx/nginx.conf; then
-    local tmp
-    tmp="$(mktemp)"
-    awk '
-      !inserted && $0 ~ /^http[[:space:]]*\{/ {
-        print "include /etc/nginx/stream-conf.d/*.conf;";
-        inserted=1
-      }
-      { print }
-    ' /etc/nginx/nginx.conf >"${tmp}"
-    install -m 0644 "${tmp}" /etc/nginx/nginx.conf
-    rm -f "${tmp}"
-  fi
+  chmod 0644 /etc/nginx/sites-available/decoy-443.conf
+  ln -sf /etc/nginx/sites-available/decoy-443.conf /etc/nginx/sites-enabled/decoy-443.conf
 
   nginx -t
 }
@@ -912,25 +1009,25 @@ configure_firewall() {
 }
 
 install_helper_vless() {
-  cat >/usr/local/bin/vpn-vless-reality <<'EOF'
+  cat >/usr/local/bin/vpn-vless <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 CONFIG="/opt/vpn-stack/xray/config.json"
 STACK_DIR="/opt/vpn-stack"
-KEY_DIR="/root/vpn-keys/vless-reality"
-SERVICE="xray-vless-reality-xhttp.service"
+KEY_DIR="/root/vpn-keys/vless"
+SERVICE="xray-vless-xhttp-tls.service"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 uri_encode() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
 
 [[ "${EUID}" -eq 0 ]] || die "Run as root."
-[[ $# -eq 1 ]] || die "Usage: vpn-vless-reality <name>"
+[[ $# -eq 1 ]] || die "Usage: vpn-vless <name>"
 name="$1"
 [[ "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || die "Use only letters, digits, dot, underscore, dash."
 [[ -f "${CONFIG}" ]] || die "Missing ${CONFIG}"
 
-if jq -e --arg email "${name}" '.inbounds[] | select(.tag=="vless-reality-xhttp") | .settings.clients[]? | select(.email==$email)' "${CONFIG}" >/dev/null; then
+if jq -e --arg email "${name}" '.inbounds[] | select(.tag=="vless-xhttp-tls") | .settings.clients[]? | select(.email==$email)' "${CONFIG}" >/dev/null; then
   die "Client already exists: ${name}"
 fi
 
@@ -939,7 +1036,7 @@ tmp="$(mktemp)"
 backup="$(mktemp)"
 cp "${CONFIG}" "${backup}"
 jq --arg id "${uuid}" --arg email "${name}" \
-  '(.inbounds[] | select(.tag=="vless-reality-xhttp") | .settings.clients) += [{id: $id, email: $email}]' \
+  '(.inbounds[] | select(.tag=="vless-xhttp-tls") | .settings.clients) += [{id: $id, email: $email}]' \
   "${CONFIG}" >"${tmp}"
 install -m 0600 "${tmp}" "${CONFIG}"
 rm -f "${tmp}"
@@ -953,19 +1050,17 @@ rm -f "${backup}"
 systemctl restart "${SERVICE}"
 
 domain="$(<"${STACK_DIR}/domain.txt")"
-path="$(<"${STACK_DIR}/vless-reality-path.txt")"
-public_key="$(<"${STACK_DIR}/vless-reality-public-key.txt")"
-short_id="$(<"${STACK_DIR}/vless-reality-short-id.txt")"
+path="$(<"${STACK_DIR}/vless-xhttp-path.txt")"
 encoded_path="$(uri_encode "${path}")"
-fragment="$(uri_encode "VLESS-REALITY-XHTTP-${name}")"
-link="vless://${uuid}@${domain}:443?security=reality&type=xhttp&encryption=none&path=${encoded_path}&mode=stream-one&sni=www.vk.com&fp=chrome&pbk=${public_key}&sid=${short_id}&spx=%2F#${fragment}"
+fragment="$(uri_encode "VLESS-XHTTP-TLS-${name}")"
+link="vless://${uuid}@${domain}:443?security=tls&type=xhttp&encryption=none&path=${encoded_path}&mode=stream-one&sni=${domain}&host=${domain}&fp=chrome&alpn=h2%2Chttp%2F1.1#${fragment}"
 
 install -d -m 0700 "${KEY_DIR}"
 printf '%s\n' "${link}" >"${KEY_DIR}/${name}.txt"
 chmod 0600 "${KEY_DIR}/${name}.txt"
 printf '%s\n' "${link}"
 EOF
-  chmod 0755 /usr/local/bin/vpn-vless-reality
+  chmod 0755 /usr/local/bin/vpn-vless
 }
 
 install_helper_hysteria() {
@@ -1263,9 +1358,9 @@ proto="${1:-}"
 name="${2:-}"
 
 case "${proto}" in
-  reality|xhttp|vless)
-    [[ -n "${name}" ]] && show_key_if_exists "/root/vpn-keys/vless-reality/${name}.txt" && exit 0
-    echo "Create: vpn-vless-reality <name>"
+  tls|xhttp|vless)
+    [[ -n "${name}" ]] && show_key_if_exists "/root/vpn-keys/vless/${name}.txt" && exit 0
+    echo "Create: vpn-vless <name>"
     exit 0
     ;;
   hysteria)
@@ -1284,7 +1379,7 @@ cat <<'HELP'
 Golden VPN helper commands
 
 Create clients:
-  vpn-vless-reality phone1
+  vpn-vless phone1
   vpn-hysteria phone1
   vpn-awg phone1
 
@@ -1294,12 +1389,12 @@ AmneziaWG diagnostics:
   vpn-awg capture 30
 
 Saved keys:
-  /root/vpn-keys/vless-reality/<name>.txt
+  /root/vpn-keys/vless/<name>.txt
   /root/vpn-keys/hysteria/<name>.txt
   /root/vpn-keys/awg/<name>.conf
 
 Show saved client material:
-  vpn-help reality phone1
+  vpn-help tls phone1
   vpn-help xhttp phone1
   vpn-help vless phone1
   vpn-help hysteria phone1
@@ -1307,7 +1402,7 @@ Show saved client material:
 
 Check services:
   systemctl status nginx --no-pager
-  systemctl status xray-vless-reality-xhttp --no-pager
+  systemctl status xray-vless-xhttp-tls --no-pager
   systemctl status hysteria2 --no-pager
   systemctl status awg-quick@awg0 --no-pager -l
   systemctl status prometheus --no-pager
@@ -1329,7 +1424,7 @@ EOF
 
 install_helpers() {
   log "Installing helper commands."
-  rm -f /usr/local/bin/vpn /usr/local/bin/vpn-trojan /usr/local/bin/vpn-vless-xhttp
+  rm -f /usr/local/bin/vpn /usr/local/bin/vpn-trojan /usr/local/bin/vpn-vless-xhttp /usr/local/bin/vpn-vless-reality
   install_helper_vless
   install_helper_hysteria
   install_helper_awg
@@ -1481,7 +1576,7 @@ set -euo pipefail
 log_file="/var/log/vpn-stack-healthcheck.log"
 services=(
   nginx
-  xray-vless-reality-xhttp
+  xray-vless-xhttp-tls
   hysteria2
   prometheus
   prometheus-node-exporter
@@ -1533,7 +1628,7 @@ enable_and_start_services() {
   systemctl daemon-reload
 
   systemctl enable nginx
-  systemctl enable xray-vless-reality-xhttp
+  systemctl enable xray-vless-xhttp-tls
   systemctl enable hysteria2
   systemctl enable amneziawg-ensure-module
   systemctl enable awg-quick@awg0
@@ -1544,7 +1639,7 @@ enable_and_start_services() {
   systemctl enable vpn-stack-healthcheck.timer
 
   systemctl restart systemd-journald || true
-  systemctl restart xray-vless-reality-xhttp
+  systemctl restart xray-vless-xhttp-tls
   systemctl restart nginx
   systemctl restart hysteria2
   systemctl restart amneziawg-ensure-module
@@ -1601,6 +1696,15 @@ listen_label() {
   fi
 }
 
+socket_label() {
+  local path="$1"
+  if [[ -S "${path}" ]]; then
+    printf 'OK'
+  else
+    printf 'MISSING'
+  fi
+}
+
 wait_for_expected_listeners() {
   local timeout="${1:-90}"
   local deadline=$((SECONDS + timeout))
@@ -1613,8 +1717,7 @@ wait_for_expected_listeners() {
     listen_any_port tcp 443 || missing+=("443/tcp")
     listen_any_port udp 8443 || missing+=("8443/udp")
     listen_any_port udp 51820 || missing+=("51820/udp")
-    listen_local_port tcp 10443 || missing+=("127.0.0.1:10443")
-    listen_local_port tcp 8444 || missing+=("127.0.0.1:8444")
+    [[ -S "${VLESS_XHTTP_SOCKET}" ]] || missing+=("${VLESS_XHTTP_SOCKET}")
     listen_local_port tcp 3000 || missing+=("127.0.0.1:3000")
     listen_local_port tcp 9090 || missing+=("127.0.0.1:9090")
     listen_local_port tcp 9100 || missing+=("127.0.0.1:9100")
@@ -1651,10 +1754,10 @@ Server IPv4: ${PUBLIC_IPV4}
 External interface: ${EXT_IFACE}
 
 Contours:
-  VLESS REALITY XHTTP : service $(service_summary xray-vless-reality-xhttp); external 443/tcp $(listen_label any tcp 443); backend 127.0.0.1:10443 $(listen_label local tcp 10443)
+  VLESS XHTTP TLS     : service $(service_summary xray-vless-xhttp-tls); external 443/tcp via nginx $(listen_label any tcp 443); backend ${VLESS_XHTTP_SOCKET} $(socket_label "${VLESS_XHTTP_SOCKET}")
   Hysteria2 Salamander: service $(service_summary hysteria2); external 8443/udp $(listen_label any udp 8443)
   AmneziaWG 2.0       : service $(service_summary awg-quick@awg0); external 51820/udp $(listen_label any udp 51820); interface awg0
-  Decoy HTTPS site    : nginx $(service_summary nginx); https://${DOMAIN}/; backend 127.0.0.1:8444 $(listen_label local tcp 8444)
+  Decoy HTTPS site    : nginx $(service_summary nginx); https://${DOMAIN}/; randomized static site on 443/tcp
 
 Monitoring, localhost only:
   Grafana       : service $(service_summary grafana-server); 127.0.0.1:3000 $(listen_label local tcp 3000)
@@ -1691,12 +1794,12 @@ Storage limits:
   Prometheus retention: 7d / 1GB
 
 Initial client files:
-  ${KEY_DIR}/vless-reality/main-reality.txt
+  ${KEY_DIR}/vless/main-vless.txt
   ${KEY_DIR}/hysteria/main-hysteria-client.txt
   ${KEY_DIR}/awg/main-awg.conf
 
 Create more clients:
-  vpn-vless-reality phone1
+  vpn-vless phone1
   vpn-hysteria phone1
   vpn-awg phone1
   vpn-help
@@ -1707,10 +1810,11 @@ EOF
 final_checks() {
   log "Final listening socket check."
   set +e
-  ss -lntup | grep -E ':443|:8443|:51820|:3000|:9090|:9100|:10443|:8444'
+  ss -lntup | grep -E ':443|:8443|:51820|:3000|:9090|:9100'
+  ls -l "${VLESS_XHTTP_SOCKET}"
 
   systemctl status nginx --no-pager
-  systemctl status xray-vless-reality-xhttp --no-pager
+  systemctl status xray-vless-xhttp-tls --no-pager
   systemctl status hysteria2 --no-pager
   systemctl status awg-quick@awg0 --no-pager -l
   systemctl status prometheus --no-pager
@@ -1723,11 +1827,11 @@ final_checks() {
 
   log "Initial client files:"
   printf '  %s\n' \
-    "${KEY_DIR}/vless-reality/main-reality.txt" \
+    "${KEY_DIR}/vless/main-vless.txt" \
     "${KEY_DIR}/hysteria/main-hysteria-client.txt" \
     "${KEY_DIR}/awg/main-awg.conf"
   log "Optional helper smoke tests create extra clients:"
-  printf '  vpn-vless-reality test-reality\n  vpn-hysteria test-hy2\n  vpn-awg test-awg\n'
+  printf '  vpn-vless test-vless\n  vpn-hysteria test-hy2\n  vpn-awg test-awg\n'
   print_install_summary
 }
 

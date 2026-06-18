@@ -4,10 +4,10 @@ Golden install script for a fresh Ubuntu/Debian VPS.
 
 It deploys:
 
-- VLESS REALITY XHTTP on `443/tcp`
+- VLESS XHTTP TLS on `443/tcp` behind nginx and the domain certificate
 - Hysteria2 Salamander on `8443/udp`
 - AmneziaWG 2.0 on `51820/udp`
-- decoy HTTPS site on `https://DOMAIN/`
+- randomized static decoy HTTPS site on `https://DOMAIN/`
 - Grafana, Prometheus, and Node Exporter on localhost only
 
 ## Requirements
@@ -71,9 +71,29 @@ chmod +x install-vpn-stack.sh
 Create clients:
 
 ```bash
-vpn-vless-reality phone1
+vpn-vless phone1
 vpn-hysteria phone1
 vpn-awg phone1
+```
+
+Initial client files:
+
+```text
+/root/vpn-keys/vless/main-vless.txt
+/root/vpn-keys/hysteria/main-hysteria-client.txt
+/root/vpn-keys/awg/main-awg.conf
+```
+
+The decoy site is generated at install time:
+
+```text
+/var/www/decoy/index.html
+/var/www/decoy/status.html
+/var/www/decoy/docs.html
+/var/www/decoy/privacy.html
+/var/www/decoy/404.html
+/var/www/decoy/robots.txt
+/var/www/decoy/assets/style.css
 ```
 
 Show help:
