@@ -113,3 +113,25 @@ Captures are saved under:
 ```text
 /var/log/vpn-stack/awg-captures/
 ```
+
+## Troubleshooting
+
+If AmneziaWG DKMS fails and the log says the running kernel is older than the latest installed kernel, reboot first:
+
+```bash
+reboot
+```
+
+After the VPS comes back:
+
+```bash
+apt-get -f install -y
+dpkg --configure -a
+./install-vpn-stack.sh
+```
+
+If DKMS still fails, check:
+
+```bash
+tail -n 120 /var/lib/dkms/amneziawg/1.0.0/build/make.log
+```

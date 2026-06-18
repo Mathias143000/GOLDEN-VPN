@@ -109,6 +109,35 @@ require_root_and_env() {
   CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 }
 
+newest_installed_kernel() {
+  find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null \
+    | sed 's/^vmlinuz-//' \
+    | sort -V \
+    | tail -n 1
+}
+
+check_dkms_kernel_ready() {
+  local running latest
+  running="$(uname -r)"
+  latest="$(newest_installed_kernel || true)"
+
+  if [[ -n "${latest}" && "${latest}" != "${running}" ]]; then
+    cat >&2 <<EOF
+[vpn-stack] ERROR: Pending kernel reboot detected.
+[vpn-stack] Running kernel: ${running}
+[vpn-stack] Latest installed kernel: ${latest}
+
+AmneziaWG uses DKMS. Building the kernel module while the VPS is still
+running an older kernel often fails. Reboot the VPS, then run the installer again:
+
+  reboot
+  ./install-vpn-stack.sh
+
+EOF
+    exit 1
+  fi
+}
+
 need_command() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
@@ -555,8 +584,20 @@ EOF
 
 install_amneziawg() {
   log "Installing AmneziaWG."
+  check_dkms_kernel_ready
   apt-get update
-  apt-get install -y amneziawg || apt-get install -y amneziawg-dkms amneziawg-tools || die "Could not install AmneziaWG packages."
+  if ! apt-get install -y amneziawg; then
+    warn "amneziawg meta package install failed; trying amneziawg-dkms and amneziawg-tools directly."
+    if ! apt-get install -y amneziawg-dkms amneziawg-tools; then
+      if [[ -f /var/lib/dkms/amneziawg/1.0.0/build/make.log ]]; then
+        warn "Last 80 lines of AmneziaWG DKMS build log:"
+        tail -n 80 /var/lib/dkms/amneziawg/1.0.0/build/make.log >&2 || true
+      else
+        warn "AmneziaWG DKMS make.log was not found at /var/lib/dkms/amneziawg/1.0.0/build/make.log."
+      fi
+      die "Could not install AmneziaWG packages. If a kernel upgrade is pending, reboot the VPS and rerun this installer."
+    fi
+  fi
 
   if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
     warn "awg or awg-quick was not found after package install; building amneziawg-tools from source."
@@ -1660,6 +1701,7 @@ final_checks() {
 
 main() {
   require_root_and_env
+  check_dkms_kernel_ready
   install_apt_repositories
   install_base_packages
   need_command ip
