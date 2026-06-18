@@ -20,6 +20,7 @@ RESUME_INSTALL_LOG="/var/log/vpn-stack-resume-install.log"
 PUBLIC_IPV4=""
 EXT_IFACE=""
 SWAP_RESULT="not checked"
+DKMS_KERNEL_REBOOT_PROMPTED=0
 
 BASE_PACKAGES=(
   curl
@@ -244,6 +245,7 @@ newest_installed_kernel() {
 }
 
 check_dkms_kernel_ready() {
+  local mode="${1:-prompt}"
   local running latest
   running="$(uname -r)"
   latest="$(newest_installed_kernel || true)"
@@ -267,11 +269,23 @@ EOF
       exit 1
     fi
 
-    if auto_reboot_resume_enabled || prompt_yes_no "Reboot now and resume installer once after boot?"; then
+    if auto_reboot_resume_enabled; then
       schedule_resume_install_once
       log "Rebooting now. The installer will continue once after the VPS comes back."
       systemctl reboot
       exit 0
+    fi
+
+    if [[ "${mode}" == "prompt" && "${DKMS_KERNEL_REBOOT_PROMPTED}" != "1" ]]; then
+      DKMS_KERNEL_REBOOT_PROMPTED=1
+      if prompt_yes_no "Reboot now and resume installer once after boot?"; then
+        schedule_resume_install_once
+        log "Rebooting now. The installer will continue once after the VPS comes back."
+        systemctl reboot
+        exit 0
+      fi
+    else
+      warn "Kernel reboot is required before AmneziaWG DKMS can continue; not asking again in this run."
     fi
 
     cat >&2 <<EOF
@@ -828,7 +842,7 @@ EOF
 
 install_amneziawg() {
   log "Installing AmneziaWG."
-  check_dkms_kernel_ready
+  check_dkms_kernel_ready no-prompt
   apt-get update
   if ! apt-get install -y amneziawg; then
     warn "amneziawg meta package install failed; trying amneziawg-dkms and amneziawg-tools directly."
