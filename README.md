@@ -49,9 +49,13 @@ export EMAIL="teriomta@gmail.com"
 export CF_Token="CLOUDFLARE_DNS_TOKEN"
 # Optional fallback:
 export CF_Zone_ID="CLOUDFLARE_ZONE_ID"
+# Optional: if a kernel reboot is pending, reboot and resume installer once.
+export VPN_STACK_AUTO_REBOOT_RESUME=1
 
 ./install-vpn-stack.sh
 ```
+
+If a kernel reboot is required for AmneziaWG DKMS, the interactive installer can create a one-time systemd resume unit, reboot, and continue automatically after the VPS comes back. The resume unit removes itself before running, so it does not start after later reboots.
 
 ## Install With Git
 
@@ -136,7 +140,7 @@ Captures are saved under:
 
 ## Troubleshooting
 
-If AmneziaWG DKMS fails and the log says the running kernel is older than the latest installed kernel, reboot first:
+If AmneziaWG DKMS fails and the log says the running kernel is older than the latest installed kernel, use the built-in one-time reboot/resume prompt or reboot first:
 
 ```bash
 reboot

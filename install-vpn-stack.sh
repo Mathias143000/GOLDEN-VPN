@@ -11,6 +11,12 @@ HYSTERIA_DIR="${STACK_DIR}/hysteria"
 LOG_DIR="/var/log/vpn-stack"
 CERT_DIR="/etc/letsencrypt/live/${DOMAIN:-}"
 VLESS_XHTTP_SOCKET="/dev/shm/xray-vless-xhttp.sock"
+RESUME_INSTALL_DIR="/root/vpn-stack-resume"
+RESUME_INSTALL_SCRIPT="${RESUME_INSTALL_DIR}/install-vpn-stack.sh"
+RESUME_INSTALL_ENV="${RESUME_INSTALL_DIR}/env"
+RESUME_INSTALL_RUNNER="/usr/local/sbin/vpn-stack-resume-install.sh"
+RESUME_INSTALL_UNIT="/etc/systemd/system/vpn-stack-resume-install.service"
+RESUME_INSTALL_LOG="/var/log/vpn-stack-resume-install.log"
 PUBLIC_IPV4=""
 EXT_IFACE=""
 SWAP_RESULT="not checked"
@@ -102,12 +108,132 @@ prompt_required_var() {
   done
 }
 
+prompt_yes_no() {
+  local prompt="$1"
+  local answer
+
+  have_tty || return 1
+  while true; do
+    printf '%s [Y/n]: ' "${prompt}" >/dev/tty
+    IFS= read -r answer </dev/tty || return 1
+    answer="$(trim_value "${answer}")"
+    case "${answer}" in
+      ""|y|Y|yes|YES|Yes)
+        return 0
+        ;;
+      n|N|no|NO|No)
+        return 1
+        ;;
+      *)
+        printf 'Please answer y or n.\n' >/dev/tty
+        ;;
+    esac
+  done
+}
+
 require_root_and_env() {
   [[ "${EUID}" -eq 0 ]] || die "Run this script as root."
   prompt_required_var DOMAIN "DOMAIN, without https://, example s5.example.com"
   prompt_required_var EMAIL "EMAIL for ZeroSSL/acme.sh"
   prompt_required_var CF_Token "Cloudflare DNS API token (hidden input)" 1
   CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
+}
+
+installer_self_path() {
+  local self
+  self="$(readlink -f "$0" 2>/dev/null || true)"
+  [[ -n "${self}" && -r "${self}" ]] || return 1
+  printf '%s\n' "${self}"
+}
+
+write_resume_env() {
+  {
+    printf 'export DOMAIN=%q\n' "${DOMAIN}"
+    printf 'export EMAIL=%q\n' "${EMAIL}"
+    printf 'export CF_Token=%q\n' "${CF_Token}"
+    [[ -n "${CF_Zone_ID:-}" ]] && printf 'export CF_Zone_ID=%q\n' "${CF_Zone_ID}"
+    [[ -n "${CF_Account_ID:-}" ]] && printf 'export CF_Account_ID=%q\n' "${CF_Account_ID}"
+    printf 'export VPN_STACK_RESUMED=1\n'
+  } >"${RESUME_INSTALL_ENV}"
+  chmod 0600 "${RESUME_INSTALL_ENV}"
+}
+
+schedule_resume_install_once() {
+  local self
+  self="$(installer_self_path)" || die "Could not resolve installer path. Download the script to a file and run it again."
+
+  install -d -m 0700 "${RESUME_INSTALL_DIR}"
+  install -m 0700 "${self}" "${RESUME_INSTALL_SCRIPT}"
+  write_resume_env
+
+  cat >"${RESUME_INSTALL_RUNNER}" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+unit="${RESUME_INSTALL_UNIT}"
+runner="${RESUME_INSTALL_RUNNER}"
+env_file="${RESUME_INSTALL_ENV}"
+installer="${RESUME_INSTALL_SCRIPT}"
+resume_dir="${RESUME_INSTALL_DIR}"
+log_file="${RESUME_INSTALL_LOG}"
+
+{
+  printf '%s resume start\n' "\$(date -Is)"
+  systemctl disable vpn-stack-resume-install.service >/dev/null 2>&1 || true
+  rm -f "\${unit}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  if [[ ! -r "\${env_file}" || ! -x "\${installer}" ]]; then
+    printf '%s missing resume env or installer\n' "\$(date -Is)"
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "\${env_file}"
+  rm -f "\${env_file}"
+  export VPN_STACK_RESUMED=1
+
+  set +e
+  bash "\${installer}"
+  status="\$?"
+  set -e
+
+  if [[ "\${status}" -eq 0 ]]; then
+    rm -f "\${installer}" "\${runner}"
+    rmdir "\${resume_dir}" 2>/dev/null || true
+  fi
+
+  printf '%s resume exit status=%s\n' "\$(date -Is)" "\${status}"
+  exit "\${status}"
+} >>"\${log_file}" 2>&1
+EOF
+  chmod 0700 "${RESUME_INSTALL_RUNNER}"
+
+  cat >"${RESUME_INSTALL_UNIT}" <<EOF
+[Unit]
+Description=Resume Golden VPN installer once after reboot
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=${RESUME_INSTALL_SCRIPT}
+
+[Service]
+Type=oneshot
+ExecStart=${RESUME_INSTALL_RUNNER}
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 "${RESUME_INSTALL_UNIT}"
+
+  systemctl daemon-reload
+  systemctl enable vpn-stack-resume-install.service
+  log "One-time resume service installed: vpn-stack-resume-install.service"
+  log "Resume log after reboot: ${RESUME_INSTALL_LOG}"
+}
+
+auto_reboot_resume_enabled() {
+  [[ "${VPN_STACK_AUTO_REBOOT_RESUME:-}" == "1" || "${AUTO_REBOOT_RESUME:-}" == "1" ]]
 }
 
 newest_installed_kernel() {
@@ -124,12 +250,33 @@ check_dkms_kernel_ready() {
 
   if [[ -n "${latest}" && "${latest}" != "${running}" ]]; then
     cat >&2 <<EOF
-[vpn-stack] ERROR: Pending kernel reboot detected.
+[vpn-stack] Pending kernel reboot detected.
 [vpn-stack] Running kernel: ${running}
 [vpn-stack] Latest installed kernel: ${latest}
 
 AmneziaWG uses DKMS. Building the kernel module while the VPS is still
-running an older kernel often fails. Reboot the VPS, then run the installer again:
+running an older kernel often fails.
+EOF
+
+    if [[ "${VPN_STACK_RESUMED:-}" == "1" ]]; then
+      cat >&2 <<EOF
+
+[vpn-stack] ERROR: The one-time resume already ran, but the kernel is still not updated.
+Reboot manually and check that the VPS boots into ${latest}.
+EOF
+      exit 1
+    fi
+
+    if auto_reboot_resume_enabled || prompt_yes_no "Reboot now and resume installer once after boot?"; then
+      schedule_resume_install_once
+      log "Rebooting now. The installer will continue once after the VPS comes back."
+      systemctl reboot
+      exit 0
+    fi
+
+    cat >&2 <<EOF
+
+Reboot the VPS, then run the installer again:
 
   reboot
   ./install-vpn-stack.sh
