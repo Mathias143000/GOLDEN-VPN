@@ -1601,6 +1601,38 @@ listen_label() {
   fi
 }
 
+wait_for_expected_listeners() {
+  local timeout="${1:-90}"
+  local deadline=$((SECONDS + timeout))
+  local -a missing
+
+  log "Waiting up to ${timeout}s for expected listening ports."
+  while true; do
+    missing=()
+
+    listen_any_port tcp 443 || missing+=("443/tcp")
+    listen_any_port udp 8443 || missing+=("8443/udp")
+    listen_any_port udp 51820 || missing+=("51820/udp")
+    listen_local_port tcp 10443 || missing+=("127.0.0.1:10443")
+    listen_local_port tcp 8444 || missing+=("127.0.0.1:8444")
+    listen_local_port tcp 3000 || missing+=("127.0.0.1:3000")
+    listen_local_port tcp 9090 || missing+=("127.0.0.1:9090")
+    listen_local_port tcp 9100 || missing+=("127.0.0.1:9100")
+
+    if ((${#missing[@]} == 0)); then
+      log "All expected listening ports are up."
+      return 0
+    fi
+
+    if ((SECONDS >= deadline)); then
+      warn "Timed out waiting for listening ports: ${missing[*]}"
+      return 0
+    fi
+
+    sleep 2
+  done
+}
+
 print_install_summary() {
   local dashboard_status
   if [[ -s /var/lib/grafana/dashboards/node-exporter-full-1860.json ]]; then
@@ -1727,6 +1759,7 @@ main() {
   configure_log_limits
   configure_timers
   enable_and_start_services
+  wait_for_expected_listeners 90
   final_checks
   log "Golden VPN stack installation complete."
 }
