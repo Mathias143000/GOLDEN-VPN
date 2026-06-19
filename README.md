@@ -99,10 +99,12 @@ The installer asks for:
 ```text
 DOMAIN
 EMAIL
+SERVER_LOCATION
 CF_Token
 ```
 
 `EMAIL` must be plain ASCII, for example `teriomta@gmail.com`. Do not paste Cyrillic lookalikes or hidden characters.
+`SERVER_LOCATION` must be two ASCII letters, for example `EE`, `NL`, or `DE`.
 
 `CF_Token` input is hidden. If the token cannot read the Cloudflare zone ID automatically, the installer also asks for `CF_Zone_ID`.
 
@@ -111,6 +113,7 @@ For unattended install, export variables before running:
 ```bash
 export DOMAIN="s5.super-lemming.online"
 export EMAIL="teriomta@gmail.com"
+export SERVER_LOCATION="EE"
 export CF_Token="CLOUDFLARE_DNS_TOKEN"
 # Optional fallback:
 export CF_Zone_ID="CLOUDFLARE_ZONE_ID"
@@ -172,12 +175,12 @@ vpn-awg phone1
 Initial client files:
 
 ```text
-/root/vpn-keys/trojan/TROJAN-main-trojan.txt
-/root/vpn-keys/hysteria/HYSTERIA-main-hysteria-client.txt
-/root/vpn-keys/awg/AWG-main-awg.conf
+/root/vpn-keys/trojan/TROJAN-EE-main-trojan.txt
+/root/vpn-keys/hysteria/HYSTERIA-EE-main-hysteria-client.txt
+/root/vpn-keys/awg/AWG-EE-main-awg.conf
 ```
 
-New client display labels and saved filenames use `TROJAN-<name>`, `HYSTERIA-<name>`, and `AWG-<name>`.
+New client display labels and saved filenames use `TROJAN-<LOCATION>-<name>`, `HYSTERIA-<LOCATION>-<name>`, and `AWG-<LOCATION>-<name>`.
 Each client helper prints a terminal QR code, the raw link or config text, and the saved file path.
 
 The decoy site is generated at install time:
@@ -191,6 +194,8 @@ The decoy site is generated at install time:
 /var/www/decoy/robots.txt
 /var/www/decoy/assets/style.css
 ```
+
+The decoy generator is embedded in `install-vpn-stack.sh`: it writes static HTML/CSS directly, randomizes the neutral brand name, build id, color pair, region label, status copy, and docs title, and serves it through nginx on `443/tcp`. It does not clone templates, use external CDN assets, forms, cookies, analytics, backend code, or JavaScript.
 
 Show help:
 
@@ -229,6 +234,8 @@ Captures are saved under:
 ```text
 /var/log/vpn-stack/awg-captures/
 ```
+
+AmneziaWG parameters are randomized from the selected profile (`AWG_OBFS_PROFILE=dns` by default, `quic-lite` optional). The installer sets `AWG_MTU=1280` by default and writes it into server and client configs; override with `export AWG_MTU=1280` or another value from `1200..1420` before install. Tcpdump is not run automatically during install; use `vpn-awg analyze 20` or `vpn-awg capture 30` when you intentionally want packet-size diagnostics.
 
 ## Troubleshooting
 

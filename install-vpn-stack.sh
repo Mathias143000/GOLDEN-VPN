@@ -126,6 +126,37 @@ valid_ascii_email() {
   [[ "${value}" =~ ^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$ ]]
 }
 
+normalize_server_location() {
+  local value="$1"
+  value="$(trim_value "${value}")"
+  value="$(printf '%s' "${value}" | tr '[:lower:]' '[:upper:]')"
+  printf '%s' "${value}"
+}
+
+valid_server_location() {
+  local value="$1"
+  [[ "${value}" =~ ^[A-Z]{2}$ ]]
+}
+
+ensure_valid_server_location() {
+  while true; do
+    SERVER_LOCATION="$(normalize_server_location "${SERVER_LOCATION:-}")"
+    export SERVER_LOCATION
+
+    if valid_server_location "${SERVER_LOCATION}"; then
+      return 0
+    fi
+
+    if have_tty; then
+      printf 'SERVER_LOCATION must be exactly two ASCII letters, example EE, NL, DE.\n' >/dev/tty
+      unset SERVER_LOCATION
+      prompt_required_var SERVER_LOCATION "SERVER_LOCATION, two letters, example EE"
+    else
+      die "SERVER_LOCATION must be exactly two ASCII letters, example EE, NL, DE."
+    fi
+  done
+}
+
 ensure_valid_email() {
   while true; do
     EMAIL="$(trim_value "${EMAIL:-}")"
@@ -207,6 +238,8 @@ require_root_and_env() {
   prompt_required_var DOMAIN "DOMAIN, without https://, example s5.example.com"
   prompt_required_var EMAIL "EMAIL for ZeroSSL/acme.sh"
   ensure_valid_email
+  prompt_required_var SERVER_LOCATION "SERVER_LOCATION, two letters, example EE"
+  ensure_valid_server_location
   prompt_required_var CF_Token "Cloudflare DNS API token (hidden input)" 1
   CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 }
@@ -239,6 +272,7 @@ write_resume_env() {
   {
     printf 'DOMAIN=%q\n' "${DOMAIN}"
     printf 'EMAIL=%q\n' "${EMAIL}"
+    printf 'SERVER_LOCATION=%q\n' "${SERVER_LOCATION}"
     printf 'CF_Token=%q\n' "${CF_Token}"
     [[ -n "${CF_Zone_ID:-}" ]] && printf 'CF_Zone_ID=%q\n' "${CF_Zone_ID}"
     [[ -n "${CF_Account_ID:-}" ]] && printf 'CF_Account_ID=%q\n' "${CF_Account_ID}"
@@ -912,10 +946,19 @@ uri_encode() {
 label_name() {
   local prefix="$1"
   local name="$2"
-  if [[ "${name}" == "${prefix}-"* ]]; then
+  local location="${SERVER_LOCATION:-}"
+  if [[ -z "${location}" && -r "${STACK_DIR}/server-location.txt" ]]; then
+    location="$(<"${STACK_DIR}/server-location.txt")"
+  fi
+  location="$(normalize_server_location "${location}")"
+  if ! valid_server_location "${location}"; then
+    location="XX"
+  fi
+
+  if [[ "${name}" == "${prefix}-${location}-"* ]]; then
     printf '%s' "${name}"
   else
-    printf '%s-%s' "${prefix}" "${name}"
+    printf '%s-%s-%s' "${prefix}" "${location}" "${name}"
   fi
 }
 
@@ -952,8 +995,10 @@ configure_xray() {
   log "Configuring Trojan XHTTP TLS backend."
   install -d -m 0700 "${STACK_DIR}" "${XRAY_DIR}" "${LOG_DIR}" "${KEY_DIR}/trojan"
   printf '%s\n' "${DOMAIN}" >"${STACK_DIR}/domain.txt"
+  printf '%s\n' "${SERVER_LOCATION}" >"${STACK_DIR}/server-location.txt"
   printf '%s\n' "${PUBLIC_IPV4}" >"${STACK_DIR}/public-ipv4.txt"
   printf '%s\n' "${EXT_IFACE}" >"${STACK_DIR}/external-interface.txt"
+  chmod 0600 "${STACK_DIR}/server-location.txt"
 
   local password path
   password="$(rand_hex 24)"
@@ -1410,6 +1455,7 @@ write_awg_client_config() {
 PrivateKey = ${client_private}
 Address = ${client_ip}/32
 DNS = 1.1.1.1, 8.8.8.8
+MTU = ${AWG_MTU:-1280}
 Jc = ${AWG_JC}
 Jmin = ${AWG_JMIN}
 Jmax = ${AWG_JMAX}
@@ -1456,8 +1502,12 @@ EOF
   client_public="$(printf '%s\n' "${client_private}" | awg pubkey)"
   psk="$(awg_genpsk)"
 
-  local awg_profile jc jmin jmax s1 s2 s3 s4 h1 h2 h3 h4 i1 i2 i3 i4 i5
+  local awg_profile awg_mtu jc jmin jmax s1 s2 s3 s4 h1 h2 h3 h4 i1 i2 i3 i4 i5
   awg_profile="${AWG_OBFS_PROFILE:-dns}"
+  awg_mtu="${AWG_MTU:-1280}"
+  if [[ ! "${awg_mtu}" =~ ^[0-9]+$ || "${awg_mtu}" -lt 1200 || "${awg_mtu}" -gt 1420 ]]; then
+    die "Unsupported AWG_MTU='${awg_mtu}'. Use an integer from 1200 to 1420."
+  fi
   case "${awg_profile}" in
     dns)
       jc="$(rand_between 5 8)"
@@ -1498,6 +1548,7 @@ EOF
 
   cat >"${STACK_DIR}/awg-params.env" <<EOF
 AWG_OBFS_PROFILE=${awg_profile}
+AWG_MTU=${awg_mtu}
 AWG_JC=${jc}
 AWG_JMIN=${jmin}
 AWG_JMAX=${jmax}
@@ -1524,6 +1575,7 @@ EOF
 Address = 10.66.66.1/24
 ListenPort = 51820
 PrivateKey = ${server_private}
+MTU = ${awg_mtu}
 Jc = ${jc}
 Jmin = ${jmin}
 Jmax = ${jmax}
@@ -1673,10 +1725,19 @@ print_qr() {
 label_name() {
   local prefix="$1"
   local name="$2"
-  if [[ "${name}" == "${prefix}-"* ]]; then
+  local location="XX"
+  if [[ -r "${STACK_DIR}/server-location.txt" ]]; then
+    location="$(<"${STACK_DIR}/server-location.txt")"
+  fi
+  location="$(printf '%s' "${location}" | tr '[:lower:]' '[:upper:]')"
+  if [[ ! "${location}" =~ ^[A-Z]{2}$ ]]; then
+    location="XX"
+  fi
+
+  if [[ "${name}" == "${prefix}-${location}-"* ]]; then
     printf '%s' "${name}"
   else
-    printf '%s-%s' "${prefix}" "${name}"
+    printf '%s-%s-%s' "${prefix}" "${location}" "${name}"
   fi
 }
 
@@ -1758,10 +1819,19 @@ print_qr() {
 label_name() {
   local prefix="$1"
   local name="$2"
-  if [[ "${name}" == "${prefix}-"* ]]; then
+  local location="XX"
+  if [[ -r "${STACK_DIR}/server-location.txt" ]]; then
+    location="$(<"${STACK_DIR}/server-location.txt")"
+  fi
+  location="$(printf '%s' "${location}" | tr '[:lower:]' '[:upper:]')"
+  if [[ ! "${location}" =~ ^[A-Z]{2}$ ]]; then
+    location="XX"
+  fi
+
+  if [[ "${name}" == "${prefix}-${location}-"* ]]; then
     printf '%s' "${name}"
   else
-    printf '%s-%s' "${prefix}" "${name}"
+    printf '%s-%s-%s' "${prefix}" "${location}" "${name}"
   fi
 }
 
@@ -1854,10 +1924,19 @@ print_qr() {
 label_name() {
   local prefix="$1"
   local name="$2"
-  if [[ "${name}" == "${prefix}-"* ]]; then
+  local location="XX"
+  if [[ -r "${STACK_DIR}/server-location.txt" ]]; then
+    location="$(<"${STACK_DIR}/server-location.txt")"
+  fi
+  location="$(printf '%s' "${location}" | tr '[:lower:]' '[:upper:]')"
+  if [[ ! "${location}" =~ ^[A-Z]{2}$ ]]; then
+    location="XX"
+  fi
+
+  if [[ "${name}" == "${prefix}-${location}-"* ]]; then
     printf '%s' "${name}"
   else
-    printf '%s-%s' "${prefix}" "${name}"
+    printf '%s-%s-%s' "${prefix}" "${location}" "${name}"
   fi
 }
 
@@ -1955,7 +2034,7 @@ analyze_awg() {
   echo
   echo "AWG obfuscation profile:"
   if [[ -f "${STACK_DIR}/awg-params.env" ]]; then
-    grep -E '^AWG_(OBFS_PROFILE|JC|JMIN|JMAX|S[1-4]|H[1-4]|I[1-5])=' "${STACK_DIR}/awg-params.env" | sed 's/^/  /'
+    grep -E '^AWG_(OBFS_PROFILE|MTU|JC|JMIN|JMAX|S[1-4]|H[1-4]|I[1-5])=' "${STACK_DIR}/awg-params.env" | sed 's/^/  /'
   else
     echo "  missing ${STACK_DIR}/awg-params.env"
   fi
@@ -2027,6 +2106,7 @@ cat >"${out}" <<EOF_CLIENT
 PrivateKey = ${client_private}
 Address = ${client_ip}/32
 DNS = 1.1.1.1, 8.8.8.8
+MTU = ${AWG_MTU:-1280}
 Jc = ${AWG_JC}
 Jmin = ${AWG_JMIN}
 Jmax = ${AWG_JMAX}
@@ -2078,10 +2158,19 @@ show_key_if_exists() {
 label_name() {
   local prefix="$1"
   local name="$2"
-  if [[ "${name}" == "${prefix}-"* ]]; then
+  local location="XX"
+  if [[ -r "/opt/vpn-stack/server-location.txt" ]]; then
+    location="$(</opt/vpn-stack/server-location.txt)"
+  fi
+  location="$(printf '%s' "${location}" | tr '[:lower:]' '[:upper:]')"
+  if [[ ! "${location}" =~ ^[A-Z]{2}$ ]]; then
+    location="XX"
+  fi
+
+  if [[ "${name}" == "${prefix}-${location}-"* ]]; then
     printf '%s' "${name}"
   else
-    printf '%s-%s' "${prefix}" "${name}"
+    printf '%s-%s-%s' "${prefix}" "${location}" "${name}"
   fi
 }
 
@@ -2125,9 +2214,9 @@ AmneziaWG diagnostics:
   vpn-awg capture 30
 
 Saved keys:
-  /root/vpn-keys/trojan/TROJAN-<name>.txt
-  /root/vpn-keys/hysteria/HYSTERIA-<name>.txt
-  /root/vpn-keys/awg/AWG-<name>.conf
+  /root/vpn-keys/trojan/TROJAN-<LOCATION>-<name>.txt
+  /root/vpn-keys/hysteria/HYSTERIA-<LOCATION>-<name>.txt
+  /root/vpn-keys/awg/AWG-<LOCATION>-<name>.conf
 
 Show saved client material:
   vpn-help trojan phone1
@@ -2487,6 +2576,7 @@ Golden VPN stack summary
 ============================================================
 Domain: ${DOMAIN}
 Server IPv4: ${PUBLIC_IPV4}
+Server location: ${SERVER_LOCATION}
 External interface: ${EXT_IFACE}
 
 Contours:
@@ -2508,6 +2598,7 @@ Grafana SSH tunnel:
 
 AmneziaWG diagnostics:
   Obfuscation profile: $(grep -E '^AWG_OBFS_PROFILE=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')
+  MTU: $(grep -E '^AWG_MTU=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')
   Full status: vpn-awg analyze
   Status + short sniff: vpn-awg analyze 20
   Save pcap: vpn-awg capture 30
@@ -2530,9 +2621,9 @@ Storage limits:
   Prometheus retention: 7d / 1GB
 
 Initial client files:
-  ${KEY_DIR}/trojan/TROJAN-main-trojan.txt
-  ${KEY_DIR}/hysteria/HYSTERIA-main-hysteria-client.txt
-  ${KEY_DIR}/awg/AWG-main-awg.conf
+  ${KEY_DIR}/trojan/TROJAN-${SERVER_LOCATION}-main-trojan.txt
+  ${KEY_DIR}/hysteria/HYSTERIA-${SERVER_LOCATION}-main-hysteria-client.txt
+  ${KEY_DIR}/awg/AWG-${SERVER_LOCATION}-main-awg.conf
 
 Create more clients:
   vpn-trojan phone1
@@ -2563,9 +2654,9 @@ final_checks() {
 
   log "Initial client files:"
   printf '  %s\n' \
-    "${KEY_DIR}/trojan/TROJAN-main-trojan.txt" \
-    "${KEY_DIR}/hysteria/HYSTERIA-main-hysteria-client.txt" \
-    "${KEY_DIR}/awg/AWG-main-awg.conf"
+    "${KEY_DIR}/trojan/TROJAN-${SERVER_LOCATION}-main-trojan.txt" \
+    "${KEY_DIR}/hysteria/HYSTERIA-${SERVER_LOCATION}-main-hysteria-client.txt" \
+    "${KEY_DIR}/awg/AWG-${SERVER_LOCATION}-main-awg.conf"
   log "Optional helper smoke tests create extra clients:"
   printf '  vpn-trojan test-trojan\n  vpn-hysteria test-hy2\n  vpn-awg test-awg\n'
   print_install_summary
