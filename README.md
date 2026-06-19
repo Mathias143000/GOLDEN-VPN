@@ -19,6 +19,69 @@ Before running the installer:
 - run as `root`
 - use a Cloudflare token with DNS edit access for the zone
 
+## Safe Two-Stage Install
+
+Use this flow on fresh VPS hosts. It keeps SSH explicit, clears stale one-time resume units, performs one manual reboot, then installs from Git without installer-managed reboot/resume.
+
+Stage 1, run from the VPS console or SSH, then let it reboot:
+
+```bash
+cat >/root/golden-vpn-preflight.sh <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+systemctl disable --now vpn-stack-resume-install.timer vpn-stack-resume-install.service vpn-stack-ssh-guard.service 2>/dev/null || true
+rm -f /etc/systemd/system/vpn-stack-resume-install.service /etc/systemd/system/vpn-stack-resume-install.timer /etc/systemd/system/vpn-stack-ssh-guard.service
+rm -f /usr/local/sbin/vpn-stack-resume-install.sh /usr/local/sbin/vpn-stack-ssh-guard.sh
+rm -f /root/vpn-stack-resume/install-vpn-stack.sh /etc/golden-vpn-installer/install.env
+rmdir /root/vpn-stack-resume /etc/golden-vpn-installer 2>/dev/null || true
+systemctl daemon-reload || true
+
+while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1; do
+  echo "Waiting for apt/dpkg lock..."
+  sleep 5
+done
+
+dpkg --configure -a
+apt-get -f install -y
+apt-get update
+apt-get install -y openssh-server curl ca-certificates git
+ssh-keygen -A
+
+systemctl unmask ssh sshd ssh.service sshd.service ssh.socket || true
+systemctl enable --now ssh.service || systemctl enable --now sshd.service || systemctl enable --now ssh.socket
+systemctl restart ssh.service || systemctl restart sshd.service || true
+
+ufw allow 22/tcp || true
+ufw allow OpenSSH || true
+ufw reload || ufw --force enable || true
+ss -lntp | grep -E ':(22)\b'
+
+reboot
+EOF
+
+bash /root/golden-vpn-preflight.sh
+```
+
+Stage 2, after the VPS comes back and SSH works:
+
+```bash
+apt-get update
+apt-get install -y git curl ca-certificates
+
+if [ -d /root/GOLDEN-VPN/.git ]; then
+  git -C /root/GOLDEN-VPN pull --ff-only
+else
+  git clone https://github.com/Mathias143000/GOLDEN-VPN.git /root/GOLDEN-VPN
+fi
+cd /root/GOLDEN-VPN
+
+export VPN_STACK_NO_AUTO_REBOOT=1
+export VPN_STACK_IGNORE_SAVED_ENV=1
+
+./install-vpn-stack.sh
+```
+
 ## Install From GitHub
 
 ```bash
@@ -49,15 +112,20 @@ export EMAIL="teriomta@gmail.com"
 export CF_Token="CLOUDFLARE_DNS_TOKEN"
 # Optional fallback:
 export CF_Zone_ID="CLOUDFLARE_ZONE_ID"
-# Optional: if a kernel reboot is pending, reboot and resume installer once.
-export VPN_STACK_AUTO_REBOOT_RESUME=1
+# Recommended for manual two-stage installs:
+export VPN_STACK_NO_AUTO_REBOOT=1
+export VPN_STACK_IGNORE_SAVED_ENV=1
 
 ./install-vpn-stack.sh
 ```
 
-If a kernel reboot is required for AmneziaWG DKMS, the interactive installer can create a one-time systemd resume unit and boot timer, reboot, and continue automatically after the VPS comes back. The installer saves the entered values in the systemd `EnvironmentFile` `/etc/golden-vpn-installer/install.env` with `0600` permissions, runs `/root/vpn-stack-resume/install-vpn-stack.sh` once after boot through `vpn-stack-resume-install.service` and `vpn-stack-resume-install.timer`, and removes the unit, timer, copied installer, and saved env only after the installation finishes successfully.
+If a kernel reboot is required for AmneziaWG DKMS, the installer stops and asks you to reboot manually. Automatic reboot/resume is disabled by default to avoid losing SSH access. The old one-time resume prompt is available only when explicitly requested:
 
-Before any installer-triggered reboot, the installer also installs a temporary `vpn-stack-ssh-guard.service` and immediately allows SSH in UFW. This guard opens `22/tcp`, `OpenSSH`, the current SSH session port, and configured `sshd` ports early on boot. It is removed after successful installation.
+```bash
+export VPN_STACK_ALLOW_REBOOT_PROMPT=1
+```
+
+The older systemd resume flow saves values in `/etc/golden-vpn-installer/install.env` and runs `/root/vpn-stack-resume/install-vpn-stack.sh` once after boot. Prefer the Safe Two-Stage Install above for clean servers.
 
 Resume logs:
 

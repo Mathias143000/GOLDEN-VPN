@@ -72,6 +72,10 @@ die() {
   exit 1
 }
 
+apt_get() {
+  apt-get -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT:-600}" "$@"
+}
+
 progress() {
   local message="$1"
   local width=24
@@ -190,6 +194,11 @@ installer_self_path() {
 }
 
 load_saved_resume_env() {
+  if [[ "${VPN_STACK_IGNORE_SAVED_ENV:-0}" == "1" ]]; then
+    log "Ignoring saved installer environment because VPN_STACK_IGNORE_SAVED_ENV=1."
+    return 0
+  fi
+
   if [[ -z "${VPN_STACK_RESUMED:-}" && -r "${RESUME_INSTALL_ENV}" ]]; then
     log "Loading saved installer environment from ${RESUME_INSTALL_ENV}."
     set -a
@@ -211,6 +220,8 @@ write_resume_env() {
     [[ -n "${ZEROSSL_EAB_KID:-}" ]] && printf 'ZEROSSL_EAB_KID=%q\n' "${ZEROSSL_EAB_KID}"
     [[ -n "${ZEROSSL_EAB_HMAC_KEY:-}" ]] && printf 'ZEROSSL_EAB_HMAC_KEY=%q\n' "${ZEROSSL_EAB_HMAC_KEY}"
     [[ -n "${VPN_STACK_DISABLE_LE_FALLBACK:-}" ]] && printf 'VPN_STACK_DISABLE_LE_FALLBACK=%q\n' "${VPN_STACK_DISABLE_LE_FALLBACK}"
+    [[ -n "${VPN_STACK_NO_AUTO_REBOOT:-}" ]] && printf 'VPN_STACK_NO_AUTO_REBOOT=%q\n' "${VPN_STACK_NO_AUTO_REBOOT}"
+    [[ -n "${VPN_STACK_ALLOW_REBOOT_PROMPT:-}" ]] && printf 'VPN_STACK_ALLOW_REBOOT_PROMPT=%q\n' "${VPN_STACK_ALLOW_REBOOT_PROMPT}"
     printf 'VPN_STACK_RESUMED=1\n'
     printf 'DEBIAN_FRONTEND=noninteractive\n'
   } >"${RESUME_INSTALL_ENV}"
@@ -269,8 +280,8 @@ ensure_ssh_firewall_access() {
   fi
 
   if ! command -v sshd >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-    apt-get update >/dev/null 2>&1 || true
-    apt-get install -y openssh-server >/dev/null 2>&1 || true
+    apt_get update >/dev/null 2>&1 || true
+    apt_get install -y openssh-server >/dev/null 2>&1 || true
   fi
 
   ssh-keygen -A >/dev/null 2>&1 || true
@@ -314,6 +325,10 @@ set -u
 log_file="/var/log/vpn-stack-ssh-guard.log"
 current_ssh_port="${current_ssh_port}"
 
+apt_get() {
+  apt-get -o DPkg::Lock::Timeout="\${APT_LOCK_TIMEOUT:-600}" "\$@"
+}
+
 {
   printf '%s ssh guard start\n' "\$(date -Is)"
 
@@ -346,8 +361,8 @@ current_ssh_port="${current_ssh_port}"
   fi
 
   if ! command -v sshd >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-    apt-get update || true
-    apt-get install -y openssh-server || true
+    apt_get update || true
+    apt_get install -y openssh-server || true
   fi
 
   ssh-keygen -A || true
@@ -577,7 +592,12 @@ EOF
 }
 
 auto_reboot_resume_enabled() {
-  [[ "${VPN_STACK_AUTO_REBOOT_RESUME:-}" == "1" || "${AUTO_REBOOT_RESUME:-}" == "1" ]]
+  [[ "${VPN_STACK_NO_AUTO_REBOOT:-0}" != "1" ]] \
+    && [[ "${VPN_STACK_AUTO_REBOOT_RESUME:-}" == "1" || "${AUTO_REBOOT_RESUME:-}" == "1" ]]
+}
+
+reboot_prompt_enabled() {
+  [[ "${VPN_STACK_NO_AUTO_REBOOT:-0}" != "1" ]] && [[ "${VPN_STACK_ALLOW_REBOOT_PROMPT:-0}" == "1" ]]
 }
 
 newest_installed_kernel() {
@@ -619,7 +639,7 @@ EOF
       exit 0
     fi
 
-    if [[ "${mode}" == "prompt" && "${DKMS_KERNEL_REBOOT_PROMPTED}" != "1" ]]; then
+    if [[ "${mode}" == "prompt" && "${DKMS_KERNEL_REBOOT_PROMPTED}" != "1" && reboot_prompt_enabled ]]; then
       DKMS_KERNEL_REBOOT_PROMPTED=1
       if prompt_yes_no "Reboot now and resume installer once after boot?"; then
         schedule_resume_install_once
@@ -628,15 +648,24 @@ EOF
         exit 0
       fi
     else
-      warn "Kernel reboot is required before AmneziaWG DKMS can continue; not asking again in this run."
+      warn "Kernel reboot is required before AmneziaWG DKMS can continue."
     fi
 
     cat >&2 <<EOF
 
-Reboot the VPS, then run the installer again:
+[vpn-stack] Automatic reboot/resume is disabled by default to avoid losing SSH access.
+[vpn-stack] Reboot manually, then run the installer again from Git after SSH is reachable:
 
   reboot
+
+After the VPS comes back:
+
+  export VPN_STACK_NO_AUTO_REBOOT=1
   ./install-vpn-stack.sh
+
+If you really want the old interactive reboot/resume prompt, set:
+
+  export VPN_STACK_ALLOW_REBOOT_PROMPT=1
 
 EOF
     exit 1
@@ -676,8 +705,8 @@ verify_domain_dns() {
 
 install_apt_repositories() {
   log "Installing APT prerequisites and external repositories."
-  apt-get update
-  apt-get install -y apt-transport-https curl wget ca-certificates gnupg lsb-release iproute2 software-properties-common
+  apt_get update
+  apt_get install -y apt-transport-https curl wget ca-certificates gnupg lsb-release iproute2 software-properties-common
 
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
@@ -709,13 +738,13 @@ deb-src [signed-by=/usr/share/keyrings/amnezia.gpg] https://ppa.launchpadcontent
 EOF
   chmod 0644 /etc/apt/sources.list.d/amneziawg.list
 
-  apt-get update
+  apt_get update
 }
 
 install_base_packages() {
   log "Installing base packages."
-  apt-get install -y "${BASE_PACKAGES[@]}" software-properties-common python3-launchpadlib
-  apt-get install -y "linux-headers-$(uname -r)" || warn "linux-headers-$(uname -r) was not installable; AmneziaWG DKMS may need manual kernel headers."
+  apt_get install -y "${BASE_PACKAGES[@]}" software-properties-common python3-launchpadlib
+  apt_get install -y "linux-headers-$(uname -r)" || warn "linux-headers-$(uname -r) was not installable; AmneziaWG DKMS may need manual kernel headers."
 }
 
 cloudflare_zone_from_domain() {
@@ -1263,10 +1292,10 @@ EOF
 install_amneziawg() {
   log "Installing AmneziaWG."
   check_dkms_kernel_ready no-prompt
-  apt-get update
-  if ! apt-get install -y amneziawg; then
+  apt_get update
+  if ! apt_get install -y amneziawg; then
     warn "amneziawg meta package install failed; trying amneziawg-dkms and amneziawg-tools directly."
-    if ! apt-get install -y amneziawg-dkms amneziawg-tools; then
+    if ! apt_get install -y amneziawg-dkms amneziawg-tools; then
       if [[ -f /var/lib/dkms/amneziawg/1.0.0/build/make.log ]]; then
         warn "Last 80 lines of AmneziaWG DKMS build log:"
         tail -n 80 /var/lib/dkms/amneziawg/1.0.0/build/make.log >&2 || true
@@ -1279,7 +1308,7 @@ install_amneziawg() {
 
   if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
     warn "awg or awg-quick was not found after package install; building amneziawg-tools from source."
-    apt-get install -y git make golang-go
+    apt_get install -y git make golang-go
     local build_dir
     build_dir="$(mktemp -d)"
     git clone --depth=1 https://github.com/amnezia-vpn/amneziawg-tools "${build_dir}/amneziawg-tools"
