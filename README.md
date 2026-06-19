@@ -79,7 +79,11 @@ cd /root/GOLDEN-VPN
 export VPN_STACK_NO_AUTO_REBOOT=1
 export VPN_STACK_IGNORE_SAVED_ENV=1
 
-./install-vpn-stack.sh
+if [ -n "${DOMAIN:-}" ] && [ -n "${EMAIL:-}" ] && [ -n "${SERVER_LOCATION:-}" ] && [ -n "${CF_Token:-}" ]; then
+  ./install-vpn-stack.sh preflight
+fi
+
+./install-vpn-stack.sh install
 ```
 
 ## Install From GitHub
@@ -92,6 +96,16 @@ curl -fsSL https://raw.githubusercontent.com/Mathias143000/GOLDEN-VPN/main/insta
 chmod +x install-vpn-stack.sh
 
 ./install-vpn-stack.sh
+```
+
+Installer modes:
+
+```bash
+./install-vpn-stack.sh preflight
+./install-vpn-stack.sh install
+./install-vpn-stack.sh validate
+./install-vpn-stack.sh report
+./install-vpn-stack.sh render-decoy /tmp/decoy-preview
 ```
 
 The installer asks for:
@@ -122,6 +136,22 @@ export VPN_STACK_NO_AUTO_REBOOT=1
 export VPN_STACK_IGNORE_SAVED_ENV=1
 
 ./install-vpn-stack.sh
+```
+
+Optional tuning variables:
+
+```bash
+export AWG_OBFS_PROFILE="random-balanced"   # dns, quic-lite, video-call, mobile-low-mtu, random-balanced, custom
+export AWG_MTU="1280"                       # or auto
+export AWG_ENDPOINT_PORT="51820"
+export AWG_DNS="1.1.1.1, 8.8.8.8"
+export AWG_ALLOWED_IPS="0.0.0.0/0, ::/0"
+export AWG_KEEPALIVE="25"
+
+export DECOY_PROFILE="random"               # network-monitor, software-status, edge-docs, availability-lab, random
+export DECOY_SEED="optional-repeatable-seed"
+export DECOY_BRAND="Optional Brand"
+export DECOY_REGION="EU-West"
 ```
 
 If a kernel reboot is required for AmneziaWG DKMS, the installer stops and asks you to reboot manually. Automatic reboot/resume is disabled by default to avoid losing SSH access. The old one-time resume prompt is available only when explicitly requested:
@@ -195,12 +225,35 @@ The decoy site is generated at install time:
 /var/www/decoy/assets/style.css
 ```
 
-The decoy generator is embedded in `install-vpn-stack.sh`: it writes static HTML/CSS directly, randomizes the neutral brand name, build id, color pair, region label, status copy, and docs title, and serves it through nginx on `443/tcp`. It does not clone templates, use external CDN assets, forms, cookies, analytics, backend code, or JavaScript.
+The decoy generator is embedded in `install-vpn-stack.sh`: it writes static HTML/CSS directly, chooses one of the built-in profiles, records the profile/seed/palette in `/opt/vpn-stack/decoy-manifest.json`, and serves it through nginx on `443/tcp`. It does not clone templates, use external CDN assets, forms, cookies, analytics, backend code, or JavaScript. The installer scans generated public HTML/CSS for forbidden protocol terms before reloading nginx.
+
+Preview a decoy render without touching nginx:
+
+```bash
+./install-vpn-stack.sh render-decoy /tmp/decoy-preview
+```
 
 Show help:
 
 ```bash
 vpn-help
+```
+
+Validate and print install reports:
+
+```bash
+./install-vpn-stack.sh validate
+./install-vpn-stack.sh report
+cat /root/vpn-keys/install-report.json
+```
+
+Report files:
+
+```text
+/root/vpn-keys/install-report.txt
+/root/vpn-keys/install-report.json
+/opt/vpn-stack/awg-tuning-report.json
+/opt/vpn-stack/decoy-manifest.json
 ```
 
 Open Grafana through SSH tunnel:
@@ -227,6 +280,13 @@ admin / admin
 vpn-awg analyze
 vpn-awg analyze 20
 vpn-awg capture 30
+vpn-awg analyze-live 20
+vpn-awg profile
+vpn-awg explain
+vpn-awg list
+vpn-awg show phone1
+vpn-awg revoke phone1
+vpn-awg rotate phone1
 ```
 
 Captures are saved under:
@@ -235,7 +295,7 @@ Captures are saved under:
 /var/log/vpn-stack/awg-captures/
 ```
 
-AmneziaWG parameters are randomized from the selected profile (`AWG_OBFS_PROFILE=dns` by default, `quic-lite` optional). The installer sets `AWG_MTU=1280` by default and writes it into server and client configs; override with `export AWG_MTU=1280` or another value from `1200..1420` before install. Tcpdump is not run automatically during install; use `vpn-awg analyze 20` or `vpn-awg capture 30` when you intentionally want packet-size diagnostics.
+AmneziaWG parameters are randomized from the selected profile. Supported profiles are `dns`, `quic-lite`, `video-call`, `mobile-low-mtu`, `random-balanced`, and `custom`; default is `random-balanced`. The installer writes `/opt/vpn-stack/awg-params.env` and `/opt/vpn-stack/awg-tuning-report.json`. Use `AWG_MTU=auto` for a PMTU probe with safe fallback to `1280`, or set an explicit value from `1200..1420`. Tcpdump is not run automatically during install; use `vpn-awg analyze 20`, `vpn-awg capture 30`, or `vpn-awg analyze-live 20` only when you intentionally want packet-size diagnostics.
 
 ## Troubleshooting
 

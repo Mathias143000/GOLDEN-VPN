@@ -27,6 +27,11 @@ SSH_GUARD_UNIT="/etc/systemd/system/${SSH_GUARD_SERVICE}"
 INSTALL_LOCK="/run/golden-vpn-install.lock"
 INSTALL_PROGRESS_FILE="${LOG_DIR}/install-progress.env"
 INSTALL_STATUS_HELPER="/usr/local/bin/vpn-install-status"
+INSTALL_REPORT_TXT="${KEY_DIR}/install-report.txt"
+INSTALL_REPORT_JSON="${KEY_DIR}/install-report.json"
+DECOY_MANIFEST="${STACK_DIR}/decoy-manifest.json"
+AWG_TUNING_REPORT="${STACK_DIR}/awg-tuning-report.json"
+AWG_DEFAULT_PORT=51820
 INSTALL_TOTAL_STEPS=25
 INSTALL_STEP=0
 PUBLIC_IPV4=""
@@ -48,6 +53,8 @@ BASE_PACKAGES=(
   lsb-release
   gnupg
   iptables
+  iproute2
+  iputils-ping
   tcpdump
   python3
   build-essential
@@ -281,6 +288,13 @@ write_resume_env() {
     [[ -n "${VPN_STACK_DISABLE_LE_FALLBACK:-}" ]] && printf 'VPN_STACK_DISABLE_LE_FALLBACK=%q\n' "${VPN_STACK_DISABLE_LE_FALLBACK}"
     [[ -n "${VPN_STACK_NO_AUTO_REBOOT:-}" ]] && printf 'VPN_STACK_NO_AUTO_REBOOT=%q\n' "${VPN_STACK_NO_AUTO_REBOOT}"
     [[ -n "${VPN_STACK_ALLOW_REBOOT_PROMPT:-}" ]] && printf 'VPN_STACK_ALLOW_REBOOT_PROMPT=%q\n' "${VPN_STACK_ALLOW_REBOOT_PROMPT}"
+    for opt in \
+      AWG_OBFS_PROFILE AWG_MTU AWG_DNS AWG_ALLOWED_IPS AWG_KEEPALIVE AWG_ENDPOINT_PORT \
+      AWG_JC AWG_JMIN AWG_JMAX AWG_S1 AWG_S2 AWG_S3 AWG_S4 AWG_H1 AWG_H2 AWG_H3 AWG_H4 \
+      AWG_I1 AWG_I2 AWG_I3 AWG_I4 AWG_I5 \
+      DECOY_PROFILE DECOY_SEED DECOY_BRAND DECOY_REGION; do
+      [[ -n "${!opt:-}" ]] && printf '%s=%q\n' "${opt}" "${!opt}"
+    done
     printf 'VPN_STACK_RESUMED=1\n'
     printf 'DEBIAN_FRONTEND=noninteractive\n'
   } >"${RESUME_INSTALL_ENV}"
@@ -943,6 +957,20 @@ uri_encode() {
   python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
 }
 
+json_escape() {
+  local value="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -Rn --arg value "${value}" '$value'
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${value}"
+  else
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    printf '"%s"\n' "${value}"
+  fi
+}
+
 label_name() {
   local prefix="$1"
   local name="$2"
@@ -975,6 +1003,90 @@ pick_decoy_value() {
   printf '%s' "$1"
 }
 
+decoy_hash_index() {
+  local seed="$1"
+  local slot="$2"
+  local count="$3"
+  local hex
+  if command -v sha256sum >/dev/null 2>&1; then
+    hex="$(printf '%s' "${seed}:${slot}" | sha256sum | awk '{print substr($1, 1, 8)}')"
+  else
+    hex="$(printf '%s' "${seed}:${slot}" | openssl dgst -sha256 -r | awk '{print substr($1, 1, 8)}')"
+  fi
+  printf '%s\n' $((16#${hex} % count + 1))
+}
+
+decoy_digest8() {
+  local value="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "${value}" | sha256sum | awk '{print substr($1, 1, 8)}'
+  else
+    printf '%s' "${value}" | openssl dgst -sha256 -r | awk '{print substr($1, 1, 8)}'
+  fi
+}
+
+pick_seeded_value() {
+  local seed="$1"
+  local slot="$2"
+  local count idx
+  shift 2
+  count="$#"
+  [[ "${count}" -gt 0 ]] || return 1
+  idx="$(decoy_hash_index "${seed}" "${slot}" "${count}")"
+  while ((idx > 1)); do
+    shift
+    idx=$((idx - 1))
+  done
+  printf '%s' "$1"
+}
+
+normalize_decoy_profile() {
+  local value="$1"
+  value="$(trim_value "${value}")"
+  value="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')"
+  case "${value}" in
+    ""|random)
+      printf 'random'
+      ;;
+    network-monitor|software-status|edge-docs|availability-lab)
+      printf '%s' "${value}"
+      ;;
+    monitoring)
+      printf 'network-monitor'
+      ;;
+    software|status)
+      printf 'software-status'
+      ;;
+    docs)
+      printf 'edge-docs'
+      ;;
+    lab)
+      printf 'availability-lab'
+      ;;
+    *)
+      die "Unsupported DECOY_PROFILE='${value}'. Use network-monitor, software-status, edge-docs, availability-lab, or random."
+      ;;
+  esac
+}
+
+scan_decoy_tree() {
+  local root="$1"
+  local forbidden_pattern='(vpn|proxy|tunnel|wireguard|trojan|hysteria|amnezia|xray)'
+  if grep -RInEi --include='*.html' --include='*.css' --include='*.txt' "${forbidden_pattern}" "${root}" >/tmp/golden-vpn-decoy-forbidden.$$ 2>/dev/null; then
+    cat /tmp/golden-vpn-decoy-forbidden.$$ >&2 || true
+    rm -f /tmp/golden-vpn-decoy-forbidden.$$
+    die "Decoy content contains forbidden public terms."
+  fi
+  rm -f /tmp/golden-vpn-decoy-forbidden.$$ 2>/dev/null || true
+
+  if grep -RInE --include='*.html' --include='*.css' 'https?://|//' "${root}" >/tmp/golden-vpn-decoy-urls.$$ 2>/dev/null; then
+    cat /tmp/golden-vpn-decoy-urls.$$ >&2 || true
+    rm -f /tmp/golden-vpn-decoy-urls.$$
+    die "Decoy content contains external URL references."
+  fi
+  rm -f /tmp/golden-vpn-decoy-urls.$$ 2>/dev/null || true
+}
+
 write_trojan_link() {
   local password="$1"
   local name="$2"
@@ -989,6 +1101,247 @@ write_trojan_link() {
   printf '%s\n' "${link}" >"${KEY_DIR}/trojan/${label}.txt"
   chmod 0600 "${KEY_DIR}/trojan/${label}.txt"
   printf '%s\n' "${link}"
+}
+
+render_decoy_site() {
+  local target_dir="$1"
+  local manifest_path="${2:-}"
+  local requested_profile profile seed brand tagline focus region primary accent bg surface build_id status_note docs_title
+  local card_one card_two card_three card_one_text card_two_text card_three_text
+
+  requested_profile="$(normalize_decoy_profile "${DECOY_PROFILE:-random}")"
+  seed="${DECOY_SEED:-$(rand_hex 8)}"
+  if [[ "${requested_profile}" == "random" ]]; then
+    profile="$(pick_seeded_value "${seed}" "profile" "network-monitor" "software-status" "edge-docs" "availability-lab")"
+  else
+    profile="${requested_profile}"
+  fi
+
+  case "${profile}" in
+    network-monitor)
+      brand="$(pick_seeded_value "${seed}" "brand" "Netwatch" "Pulsegrid" "Signal Harbor" "Lattice Monitor")"
+      tagline="$(pick_seeded_value "${seed}" "tagline" "Lightweight availability checks for distributed teams." "Quiet visibility for public service surfaces." "Simple availability signals for operations teams.")"
+      focus="$(pick_seeded_value "${seed}" "focus" "availability checks" "route samples" "latency snapshots" "maintenance windows")"
+      docs_title="Check catalog"
+      status_note="$(pick_seeded_value "${seed}" "status" "All public endpoints are responding normally." "Regional checks are within normal operating range." "No active maintenance windows are scheduled.")"
+      card_one="Endpoint checks"; card_one_text="Small availability checks help teams confirm that public service surfaces are reachable."
+      card_two="Maintenance notes"; card_two_text="Planned work and operational windows are recorded as concise status updates."
+      card_three="Route samples"; card_three_text="Regional signal snapshots make routine behavior easier to compare over time."
+      ;;
+    software-status)
+      brand="$(pick_seeded_value "${seed}" "brand" "Northstar Systems" "Uplink Labs" "Clearboard" "Beacon Desk")"
+      tagline="$(pick_seeded_value "${seed}" "tagline" "A compact status surface for service operators." "Public notes for software availability and maintenance." "Small status pages for practical operations.")"
+      focus="$(pick_seeded_value "${seed}" "focus" "release windows" "service checks" "operator notes" "status updates")"
+      docs_title="Operator notes"
+      status_note="$(pick_seeded_value "${seed}" "status" "Application surfaces are operating normally." "No scheduled work is active right now." "Routine checks are passing.")"
+      card_one="Status updates"; card_one_text="Short updates keep availability and planned work easy to scan."
+      card_two="Release windows"; card_two_text="Maintenance windows are listed clearly and kept separate from routine notes."
+      card_three="Public reference"; card_three_text="Static pages provide a stable reference without visitor accounts."
+      ;;
+    edge-docs)
+      brand="$(pick_seeded_value "${seed}" "brand" "Edgebook" "Atlas Reference" "Relay Notes" "Field Manual")"
+      tagline="$(pick_seeded_value "${seed}" "tagline" "Operational references for public availability checks." "A static reference for edge status and maintenance notes." "Clear documentation for lightweight service checks.")"
+      focus="$(pick_seeded_value "${seed}" "focus" "reference pages" "check definitions" "status summaries" "regional notes")"
+      docs_title="Reference notes"
+      status_note="$(pick_seeded_value "${seed}" "status" "Reference pages are online." "Check definitions are available." "No documentation maintenance is active.")"
+      card_one="Reference pages"; card_one_text="Documentation is kept static, brief, and easy to mirror."
+      card_two="Check definitions"; card_two_text="Each check has a plain description and a small status summary."
+      card_three="Change notes"; card_three_text="Operational changes are recorded as compact public notes."
+      ;;
+    availability-lab)
+      brand="$(pick_seeded_value "${seed}" "brand" "Signal Lab" "Northline Lab" "Open Cadence" "Metric Yard")"
+      tagline="$(pick_seeded_value "${seed}" "tagline" "Availability sampling for small public services." "Practical service signals without account collection." "A simple public surface for operational sampling.")"
+      focus="$(pick_seeded_value "${seed}" "focus" "sampling cadence" "incident notes" "availability summaries" "public checks")"
+      docs_title="Availability guide"
+      status_note="$(pick_seeded_value "${seed}" "status" "Sampling is operating normally." "The incident feed is clear." "Availability summaries are current.")"
+      card_one="Sampling cadence"; card_one_text="Short sampling intervals keep public status information fresh."
+      card_two="Incident notes"; card_two_text="Incident records are written in a concise operator-friendly format."
+      card_three="Retention"; card_three_text="Older public notes are rotated to keep the surface compact."
+      ;;
+    *)
+      die "Internal decoy profile error: ${profile}"
+      ;;
+  esac
+
+  brand="${DECOY_BRAND:-${brand}}"
+  region="${DECOY_REGION:-$(pick_seeded_value "${seed}" "region" "EU-West" "North Atlantic" "Central Europe" "Edge Group 7" "Global Relay")}"
+  primary="$(pick_seeded_value "${seed}" "primary" "#0f766e" "#2563eb" "#334155" "#047857" "#475569")"
+  accent="$(pick_seeded_value "${seed}" "accent" "#f59e0b" "#06b6d4" "#22c55e" "#64748b" "#f97316")"
+  bg="$(pick_seeded_value "${seed}" "bg" "#f8fafc" "#f5f7fb" "#f7f7f2" "#f4f7f5")"
+  surface="$(pick_seeded_value "${seed}" "surface" "#ffffff" "#fbfdff" "#fffdf7")"
+  build_id="$(decoy_digest8 "${seed}:${profile}")"
+
+  install -d -m 0755 "${target_dir}/assets"
+  cat >"${target_dir}/assets/style.css" <<EOF
+:root {
+  --primary: ${primary};
+  --accent: ${accent};
+  --bg: ${bg};
+  --surface: ${surface};
+  --text: #172033;
+  --muted: #607086;
+  --line: #d9e1ea;
+}
+
+* { box-sizing: border-box; }
+html { min-height: 100%; background: var(--bg); }
+body { margin: 0; min-height: 100vh; font-family: Arial, Helvetica, sans-serif; color: var(--text); background: var(--bg); }
+a { color: inherit; text-decoration: none; }
+.site-header { border-bottom: 1px solid var(--line); background: rgba(255,255,255,.82); }
+.wrap { width: min(1040px, calc(100% - 40px)); margin: 0 auto; }
+.nav { display: flex; align-items: center; justify-content: space-between; min-height: 72px; gap: 24px; }
+.brand { display: flex; align-items: center; gap: 12px; font-weight: 700; }
+.mark { width: 34px; height: 34px; border-radius: 8px; background: linear-gradient(135deg, var(--primary), var(--accent)); }
+.nav-links { display: flex; align-items: center; gap: 18px; color: var(--muted); font-size: 14px; }
+.hero { padding: 72px 0 50px; }
+.hero-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr); gap: 42px; align-items: center; }
+.eyebrow { color: var(--primary); font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+h1 { margin: 14px 0 18px; font-size: clamp(36px, 7vw, 62px); line-height: 1.02; letter-spacing: 0; }
+.lead { max-width: 640px; color: var(--muted); font-size: 18px; line-height: 1.7; }
+.panel { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: 24px; }
+.metric { display: grid; grid-template-columns: 1fr auto; gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.metric:last-child { border-bottom: 0; }
+.metric span { color: var(--muted); }
+.ok { color: var(--primary); font-weight: 700; }
+.section { padding: 42px 0; }
+.cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+.card { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: 22px; }
+.card h2, .card h3 { margin: 0 0 10px; }
+.card p, .body-copy { color: var(--muted); line-height: 1.65; }
+.footer { border-top: 1px solid var(--line); color: var(--muted); padding: 28px 0; font-size: 14px; }
+@media (max-width: 760px) {
+  .nav { align-items: flex-start; flex-direction: column; padding: 18px 0; }
+  .nav-links { flex-wrap: wrap; }
+  .hero { padding-top: 44px; }
+  .hero-grid, .cards { grid-template-columns: 1fr; }
+}
+EOF
+
+  cat >"${target_dir}/index.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${brand} - Availability Monitoring</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap nav">
+      <a class="brand" href="/"><span class="mark"></span><span>${brand}</span></a>
+      <nav class="nav-links"><a href="/status">Status</a><a href="/docs">Docs</a><a href="/privacy">Privacy</a></nav>
+    </div>
+  </header>
+  <main class="hero">
+    <div class="wrap hero-grid">
+      <section>
+        <div class="eyebrow">${region} / build ${build_id}</div>
+        <h1>${tagline}</h1>
+        <p class="lead">${brand} provides a compact public surface for ${focus}, maintenance messages, and simple service availability snapshots.</p>
+      </section>
+      <aside class="panel">
+        <div class="metric"><span>Public endpoint</span><strong class="ok">Online</strong></div>
+        <div class="metric"><span>Sampling window</span><strong>60 sec</strong></div>
+        <div class="metric"><span>Signal region</span><strong>${region}</strong></div>
+        <div class="metric"><span>Incident feed</span><strong class="ok">Clear</strong></div>
+      </aside>
+    </div>
+  </main>
+  <section class="section"><div class="wrap cards"><article class="card"><h3>${card_one}</h3><p>${card_one_text}</p></article><article class="card"><h3>${card_two}</h3><p>${card_two_text}</p></article><article class="card"><h3>${card_three}</h3><p>${card_three_text}</p></article></div></section>
+  <footer class="footer"><div class="wrap">(c) 2026 ${brand}. Operational reference ${build_id}.</div></footer>
+</body>
+</html>
+EOF
+
+  cat >"${target_dir}/status.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Status - ${brand}</title><link rel="stylesheet" href="/assets/style.css"></head>
+<body>
+  <header class="site-header"><div class="wrap nav"><a class="brand" href="/"><span class="mark"></span><span>${brand}</span></a><nav class="nav-links"><a href="/status">Status</a><a href="/docs">Docs</a><a href="/privacy">Privacy</a></nav></div></header>
+  <main class="section"><div class="wrap"><div class="eyebrow">Status</div><h1>Service status</h1><p class="lead">${status_note}</p><div class="panel"><div class="metric"><span>HTTPS surface</span><strong class="ok">Operational</strong></div><div class="metric"><span>Monitoring schedule</span><strong class="ok">Operational</strong></div><div class="metric"><span>Incident queue</span><strong>Empty</strong></div></div></div></main>
+  <footer class="footer"><div class="wrap">Last generated reference ${build_id}.</div></footer>
+</body>
+</html>
+EOF
+
+  cat >"${target_dir}/docs.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Docs - ${brand}</title><link rel="stylesheet" href="/assets/style.css"></head>
+<body>
+  <header class="site-header"><div class="wrap nav"><a class="brand" href="/"><span class="mark"></span><span>${brand}</span></a><nav class="nav-links"><a href="/status">Status</a><a href="/docs">Docs</a><a href="/privacy">Privacy</a></nav></div></header>
+  <main class="section"><div class="wrap"><div class="eyebrow">${docs_title}</div><h1>Availability reference</h1><p class="body-copy">This static reference describes the public status surface, sampling cadence, and maintenance message format used by ${brand}. It does not collect visitor input and does not require an account.</p><div class="cards"><article class="card"><h3>Checks</h3><p>Endpoint checks are lightweight and intended for availability confirmation.</p></article><article class="card"><h3>Updates</h3><p>Maintenance updates are short, timestamped, and human reviewed.</p></article><article class="card"><h3>Retention</h3><p>Public operational notes are kept compact and rotated periodically.</p></article></div></div></main>
+  <footer class="footer"><div class="wrap">Reference ${build_id}.</div></footer>
+</body>
+</html>
+EOF
+
+  cat >"${target_dir}/privacy.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Privacy - ${brand}</title><link rel="stylesheet" href="/assets/style.css"></head>
+<body>
+  <header class="site-header"><div class="wrap nav"><a class="brand" href="/"><span class="mark"></span><span>${brand}</span></a><nav class="nav-links"><a href="/status">Status</a><a href="/docs">Docs</a><a href="/privacy">Privacy</a></nav></div></header>
+  <main class="section"><div class="wrap"><div class="eyebrow">Privacy</div><h1>Minimal public page</h1><p class="lead">${brand} is a static informational surface. It has no forms, no accounts, no cookies, and no browser analytics.</p><div class="panel"><p class="body-copy">Standard web server logs may record request time, IP address, user agent, and requested path for security and operational troubleshooting.</p></div></div></main>
+  <footer class="footer"><div class="wrap">Policy reference ${build_id}.</div></footer>
+</body>
+</html>
+EOF
+
+  cat >"${target_dir}/404.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Not found - ${brand}</title><link rel="stylesheet" href="/assets/style.css"></head>
+<body><main class="section"><div class="wrap"><div class="eyebrow">404</div><h1>Page not found</h1><p class="lead">The requested reference page is not available.</p><p><a href="/">Return to ${brand}</a></p></div></main></body>
+</html>
+EOF
+
+  cat >"${target_dir}/robots.txt" <<'EOF'
+User-agent: *
+Allow: /
+Disallow: /assets/
+EOF
+  chmod 0644 "${target_dir}/assets/style.css" "${target_dir}/index.html" "${target_dir}/status.html" "${target_dir}/docs.html" "${target_dir}/privacy.html" "${target_dir}/404.html" "${target_dir}/robots.txt"
+  scan_decoy_tree "${target_dir}"
+
+  if [[ -n "${manifest_path}" ]]; then
+    install -d -m 0700 "$(dirname "${manifest_path}")"
+    cat >"${manifest_path}" <<EOF
+{
+  "generated_at": $(json_escape "$(date -Is)"),
+  "profile": $(json_escape "${profile}"),
+  "requested_profile": $(json_escape "${requested_profile}"),
+  "seed": $(json_escape "${seed}"),
+  "brand": $(json_escape "${brand}"),
+  "region": $(json_escape "${region}"),
+  "build_id": $(json_escape "${build_id}"),
+  "palette": {
+    "primary": $(json_escape "${primary}"),
+    "accent": $(json_escape "${accent}"),
+    "background": $(json_escape "${bg}"),
+    "surface": $(json_escape "${surface}")
+  },
+  "pages": [
+    "index.html",
+    "status.html",
+    "docs.html",
+    "privacy.html",
+    "404.html",
+    "robots.txt",
+    "assets/style.css"
+  ]
+}
+EOF
+    chmod 0600 "${manifest_path}"
+  fi
+
+  if [[ -d "${STACK_DIR}" && -w "${STACK_DIR}" ]]; then
+    printf '%s\n' "${brand}" >"${STACK_DIR}/decoy-brand.txt"
+    printf '%s\n' "${build_id}" >"${STACK_DIR}/decoy-build-id.txt"
+    chmod 0600 "${STACK_DIR}/decoy-brand.txt" "${STACK_DIR}/decoy-build-id.txt"
+  fi
 }
 
 configure_xray() {
@@ -1236,6 +1589,8 @@ Disallow: /assets/
 EOF
   chmod 0644 /var/www/decoy/assets/style.css /var/www/decoy/index.html /var/www/decoy/status.html /var/www/decoy/docs.html /var/www/decoy/privacy.html /var/www/decoy/404.html /var/www/decoy/robots.txt
 
+  render_decoy_site "/var/www/decoy" "${DECOY_MANIFEST}"
+
   rm -f /etc/nginx/sites-enabled/default
   rm -f /etc/nginx/sites-enabled/decoy-8444.conf /etc/nginx/sites-available/decoy-8444.conf
   rm -f /etc/nginx/stream-conf.d/vpn-stack.conf
@@ -1436,79 +1791,69 @@ awg_genpsk() {
   fi
 }
 
-write_awg_client_config() {
+validate_int_range() {
   local name="$1"
-  local client_private="$2"
-  local client_ip="$3"
-  local server_public="$4"
-  local psk="$5"
-  local label out_file
-  label="$(label_name "AWG" "${name}")"
-  out_file="${KEY_DIR}/awg/${label}.conf"
-
-  # shellcheck disable=SC1091
-  source "${STACK_DIR}/awg-params.env"
-  install -d -m 0700 "${KEY_DIR}/awg"
-  cat >"${out_file}" <<EOF
-# ${label}
-[Interface]
-PrivateKey = ${client_private}
-Address = ${client_ip}/32
-DNS = 1.1.1.1, 8.8.8.8
-MTU = ${AWG_MTU:-1280}
-Jc = ${AWG_JC}
-Jmin = ${AWG_JMIN}
-Jmax = ${AWG_JMAX}
-S1 = ${AWG_S1}
-S2 = ${AWG_S2}
-S3 = ${AWG_S3}
-S4 = ${AWG_S4}
-H1 = ${AWG_H1}
-H2 = ${AWG_H2}
-H3 = ${AWG_H3}
-H4 = ${AWG_H4}
-I1 = ${AWG_I1}
-I2 = ${AWG_I2}
-I3 = ${AWG_I3}
-I4 = ${AWG_I4}
-I5 = ${AWG_I5}
-
-[Peer]
-PublicKey = ${server_public}
-PresharedKey = ${psk}
-Endpoint = ${DOMAIN}:51820
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
-EOF
-  chmod 0600 "${out_file}"
-  cat "${out_file}"
+  local value="$2"
+  local min="$3"
+  local max="$4"
+  [[ "${value}" =~ ^[0-9]+$ ]] || die "${name} must be an integer from ${min} to ${max}."
+  [[ "${value}" -ge "${min}" && "${value}" -le "${max}" ]] || die "${name} must be from ${min} to ${max}."
 }
 
-configure_amneziawg() {
-  log "Configuring AmneziaWG 2.0."
-  install -d -m 0700 /etc/amnezia/amneziawg "${KEY_DIR}/awg"
+detect_awg_auto_mtu() {
+  local target payload best=0 path_mtu awg_mtu
+  local -a targets=(1.1.1.1 8.8.8.8)
+  [[ -n "${DOMAIN:-}" ]] && targets+=("${DOMAIN}")
 
-  cat >/etc/sysctl.d/98-vpn-forward.conf <<'EOF'
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-EOF
-  chmod 0644 /etc/sysctl.d/98-vpn-forward.conf
-  sysctl --system >/dev/null || true
+  command -v ping >/dev/null 2>&1 || {
+    printf '1280\n'
+    return 0
+  }
 
-  local server_private server_public client_private client_public psk
-  server_private="$(awg genkey)"
-  server_public="$(printf '%s\n' "${server_private}" | awg pubkey)"
-  client_private="$(awg genkey)"
-  client_public="$(printf '%s\n' "${client_private}" | awg pubkey)"
-  psk="$(awg_genpsk)"
+  for target in "${targets[@]}"; do
+    for payload in 1372 1352 1332 1312 1292 1272 1252 1232 1212 1172; do
+      if ping -4 -c 1 -W 1 -M do -s "${payload}" "${target}" >/dev/null 2>&1; then
+        ((payload > best)) && best="${payload}"
+        break
+      fi
+    done
+  done
 
-  local awg_profile awg_mtu jc jmin jmax s1 s2 s3 s4 h1 h2 h3 h4 i1 i2 i3 i4 i5
-  awg_profile="${AWG_OBFS_PROFILE:-dns}"
-  awg_mtu="${AWG_MTU:-1280}"
-  if [[ ! "${awg_mtu}" =~ ^[0-9]+$ || "${awg_mtu}" -lt 1200 || "${awg_mtu}" -gt 1420 ]]; then
-    die "Unsupported AWG_MTU='${awg_mtu}'. Use an integer from 1200 to 1420."
+  if ((best <= 0)); then
+    printf '1280\n'
+    return 0
   fi
-  case "${awg_profile}" in
+
+  path_mtu=$((best + 28))
+  awg_mtu=$((path_mtu - 80))
+  ((awg_mtu < 1200)) && awg_mtu=1200
+  ((awg_mtu > 1420)) && awg_mtu=1420
+  printf '%s\n' "${awg_mtu}"
+}
+
+generate_awg_tuning() {
+  local requested_profile effective_profile awg_mtu awg_mtu_requested awg_port awg_dns awg_allowed_ips awg_keepalive
+  local jc jmin jmax s1 s2 s3 s4 h1 h2 h3 h4 i1 i2 i3 i4 i5 source_note mtu_source
+
+  requested_profile="$(printf '%s' "${AWG_OBFS_PROFILE:-random-balanced}" | tr '[:upper:]' '[:lower:]')"
+  case "${requested_profile}" in
+    dns|quic-lite|video-call|mobile-low-mtu|random-balanced|custom)
+      ;;
+    random)
+      requested_profile="random-balanced"
+      ;;
+    *)
+      die "Unsupported AWG_OBFS_PROFILE='${requested_profile}'. Use dns, quic-lite, video-call, mobile-low-mtu, random-balanced, or custom."
+      ;;
+  esac
+
+  if [[ "${requested_profile}" == "random-balanced" || "${requested_profile}" == "custom" ]]; then
+    effective_profile="$(pick_decoy_value "dns" "quic-lite" "video-call" "mobile-low-mtu")"
+  else
+    effective_profile="${requested_profile}"
+  fi
+
+  case "${effective_profile}" in
     dns)
       jc="$(rand_between 5 8)"
       jmin="$(rand_between 48 96)"
@@ -1537,43 +1882,247 @@ EOF
       i4="<t><r 48>"
       i5="<r 64>"
       ;;
+    video-call)
+      jc="$(rand_between 7 12)"
+      jmin="$(rand_between 120 220)"
+      jmax="$(rand_between 820 1320)"
+      s1="$(rand_between 112 220)"
+      s2="$(rand_between 96 180)"
+      s3="$(rand_between 80 160)"
+      s4="$(rand_between 112 220)"
+      i1="<r 32><t><r 96>"
+      i2="<r 64><t><r 48>"
+      i3="<r 112>"
+      i4="<t><r 72>"
+      i5="<r 96><t>"
+      ;;
+    mobile-low-mtu)
+      jc="$(rand_between 4 7)"
+      jmin="$(rand_between 36 84)"
+      jmax="$(rand_between 360 680)"
+      s1="$(rand_between 48 112)"
+      s2="$(rand_between 36 88)"
+      s3="$(rand_between 28 72)"
+      s4="$(rand_between 48 112)"
+      i1="<r 8><t><r 24>"
+      i2="<r 18><t><r 18>"
+      i3="<r 32>"
+      i4="<t><r 22>"
+      i5="<rc 8><r 12>"
+      ;;
     *)
-      die "Unsupported AWG_OBFS_PROFILE='${awg_profile}'. Use dns or quic-lite."
+      die "Internal AWG profile error: ${effective_profile}"
       ;;
   esac
+
   h1="$(rand_range 100000000 499999999 25000000 90000000)"
   h2="$(rand_range 600000000 999999999 25000000 90000000)"
   h3="$(rand_range 1100000000 1499999999 25000000 90000000)"
   h4="$(rand_range 1600000000 2100000000 25000000 90000000)"
 
-  cat >"${STACK_DIR}/awg-params.env" <<EOF
-AWG_OBFS_PROFILE=${awg_profile}
-AWG_MTU=${awg_mtu}
-AWG_JC=${jc}
-AWG_JMIN=${jmin}
-AWG_JMAX=${jmax}
-AWG_S1=${s1}
-AWG_S2=${s2}
-AWG_S3=${s3}
-AWG_S4=${s4}
-AWG_H1=${h1}
-AWG_H2=${h2}
-AWG_H3=${h3}
-AWG_H4=${h4}
-AWG_I1='${i1}'
-AWG_I2='${i2}'
-AWG_I3='${i3}'
-AWG_I4='${i4}'
-AWG_I5='${i5}'
-EOF
+  [[ -n "${AWG_JC:-}" ]] && jc="${AWG_JC}"
+  [[ -n "${AWG_JMIN:-}" ]] && jmin="${AWG_JMIN}"
+  [[ -n "${AWG_JMAX:-}" ]] && jmax="${AWG_JMAX}"
+  [[ -n "${AWG_S1:-}" ]] && s1="${AWG_S1}"
+  [[ -n "${AWG_S2:-}" ]] && s2="${AWG_S2}"
+  [[ -n "${AWG_S3:-}" ]] && s3="${AWG_S3}"
+  [[ -n "${AWG_S4:-}" ]] && s4="${AWG_S4}"
+  [[ -n "${AWG_H1:-}" ]] && h1="${AWG_H1}"
+  [[ -n "${AWG_H2:-}" ]] && h2="${AWG_H2}"
+  [[ -n "${AWG_H3:-}" ]] && h3="${AWG_H3}"
+  [[ -n "${AWG_H4:-}" ]] && h4="${AWG_H4}"
+  [[ -n "${AWG_I1:-}" ]] && i1="${AWG_I1}"
+  [[ -n "${AWG_I2:-}" ]] && i2="${AWG_I2}"
+  [[ -n "${AWG_I3:-}" ]] && i3="${AWG_I3}"
+  [[ -n "${AWG_I4:-}" ]] && i4="${AWG_I4}"
+  [[ -n "${AWG_I5:-}" ]] && i5="${AWG_I5}"
+
+  validate_int_range AWG_JC "${jc}" 1 128
+  validate_int_range AWG_JMIN "${jmin}" 1 4096
+  validate_int_range AWG_JMAX "${jmax}" 1 4096
+  ((jmin <= jmax)) || die "AWG_JMIN must be less than or equal to AWG_JMAX."
+  validate_int_range AWG_S1 "${s1}" 1 4096
+  validate_int_range AWG_S2 "${s2}" 1 4096
+  validate_int_range AWG_S3 "${s3}" 1 4096
+  validate_int_range AWG_S4 "${s4}" 1 4096
+
+  awg_mtu_requested="${AWG_MTU:-}"
+  if [[ -z "${awg_mtu_requested}" ]]; then
+    if [[ "${effective_profile}" == "mobile-low-mtu" ]]; then
+      awg_mtu="1240"
+      mtu_source="profile"
+    else
+      awg_mtu="1280"
+      mtu_source="default"
+    fi
+  elif [[ "${awg_mtu_requested}" == "auto" ]]; then
+    awg_mtu="$(detect_awg_auto_mtu)"
+    mtu_source="auto-pmtu"
+  else
+    awg_mtu="${awg_mtu_requested}"
+    mtu_source="user"
+  fi
+  validate_int_range AWG_MTU "${awg_mtu}" 1200 1420
+
+  awg_port="${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}"
+  validate_int_range AWG_ENDPOINT_PORT "${awg_port}" 1 65535
+  awg_dns="${AWG_DNS:-1.1.1.1, 8.8.8.8}"
+  awg_allowed_ips="${AWG_ALLOWED_IPS:-0.0.0.0/0, ::/0}"
+  awg_keepalive="${AWG_KEEPALIVE:-25}"
+  validate_int_range AWG_KEEPALIVE "${awg_keepalive}" 0 65535
+
+  source_note="profile=${requested_profile}; effective=${effective_profile}; overrides are applied from AWG_* env when present"
+
+  {
+    printf 'AWG_OBFS_PROFILE=%q\n' "${requested_profile}"
+    printf 'AWG_EFFECTIVE_PROFILE=%q\n' "${effective_profile}"
+    printf 'AWG_TUNING_SOURCE=%q\n' "${source_note}"
+    printf 'AWG_MTU=%q\n' "${awg_mtu}"
+    printf 'AWG_MTU_SOURCE=%q\n' "${mtu_source}"
+    printf 'AWG_ENDPOINT_PORT=%q\n' "${awg_port}"
+    printf 'AWG_DNS=%q\n' "${awg_dns}"
+    printf 'AWG_ALLOWED_IPS=%q\n' "${awg_allowed_ips}"
+    printf 'AWG_KEEPALIVE=%q\n' "${awg_keepalive}"
+    printf 'AWG_JC=%q\n' "${jc}"
+    printf 'AWG_JMIN=%q\n' "${jmin}"
+    printf 'AWG_JMAX=%q\n' "${jmax}"
+    printf 'AWG_S1=%q\n' "${s1}"
+    printf 'AWG_S2=%q\n' "${s2}"
+    printf 'AWG_S3=%q\n' "${s3}"
+    printf 'AWG_S4=%q\n' "${s4}"
+    printf 'AWG_H1=%q\n' "${h1}"
+    printf 'AWG_H2=%q\n' "${h2}"
+    printf 'AWG_H3=%q\n' "${h3}"
+    printf 'AWG_H4=%q\n' "${h4}"
+    printf 'AWG_I1=%q\n' "${i1}"
+    printf 'AWG_I2=%q\n' "${i2}"
+    printf 'AWG_I3=%q\n' "${i3}"
+    printf 'AWG_I4=%q\n' "${i4}"
+    printf 'AWG_I5=%q\n' "${i5}"
+  } >"${STACK_DIR}/awg-params.env"
   chmod 0600 "${STACK_DIR}/awg-params.env"
+
+  cat >"${AWG_TUNING_REPORT}" <<EOF
+{
+  "generated_at": $(json_escape "$(date -Is)"),
+  "requested_profile": $(json_escape "${requested_profile}"),
+  "effective_profile": $(json_escape "${effective_profile}"),
+  "mtu": ${awg_mtu},
+  "mtu_source": $(json_escape "${mtu_source}"),
+  "endpoint_port": ${awg_port},
+  "dns": $(json_escape "${awg_dns}"),
+  "allowed_ips": $(json_escape "${awg_allowed_ips}"),
+  "keepalive": ${awg_keepalive},
+  "params_path": $(json_escape "${STACK_DIR}/awg-params.env"),
+  "note": $(json_escape "Values are randomized per install unless overridden through AWG_* environment variables. Tcpdump is never started automatically.")
+}
+EOF
+  chmod 0600 "${AWG_TUNING_REPORT}"
+}
+
+write_awg_client_config() {
+  local name="$1"
+  local client_private="$2"
+  local client_ip="$3"
+  local server_public="$4"
+  local psk="$5"
+  local label out_file
+  label="$(label_name "AWG" "${name}")"
+  out_file="${KEY_DIR}/awg/${label}.conf"
+
+  # shellcheck disable=SC1091
+  source "${STACK_DIR}/awg-params.env"
+  install -d -m 0700 "${KEY_DIR}/awg"
+  cat >"${out_file}" <<EOF
+# ${label}
+# GeneratedAt = $(date -Is)
+# ObfuscationProfile = ${AWG_OBFS_PROFILE:-unknown}
+# EffectiveProfile = ${AWG_EFFECTIVE_PROFILE:-unknown}
+# MTU = ${AWG_MTU:-1280}
+[Interface]
+PrivateKey = ${client_private}
+Address = ${client_ip}/32
+DNS = ${AWG_DNS:-1.1.1.1, 8.8.8.8}
+MTU = ${AWG_MTU:-1280}
+Jc = ${AWG_JC}
+Jmin = ${AWG_JMIN}
+Jmax = ${AWG_JMAX}
+S1 = ${AWG_S1}
+S2 = ${AWG_S2}
+S3 = ${AWG_S3}
+S4 = ${AWG_S4}
+H1 = ${AWG_H1}
+H2 = ${AWG_H2}
+H3 = ${AWG_H3}
+H4 = ${AWG_H4}
+I1 = ${AWG_I1}
+I2 = ${AWG_I2}
+I3 = ${AWG_I3}
+I4 = ${AWG_I4}
+I5 = ${AWG_I5}
+
+[Peer]
+PublicKey = ${server_public}
+PresharedKey = ${psk}
+Endpoint = ${DOMAIN}:${AWG_ENDPOINT_PORT:-51820}
+AllowedIPs = ${AWG_ALLOWED_IPS:-0.0.0.0/0, ::/0}
+PersistentKeepalive = ${AWG_KEEPALIVE:-25}
+EOF
+  chmod 0600 "${out_file}"
+  cat "${out_file}"
+}
+
+configure_amneziawg() {
+  log "Configuring AmneziaWG 2.0."
+  install -d -m 0700 /etc/amnezia/amneziawg "${KEY_DIR}/awg"
+
+  cat >/etc/sysctl.d/98-vpn-forward.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF
+  chmod 0644 /etc/sysctl.d/98-vpn-forward.conf
+  sysctl --system >/dev/null || true
+
+  local server_private server_public client_private client_public psk
+  server_private="$(awg genkey)"
+  server_public="$(printf '%s\n' "${server_private}" | awg pubkey)"
+  client_private="$(awg genkey)"
+  client_public="$(printf '%s\n' "${client_private}" | awg pubkey)"
+  psk="$(awg_genpsk)"
+
+  generate_awg_tuning
+  # shellcheck disable=SC1091
+  source "${STACK_DIR}/awg-params.env"
+
+  local awg_profile awg_effective_profile awg_mtu awg_port jc jmin jmax s1 s2 s3 s4 h1 h2 h3 h4 i1 i2 i3 i4 i5
+  awg_profile="${AWG_OBFS_PROFILE}"
+  awg_effective_profile="${AWG_EFFECTIVE_PROFILE}"
+  awg_mtu="${AWG_MTU}"
+  awg_port="${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}"
+  jc="${AWG_JC}"
+  jmin="${AWG_JMIN}"
+  jmax="${AWG_JMAX}"
+  s1="${AWG_S1}"
+  s2="${AWG_S2}"
+  s3="${AWG_S3}"
+  s4="${AWG_S4}"
+  h1="${AWG_H1}"
+  h2="${AWG_H2}"
+  h3="${AWG_H3}"
+  h4="${AWG_H4}"
+  i1="${AWG_I1}"
+  i2="${AWG_I2}"
+  i3="${AWG_I3}"
+  i4="${AWG_I4}"
+  i5="${AWG_I5}"
+  log "AWG profile: ${awg_profile} (effective ${awg_effective_profile}), MTU ${awg_mtu}, UDP port ${awg_port}."
   printf '%s\n' "${server_public}" >"${STACK_DIR}/awg-server-public-key.txt"
   chmod 0600 "${STACK_DIR}/awg-server-public-key.txt"
 
   cat >/etc/amnezia/amneziawg/awg0.conf <<EOF
 [Interface]
 Address = 10.66.66.1/24
-ListenPort = 51820
+ListenPort = ${awg_port}
 PrivateKey = ${server_private}
 MTU = ${awg_mtu}
 Jc = ${jc}
@@ -1688,13 +2237,19 @@ EOF
 }
 
 configure_firewall() {
+  local awg_port="${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}"
+  if [[ -f "${STACK_DIR}/awg-params.env" ]]; then
+    # shellcheck disable=SC1091
+    source "${STACK_DIR}/awg-params.env"
+    awg_port="${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}"
+  fi
   log "Configuring UFW firewall."
   ufw default deny incoming
   ufw default allow outgoing
   ensure_ssh_firewall_access
   ufw allow 443/tcp
   ufw allow 8443/udp
-  ufw allow 51820/udp
+  ufw allow "${awg_port}/udp"
   ufw --force enable
 }
 
@@ -1900,6 +2455,8 @@ set -Eeuo pipefail
 STACK_DIR="/opt/vpn-stack"
 CONFIG="/etc/amnezia/amneziawg/awg0.conf"
 KEY_DIR="/root/vpn-keys/awg"
+PARAMS="${STACK_DIR}/awg-params.env"
+DEFAULT_PORT=51820
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 awg_genpsk() {
@@ -1940,12 +2497,30 @@ label_name() {
   fi
 }
 
+load_params() {
+  [[ -f "${PARAMS}" ]] || die "Missing ${PARAMS}"
+  # shellcheck disable=SC1090
+  source "${PARAMS}"
+  AWG_ENDPOINT_PORT="${AWG_ENDPOINT_PORT:-${DEFAULT_PORT}}"
+  AWG_DNS="${AWG_DNS:-1.1.1.1, 8.8.8.8}"
+  AWG_ALLOWED_IPS="${AWG_ALLOWED_IPS:-0.0.0.0/0, ::/0}"
+  AWG_KEEPALIVE="${AWG_KEEPALIVE:-25}"
+}
+
 show_usage() {
   cat <<'USAGE'
 Usage:
   vpn-awg <name>          Create a new AmneziaWG client
-  vpn-awg analyze [sec]   Print AWG status; if sec > 0, also capture UDP/51820 for sec seconds
-  vpn-awg capture [sec]   Save a tcpdump pcap for UDP/51820, default 20 seconds
+  vpn-awg list            List saved AmneziaWG client configs
+  vpn-awg show <name>     Print saved client config and QR
+  vpn-awg revoke <name>   Remove a client peer and archive its config
+  vpn-awg rotate <name>   Revoke and recreate a client
+  vpn-awg profile         Show selected obfuscation profile and tuning report
+  vpn-awg show-config     Show sanitized server config
+  vpn-awg explain         Explain tuning and capture policy
+  vpn-awg analyze [sec]   Print AWG status; if sec > 0, explicitly capture UDP packets
+  vpn-awg capture [sec]   Save a tcpdump pcap, default 20 seconds
+  vpn-awg analyze-live [packets]  Print a live tcpdump summary without saving pcap
 USAGE
 }
 
@@ -1963,17 +2538,19 @@ next_ip() {
 
 capture_awg_udp() {
   local seconds="${1:-20}"
-  local iface out
+  local iface out port
   [[ "${seconds}" =~ ^[0-9]+$ && "${seconds}" -ge 1 && "${seconds}" -le 300 ]] || die "Capture duration must be 1..300 seconds."
   command -v tcpdump >/dev/null 2>&1 || die "tcpdump is not installed."
+  load_params
+  port="${AWG_ENDPOINT_PORT:-${DEFAULT_PORT}}"
   iface="$(cat "${STACK_DIR}/external-interface.txt" 2>/dev/null || true)"
   [[ -n "${iface}" ]] || iface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')"
   [[ -n "${iface}" ]] || die "Could not determine external interface."
   install -d -m 0700 /var/log/vpn-stack/awg-captures
-  out="/var/log/vpn-stack/awg-captures/awg-udp-51820-$(date +%Y%m%d-%H%M%S).pcap"
-  echo "Capturing UDP/51820 on ${iface} for ${seconds}s -> ${out}"
+  out="/var/log/vpn-stack/awg-captures/awg-udp-${port}-$(date +%Y%m%d-%H%M%S).pcap"
+  echo "Capturing UDP/${port} on ${iface} for ${seconds}s -> ${out}"
   echo "The pcap contains encrypted UDP metadata; keep it private."
-  timeout "${seconds}" tcpdump -ni "${iface}" -s 192 -w "${out}" udp port 51820 || true
+  timeout "${seconds}" tcpdump -ni "${iface}" -s 192 -w "${out}" udp port "${port}" || true
   chmod 0600 "${out}" 2>/dev/null || true
   echo "Saved: ${out}"
   echo "Packet size summary:"
@@ -2004,9 +2581,32 @@ capture_awg_udp() {
   ' | sort -n -k2 2>/dev/null || true
 }
 
+analyze_live_awg() {
+  local packets="${1:-20}"
+  local iface port
+  [[ "${packets}" =~ ^[0-9]+$ && "${packets}" -ge 1 && "${packets}" -le 200 ]] || die "Packet count must be 1..200."
+  command -v tcpdump >/dev/null 2>&1 || die "tcpdump is not installed."
+  load_params
+  port="${AWG_ENDPOINT_PORT:-${DEFAULT_PORT}}"
+  iface="$(cat "${STACK_DIR}/external-interface.txt" 2>/dev/null || true)"
+  [[ -n "${iface}" ]] || iface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')"
+  [[ -n "${iface}" ]] || die "Could not determine external interface."
+  echo "Live UDP/${port} summary on ${iface}, ${packets} packets max. No pcap will be saved."
+  tcpdump -ni "${iface}" -c "${packets}" -tt -nn udp port "${port}" 2>/dev/null | awk '
+    /length/ {
+      for (i = 1; i <= NF; i++) if ($i == "length") {
+        n = $(i + 1); gsub(/[^0-9]/, "", n)
+        if (n != "") print "  packet length=" n
+      }
+    }
+  '
+}
+
 analyze_awg() {
   local seconds="${1:-0}"
-  local iface
+  local iface port
+  load_params
+  port="${AWG_ENDPOINT_PORT:-${DEFAULT_PORT}}"
   iface="$(cat "${STACK_DIR}/external-interface.txt" 2>/dev/null || true)"
   echo "AmneziaWG diagnostics"
   echo
@@ -2019,7 +2619,7 @@ analyze_awg() {
   lsmod | awk '$1 ~ /^(amneziawg|wireguard)$/ {print "  " $0}' || true
   echo
   echo "Listening socket:"
-  ss -lunp | awk '$5 ~ /:51820$/ {print "  " $0}' || true
+  ss -lunp | awk -v port=":${port}" '$5 ~ (port "$") {print "  " $0}' || true
   echo
   echo "Routing/sysctl:"
   printf '  net.ipv4.ip_forward = '; sysctl -n net.ipv4.ip_forward 2>/dev/null || true
@@ -2033,15 +2633,141 @@ analyze_awg() {
   awg show awg0 2>/dev/null | sed 's/^/  /' || true
   echo
   echo "AWG obfuscation profile:"
-  if [[ -f "${STACK_DIR}/awg-params.env" ]]; then
-    grep -E '^AWG_(OBFS_PROFILE|MTU|JC|JMIN|JMAX|S[1-4]|H[1-4]|I[1-5])=' "${STACK_DIR}/awg-params.env" | sed 's/^/  /'
+  if [[ -f "${PARAMS}" ]]; then
+    grep -E '^AWG_(OBFS_PROFILE|EFFECTIVE_PROFILE|TUNING_SOURCE|MTU|MTU_SOURCE|ENDPOINT_PORT|DNS|ALLOWED_IPS|KEEPALIVE|JC|JMIN|JMAX|S[1-4]|H[1-4]|I[1-5])=' "${PARAMS}" | sed 's/^/  /'
   else
-    echo "  missing ${STACK_DIR}/awg-params.env"
+    echo "  missing ${PARAMS}"
   fi
+  [[ -f "${STACK_DIR}/awg-tuning-report.json" ]] && echo "  report: ${STACK_DIR}/awg-tuning-report.json"
   if [[ "${seconds}" =~ ^[0-9]+$ && "${seconds}" -gt 0 ]]; then
     echo
     capture_awg_udp "${seconds}"
   fi
+}
+
+client_file_for() {
+  local name="$1"
+  local label
+  label="$(label_name "AWG" "${name}")"
+  if [[ -f "${KEY_DIR}/${label}.conf" ]]; then
+    printf '%s\n' "${KEY_DIR}/${label}.conf"
+  elif [[ -f "${KEY_DIR}/${name}.conf" ]]; then
+    printf '%s\n' "${KEY_DIR}/${name}.conf"
+  else
+    return 1
+  fi
+}
+
+list_clients() {
+  install -d -m 0700 "${KEY_DIR}"
+  find "${KEY_DIR}" -maxdepth 1 -type f -name '*.conf' -printf '%f\n' 2>/dev/null | sed 's/\.conf$//' | sort
+}
+
+show_client() {
+  local name="$1"
+  local file
+  file="$(client_file_for "${name}")" || die "Client not found: ${name}"
+  printf 'Client file: %s\n' "${file}"
+  print_qr "$(cat "${file}")"
+  cat "${file}"
+}
+
+revoke_client() {
+  local name="$1"
+  local file label private public tmp archive
+  file="$(client_file_for "${name}")" || die "Client not found: ${name}"
+  label="$(basename "${file}" .conf)"
+  private="$(awk -F'= *' '$1 ~ /^PrivateKey/ {print $2; exit}' "${file}")"
+  [[ -n "${private}" ]] || die "Could not read client private key from ${file}."
+  public="$(printf '%s\n' "${private}" | awg pubkey)"
+
+  tmp="$(mktemp)"
+  awk -v pub="${public}" '
+    function flush_peer() {
+      if (peer) {
+        if (!drop) printf "%s", block
+        peer = 0
+        block = ""
+        drop = 0
+      }
+    }
+    /^\[Peer\][[:space:]]*$/ {
+      flush_peer()
+      peer = 1
+      block = $0 ORS
+      next
+    }
+    peer {
+      block = block $0 ORS
+      line = $0
+      if (line ~ /^[[:space:]]*PublicKey[[:space:]]*=/) {
+        sub(/^[^=]*=[[:space:]]*/, "", line)
+        sub(/[[:space:]]*$/, "", line)
+        if (line == pub) drop = 1
+      }
+      next
+    }
+    {
+      flush_peer()
+      print
+    }
+    END {
+      flush_peer()
+    }
+  ' "${CONFIG}" >"${tmp}"
+  install -m 0600 "${tmp}" "${CONFIG}"
+  rm -f "${tmp}"
+
+  if awg show awg0 >/dev/null 2>&1; then
+    awg set awg0 peer "${public}" remove || true
+  else
+    systemctl restart awg-quick@awg0.service || true
+  fi
+
+  install -d -m 0700 "${KEY_DIR}/revoked"
+  archive="${KEY_DIR}/revoked/$(date +%Y%m%d-%H%M%S)-${label}.conf"
+  mv "${file}" "${archive}"
+  chmod 0600 "${archive}"
+  printf 'Revoked: %s\nArchived: %s\n' "${label}" "${archive}"
+}
+
+profile_report() {
+  load_params
+  echo "AmneziaWG profile"
+  echo
+  grep -E '^AWG_(OBFS_PROFILE|EFFECTIVE_PROFILE|TUNING_SOURCE|MTU|MTU_SOURCE|ENDPOINT_PORT|DNS|ALLOWED_IPS|KEEPALIVE|JC|JMIN|JMAX|S[1-4]|H[1-4]|I[1-5])=' "${PARAMS}" | sed 's/^/  /'
+  echo
+  if [[ -f "${STACK_DIR}/awg-tuning-report.json" ]]; then
+    echo "Report: ${STACK_DIR}/awg-tuning-report.json"
+    if command -v jq >/dev/null 2>&1; then
+      jq . "${STACK_DIR}/awg-tuning-report.json"
+    else
+      cat "${STACK_DIR}/awg-tuning-report.json"
+    fi
+  fi
+}
+
+show_sanitized_config() {
+  [[ -f "${CONFIG}" ]] || die "Missing ${CONFIG}"
+  sed -E 's/^(PrivateKey|PresharedKey)[[:space:]]*=.*/\1 = [hidden]/' "${CONFIG}"
+}
+
+explain_tuning() {
+  cat <<'EXPLAIN'
+AmneziaWG tuning notes
+
+Values are generated at install time from AWG_OBFS_PROFILE and saved in /opt/vpn-stack/awg-params.env.
+Supported profiles: dns, quic-lite, video-call, mobile-low-mtu, random-balanced, custom.
+Use AWG_MTU=auto to run a PMTU probe; if ICMP is blocked, the fallback is 1280.
+Use AWG_* environment variables before install to override generated values.
+
+Tcpdump is never started by the installer. Explicit commands:
+  vpn-awg analyze 20
+  vpn-awg capture 30
+  vpn-awg analyze-live 20
+
+Saved pcap files contain encrypted UDP metadata and should remain private.
+EXPLAIN
 }
 
 [[ "${EUID}" -eq 0 ]] || die "Run as root."
@@ -2055,8 +2781,43 @@ case "${1}" in
     analyze_awg "${2:-0}"
     exit 0
     ;;
+  analyze-live|live)
+    analyze_live_awg "${2:-20}"
+    exit 0
+    ;;
   capture|tcpdump)
     capture_awg_udp "${2:-20}"
+    exit 0
+    ;;
+  list)
+    list_clients
+    exit 0
+    ;;
+  show)
+    [[ -n "${2:-}" ]] || die "Usage: vpn-awg show <name>"
+    show_client "${2}"
+    exit 0
+    ;;
+  revoke)
+    [[ -n "${2:-}" ]] || die "Usage: vpn-awg revoke <name>"
+    revoke_client "${2}"
+    exit 0
+    ;;
+  rotate)
+    [[ -n "${2:-}" ]] || die "Usage: vpn-awg rotate <name>"
+    revoke_client "${2}"
+    exec "$0" "${2}"
+    ;;
+  profile)
+    profile_report
+    exit 0
+    ;;
+  show-config)
+    show_sanitized_config
+    exit 0
+    ;;
+  explain)
+    explain_tuning
     exit 0
     ;;
 esac
@@ -2064,7 +2825,7 @@ esac
 name="$1"
 [[ "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || die "Use only letters, digits, dot, underscore, dash."
 [[ -f "${CONFIG}" ]] || die "Missing ${CONFIG}"
-[[ -f "${STACK_DIR}/awg-params.env" ]] || die "Missing ${STACK_DIR}/awg-params.env"
+load_params
 label="$(label_name "AWG" "${name}")"
 if [[ -f "${KEY_DIR}/${label}.conf" || -f "${KEY_DIR}/${name}.conf" ]]; then
   die "Client config already exists for: ${label}"
@@ -2102,10 +2863,14 @@ install -d -m 0700 "${KEY_DIR}"
 out="${KEY_DIR}/${label}.conf"
 cat >"${out}" <<EOF_CLIENT
 # ${label}
+# GeneratedAt = $(date -Is)
+# ObfuscationProfile = ${AWG_OBFS_PROFILE:-unknown}
+# EffectiveProfile = ${AWG_EFFECTIVE_PROFILE:-unknown}
+# MTU = ${AWG_MTU:-1280}
 [Interface]
 PrivateKey = ${client_private}
 Address = ${client_ip}/32
-DNS = 1.1.1.1, 8.8.8.8
+DNS = ${AWG_DNS:-1.1.1.1, 8.8.8.8}
 MTU = ${AWG_MTU:-1280}
 Jc = ${AWG_JC}
 Jmin = ${AWG_JMIN}
@@ -2127,9 +2892,9 @@ I5 = ${AWG_I5}
 [Peer]
 PublicKey = ${server_public}
 PresharedKey = ${psk}
-Endpoint = ${domain}:51820
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
+Endpoint = ${domain}:${AWG_ENDPOINT_PORT:-51820}
+AllowedIPs = ${AWG_ALLOWED_IPS:-0.0.0.0/0, ::/0}
+PersistentKeepalive = ${AWG_KEEPALIVE:-25}
 EOF_CLIENT
 chmod 0600 "${out}"
 printf 'Client: %s\n' "${label}"
@@ -2212,6 +2977,10 @@ AmneziaWG diagnostics:
   vpn-awg analyze
   vpn-awg analyze 20
   vpn-awg capture 30
+  vpn-awg analyze-live 20
+  vpn-awg profile
+  vpn-awg explain
+  vpn-awg show-config
 
 Saved keys:
   /root/vpn-keys/trojan/TROJAN-<LOCATION>-<name>.txt
@@ -2224,6 +2993,18 @@ Show saved client material:
   vpn-help xhttp phone1
   vpn-help hysteria phone1
   vpn-help awg phone1
+
+AmneziaWG lifecycle:
+  vpn-awg list
+  vpn-awg show phone1
+  vpn-awg revoke phone1
+  vpn-awg rotate phone1
+
+Install reports:
+  /root/vpn-keys/install-report.txt
+  /root/vpn-keys/install-report.json
+  /opt/vpn-stack/awg-tuning-report.json
+  /opt/vpn-stack/decoy-manifest.json
 
 Check services:
   systemctl status nginx --no-pager
@@ -2476,6 +3257,26 @@ enable_and_start_services() {
   systemctl restart vpn-stack-healthcheck.timer
 }
 
+load_installed_context() {
+  [[ -n "${DOMAIN:-}" ]] || DOMAIN="$(cat "${STACK_DIR}/domain.txt" 2>/dev/null || true)"
+  [[ -n "${SERVER_LOCATION:-}" ]] || SERVER_LOCATION="$(cat "${STACK_DIR}/server-location.txt" 2>/dev/null || true)"
+  [[ -n "${PUBLIC_IPV4:-}" ]] || PUBLIC_IPV4="$(cat "${STACK_DIR}/public-ipv4.txt" 2>/dev/null || true)"
+  [[ -n "${EXT_IFACE:-}" ]] || EXT_IFACE="$(cat "${STACK_DIR}/external-interface.txt" 2>/dev/null || true)"
+  SERVER_LOCATION="$(normalize_server_location "${SERVER_LOCATION:-XX}")"
+  valid_server_location "${SERVER_LOCATION}" || SERVER_LOCATION="XX"
+  [[ -n "${DOMAIN:-}" ]] && CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
+}
+
+current_awg_port() {
+  local port="${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}"
+  if [[ -f "${STACK_DIR}/awg-params.env" ]]; then
+    # shellcheck disable=SC1091
+    source "${STACK_DIR}/awg-params.env"
+    port="${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}"
+  fi
+  printf '%s\n' "${port}"
+}
+
 service_summary() {
   local unit="$1"
   local active enabled
@@ -2498,6 +3299,16 @@ listen_local_port() {
   local port="$2"
   ss -H -lntup 2>/dev/null | awk -v proto="${proto}" -v port=":${port}" '
     tolower($1) == proto && ($5 == "127.0.0.1" port || $5 == "[::1]" port) { found=1 }
+    END { exit found ? 0 : 1 }
+  '
+}
+
+listen_nonlocal_port() {
+  local proto="$1"
+  local port="$2"
+  ss -H -lntup 2>/dev/null | awk -v proto="${proto}" -v port=":${port}" '
+    tolower($1) == proto && $5 ~ (port "$") &&
+      $5 !~ /^127\.0\.0\.1:/ && $5 !~ /^\[::1\]:/ && $5 !~ /^::1:/ { found=1 }
     END { exit found ? 0 : 1 }
   '
 }
@@ -2533,7 +3344,9 @@ socket_label() {
 wait_for_expected_listeners() {
   local timeout="${1:-90}"
   local deadline=$((SECONDS + timeout))
+  local awg_port
   local -a missing
+  awg_port="$(current_awg_port)"
 
   log "Waiting up to ${timeout}s for expected listening ports."
   while true; do
@@ -2541,7 +3354,7 @@ wait_for_expected_listeners() {
 
     listen_any_port tcp 443 || missing+=("443/tcp")
     listen_any_port udp 8443 || missing+=("8443/udp")
-    listen_any_port udp 51820 || missing+=("51820/udp")
+    listen_any_port udp "${awg_port}" || missing+=("${awg_port}/udp")
     [[ -S "${TROJAN_XHTTP_SOCKET}" ]] || missing+=("${TROJAN_XHTTP_SOCKET}")
     listen_local_port tcp 3000 || missing+=("127.0.0.1:3000")
     listen_local_port tcp 9090 || missing+=("127.0.0.1:9090")
@@ -2562,12 +3375,21 @@ wait_for_expected_listeners() {
 }
 
 print_install_summary() {
-  local dashboard_status
+  local dashboard_status awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry
+  load_installed_context
+  awg_port="$(current_awg_port)"
   if [[ -s /var/lib/grafana/dashboards/node-exporter-full-1860.json ]]; then
     dashboard_status="provisioned from local JSON"
   else
     dashboard_status="not provisioned; import dashboard ID 1860 manually"
   fi
+  awg_profile="$(grep -E '^AWG_OBFS_PROFILE=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')"
+  awg_effective="$(grep -E '^AWG_EFFECTIVE_PROFILE=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')"
+  awg_mtu="$(grep -E '^AWG_MTU=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')"
+  decoy_profile="$(jq -r '.profile // "unknown"' "${DECOY_MANIFEST}" 2>/dev/null || printf 'unknown')"
+  decoy_seed="$(jq -r '.seed // "unknown"' "${DECOY_MANIFEST}" 2>/dev/null || printf 'unknown')"
+  cert_issuer="$(openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -issuer 2>/dev/null | sed 's/^issuer=//' || printf 'unknown')"
+  cert_expiry="$(openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//' || printf 'unknown')"
 
   cat <<EOF
 
@@ -2582,8 +3404,12 @@ External interface: ${EXT_IFACE}
 Contours:
   Trojan XHTTP TLS   : service $(service_summary xray-trojan-xhttp-tls); external 443/tcp via nginx $(listen_label any tcp 443); backend ${TROJAN_XHTTP_SOCKET} $(socket_label "${TROJAN_XHTTP_SOCKET}")
   Hysteria2 Salamander: service $(service_summary hysteria2); external 8443/udp $(listen_label any udp 8443)
-  AmneziaWG 2.0       : service $(service_summary awg-quick@awg0); external 51820/udp $(listen_label any udp 51820); interface awg0
+  AmneziaWG 2.0       : service $(service_summary awg-quick@awg0); external ${awg_port}/udp $(listen_label any udp "${awg_port}"); interface awg0
   Decoy HTTPS site    : nginx $(service_summary nginx); https://${DOMAIN}/; randomized static site on 443/tcp
+
+TLS certificate:
+  Issuer: ${cert_issuer}
+  Expires: ${cert_expiry}
 
 Monitoring, localhost only:
   Grafana       : service $(service_summary grafana-server); 127.0.0.1:3000 $(listen_label local tcp 3000)
@@ -2597,11 +3423,18 @@ Grafana SSH tunnel:
   Default login: admin / admin
 
 AmneziaWG diagnostics:
-  Obfuscation profile: $(grep -E '^AWG_OBFS_PROFILE=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')
-  MTU: $(grep -E '^AWG_MTU=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')
+  Obfuscation profile: ${awg_profile}
+  Effective profile: ${awg_effective}
+  MTU: ${awg_mtu}
+  Tuning report: ${AWG_TUNING_REPORT}
   Full status: vpn-awg analyze
-  Status + short sniff: vpn-awg analyze 20
+  Status + explicit short capture: vpn-awg analyze 20
   Save pcap: vpn-awg capture 30
+
+Decoy:
+  Profile: ${decoy_profile}
+  Seed: ${decoy_seed}
+  Manifest: ${DECOY_MANIFEST}
 
 Swap:
   Install decision: ${SWAP_RESULT}
@@ -2630,14 +3463,165 @@ Create more clients:
   vpn-hysteria phone1
   vpn-awg phone1
   vpn-help
+
+Install reports:
+  ${INSTALL_REPORT_TXT}
+  ${INSTALL_REPORT_JSON}
 ============================================================
 EOF
 }
 
+generate_install_report() {
+  local awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_active dashboard_status
+  load_installed_context
+  awg_port="$(current_awg_port)"
+  awg_profile="$(grep -E '^AWG_OBFS_PROFILE=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')"
+  awg_effective="$(grep -E '^AWG_EFFECTIVE_PROFILE=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')"
+  awg_mtu="$(grep -E '^AWG_MTU=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')"
+  decoy_profile="$(jq -r '.profile // "unknown"' "${DECOY_MANIFEST}" 2>/dev/null || printf 'unknown')"
+  decoy_seed="$(jq -r '.seed // "unknown"' "${DECOY_MANIFEST}" 2>/dev/null || printf 'unknown')"
+  cert_issuer="$(openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -issuer 2>/dev/null | sed 's/^issuer=//' || printf 'unknown')"
+  cert_expiry="$(openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//' || printf 'unknown')"
+  if swapon --show | awk 'NR>1 {found=1} END {exit found ? 0 : 1}'; then
+    swap_active="true"
+  else
+    swap_active="false"
+  fi
+  if [[ -s /var/lib/grafana/dashboards/node-exporter-full-1860.json ]]; then
+    dashboard_status="provisioned"
+  else
+    dashboard_status="manual-import"
+  fi
+
+  install -d -m 0700 "${KEY_DIR}"
+  print_install_summary >"${INSTALL_REPORT_TXT}"
+  chmod 0600 "${INSTALL_REPORT_TXT}"
+
+  cat >"${INSTALL_REPORT_JSON}" <<EOF
+{
+  "generated_at": $(json_escape "$(date -Is)"),
+  "domain": $(json_escape "${DOMAIN:-unknown}"),
+  "server_ipv4": $(json_escape "${PUBLIC_IPV4:-unknown}"),
+  "server_location": $(json_escape "${SERVER_LOCATION:-XX}"),
+  "external_interface": $(json_escape "${EXT_IFACE:-unknown}"),
+  "contours": {
+    "trojan_xhttp_tls": {
+      "external": "443/tcp",
+      "service": $(json_escape "$(service_summary xray-trojan-xhttp-tls)"),
+      "backend_socket": $(json_escape "${TROJAN_XHTTP_SOCKET}")
+    },
+    "hysteria2_salamander": {
+      "external": "8443/udp",
+      "service": $(json_escape "$(service_summary hysteria2)")
+    },
+    "amneziawg": {
+      "external": $(json_escape "${awg_port}/udp"),
+      "service": $(json_escape "$(service_summary awg-quick@awg0)"),
+      "profile": $(json_escape "${awg_profile}"),
+      "effective_profile": $(json_escape "${awg_effective}"),
+      "mtu": $(json_escape "${awg_mtu}"),
+      "params_path": $(json_escape "${STACK_DIR}/awg-params.env"),
+      "tuning_report": $(json_escape "${AWG_TUNING_REPORT}")
+    }
+  },
+  "monitoring": {
+    "grafana": "127.0.0.1:3000",
+    "prometheus": "127.0.0.1:9090",
+    "node_exporter": "127.0.0.1:9100",
+    "grafana_tunnel": $(json_escape "ssh -L 3000:127.0.0.1:3000 root@${PUBLIC_IPV4:-SERVER_IP}"),
+    "dashboard_1860": $(json_escape "${dashboard_status}")
+  },
+  "tls_certificate": {
+    "issuer": $(json_escape "${cert_issuer}"),
+    "expires": $(json_escape "${cert_expiry}")
+  },
+  "decoy": {
+    "url": $(json_escape "https://${DOMAIN:-DOMAIN}/"),
+    "profile": $(json_escape "${decoy_profile}"),
+    "seed": $(json_escape "${decoy_seed}"),
+    "manifest": $(json_escape "${DECOY_MANIFEST}")
+  },
+  "swap": {
+    "active": ${swap_active},
+    "install_decision": $(json_escape "${SWAP_RESULT}")
+  },
+  "key_paths": {
+    "trojan": $(json_escape "${KEY_DIR}/trojan"),
+    "hysteria": $(json_escape "${KEY_DIR}/hysteria"),
+    "awg": $(json_escape "${KEY_DIR}/awg")
+  }
+}
+EOF
+  chmod 0600 "${INSTALL_REPORT_JSON}"
+  log "Install reports saved: ${INSTALL_REPORT_TXT}, ${INSTALL_REPORT_JSON}"
+}
+
+validate_stack() {
+  local failed=0 awg_port
+  load_installed_context
+  awg_port="$(current_awg_port)"
+
+  check_pass() {
+    local label="$1"
+    shift
+    if "$@"; then
+      printf 'PASS %s\n' "${label}"
+    else
+      printf 'FAIL %s\n' "${label}"
+      failed=1
+    fi
+  }
+
+  check_absent() {
+    local label="$1"
+    shift
+    if "$@"; then
+      printf 'FAIL %s\n' "${label}"
+      failed=1
+    else
+      printf 'PASS %s\n' "${label}"
+    fi
+  }
+
+  printf 'Golden VPN validation\n\n'
+  check_pass "443/tcp public listener" listen_any_port tcp 443
+  check_pass "8443/udp public listener" listen_any_port udp 8443
+  check_pass "${awg_port}/udp public listener" listen_any_port udp "${awg_port}"
+  check_pass "Trojan XHTTP unix socket" test -S "${TROJAN_XHTTP_SOCKET}"
+  check_pass "Grafana localhost 3000" listen_local_port tcp 3000
+  check_pass "Prometheus localhost 9090" listen_local_port tcp 9090
+  check_pass "Node Exporter localhost 9100" listen_local_port tcp 9100
+  check_absent "Grafana not public" listen_nonlocal_port tcp 3000
+  check_absent "Prometheus not public" listen_nonlocal_port tcp 9090
+  check_absent "Node Exporter not public" listen_nonlocal_port tcp 9100
+  check_pass "nginx active" systemctl is-active --quiet nginx
+  check_pass "xray-trojan-xhttp-tls active" systemctl is-active --quiet xray-trojan-xhttp-tls
+  check_pass "hysteria2 active" systemctl is-active --quiet hysteria2
+  check_pass "awg-quick@awg0 active" systemctl is-active --quiet awg-quick@awg0
+  check_pass "prometheus active" systemctl is-active --quiet prometheus
+  check_pass "node exporter active" systemctl is-active --quiet prometheus-node-exporter
+  check_pass "grafana active" systemctl is-active --quiet grafana-server
+  check_pass "decoy forbidden-word scan" scan_decoy_tree /var/www/decoy
+  check_pass "certificate readable" openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout
+  check_pass "private key readable" openssl pkey -in "${CERT_DIR}/privkey.pem" -noout
+  if [[ -n "${DOMAIN:-}" ]]; then
+    check_pass "decoy HTTPS responds" curl -fsSk -o /dev/null "https://${DOMAIN}/"
+  fi
+
+  printf '\n'
+  if [[ "${failed}" -eq 0 ]]; then
+    log "Validation passed."
+  else
+    die "Validation failed."
+  fi
+}
+
 final_checks() {
+  local awg_port
+  awg_port="$(current_awg_port)"
   log "Final listening socket check."
   set +e
-  ss -lntup | grep -E ':443|:8443|:51820|:3000|:9090|:9100'
+  ss -lntup | grep -E ":443|:8443|:${awg_port}|:3000|:9090|:9100"
   ls -l "${TROJAN_XHTTP_SOCKET}"
 
   systemctl status nginx --no-pager
@@ -2659,6 +3643,7 @@ final_checks() {
     "${KEY_DIR}/awg/AWG-${SERVER_LOCATION}-main-awg.conf"
   log "Optional helper smoke tests create extra clients:"
   printf '  vpn-trojan test-trojan\n  vpn-hysteria test-hy2\n  vpn-awg test-awg\n'
+  generate_install_report
   print_install_summary
 }
 
@@ -2721,6 +3706,69 @@ main() {
   log "Golden VPN stack installation complete."
 }
 
+preflight_check() {
+  local failed=0
+
+  pass() { printf 'PASS %s\n' "$1"; }
+  fail() { printf 'FAIL %s\n' "$1"; failed=1; }
+  warn_check() { printf 'WARN %s\n' "$1"; }
+
+  printf 'Golden VPN preflight\n\n'
+
+  if [[ "${EUID}" -eq 0 ]]; then pass "running as root"; else fail "run as root"; fi
+  if [[ -n "${DOMAIN:-}" ]]; then pass "DOMAIN is set"; else fail "DOMAIN is empty"; fi
+  if [[ -n "${EMAIL:-}" ]] && valid_ascii_email "$(trim_value "${EMAIL:-}")"; then pass "EMAIL is valid ASCII"; else fail "EMAIL is missing or invalid"; fi
+  if [[ -n "${SERVER_LOCATION:-}" ]] && valid_server_location "$(normalize_server_location "${SERVER_LOCATION:-}")"; then pass "SERVER_LOCATION is valid"; else fail "SERVER_LOCATION must be two ASCII letters"; fi
+  if [[ -n "${CF_Token:-}" ]]; then pass "CF_Token is set"; else fail "CF_Token is empty"; fi
+
+  if command -v curl >/dev/null 2>&1; then pass "curl is available"; else fail "curl is missing"; fi
+  if command -v jq >/dev/null 2>&1; then pass "jq is available"; else warn_check "jq is not installed yet; installer will install it"; fi
+  if command -v ss >/dev/null 2>&1; then pass "ss is available"; else warn_check "ss is not installed yet"; fi
+
+  if [[ -n "${DOMAIN:-}" ]] && command -v getent >/dev/null 2>&1; then
+    if getent ahostsv4 "${DOMAIN}" >/dev/null 2>&1; then pass "DOMAIN resolves"; else fail "DOMAIN does not resolve"; fi
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    if PUBLIC_IPV4="$(curl -4fsSL --max-time 8 https://api.ipify.org 2>/dev/null)" && [[ "${PUBLIC_IPV4}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      pass "public IPv4 detected: ${PUBLIC_IPV4}"
+    else
+      fail "public IPv4 was not detected"
+    fi
+  fi
+
+  if EXT_IFACE="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')" && [[ -n "${EXT_IFACE}" ]]; then
+    pass "external interface detected: ${EXT_IFACE}"
+  else
+    fail "external interface was not detected"
+  fi
+
+  if command -v fuser >/dev/null 2>&1 && fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1; then
+    fail "apt/dpkg lock is currently held"
+  else
+    pass "apt/dpkg locks are free"
+  fi
+
+  if [[ -f /var/run/reboot-required ]]; then
+    warn_check "kernel/package reboot is already required"
+  else
+    pass "no pending reboot marker"
+  fi
+
+  if ss -lntp 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:22[[:space:]]'; then
+    pass "SSH listener on 22/tcp is present"
+  else
+    warn_check "SSH listener on 22/tcp was not detected"
+  fi
+
+  printf '\n'
+  if [[ "${failed}" -eq 0 ]]; then
+    log "Preflight passed."
+  else
+    die "Preflight failed."
+  fi
+}
+
 run_with_install_lock() {
   if command -v flock >/dev/null 2>&1; then
     exec 200>"${INSTALL_LOCK}"
@@ -2742,4 +3790,50 @@ run_with_install_lock() {
   main "$@"
 }
 
-run_with_install_lock "$@"
+show_installer_usage() {
+  cat <<'USAGE'
+Usage:
+  ./install-vpn-stack.sh                 Install the full Golden VPN stack
+  ./install-vpn-stack.sh install         Same as default install
+  ./install-vpn-stack.sh preflight       Check inputs and host readiness without changing VPN configs
+  ./install-vpn-stack.sh validate        Validate installed listeners, services, cert, and decoy
+  ./install-vpn-stack.sh verify          Alias for validate
+  ./install-vpn-stack.sh report          Write and print install reports
+  ./install-vpn-stack.sh render-decoy [dir]  Render decoy site into dir without touching nginx
+USAGE
+}
+
+dispatch() {
+  local cmd="${1:-install}"
+  local out_dir
+  case "${cmd}" in
+    install|"")
+      shift || true
+      run_with_install_lock "$@"
+      ;;
+    preflight|preflight-only|--preflight)
+      preflight_check
+      ;;
+    validate|verify|--validate-only)
+      validate_stack
+      ;;
+    report)
+      generate_install_report
+      cat "${INSTALL_REPORT_TXT}"
+      ;;
+    render-decoy|--render-only)
+      out_dir="${2:-/tmp/golden-vpn-decoy-render}"
+      render_decoy_site "${out_dir}" "${out_dir}/decoy-manifest.json"
+      printf 'Rendered decoy site: %s\nManifest: %s\n' "${out_dir}" "${out_dir}/decoy-manifest.json"
+      ;;
+    help|-h|--help)
+      show_installer_usage
+      ;;
+    *)
+      show_installer_usage >&2
+      die "Unknown command: ${cmd}"
+      ;;
+  esac
+}
+
+dispatch "$@"

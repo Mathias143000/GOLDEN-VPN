@@ -7,6 +7,27 @@
 
 Этот раздел имеет приоритет над устаревшими пунктами ниже, если они расходятся с текущим `install-vpn-stack.sh`.
 
+### 0.0 DoD status after P0-P2 implementation
+
+This section is normative for the current project state. Older VLESS/REALITY sections below are legacy notes only and must not override the current Trojan XHTTP TLS implementation.
+
+Implemented DoD items:
+
+```text
+CLI modes: install, preflight, validate/verify, report, render-decoy
+Reports: /root/vpn-keys/install-report.txt and /root/vpn-keys/install-report.json
+AWG report: /opt/vpn-stack/awg-tuning-report.json
+Decoy manifest: /opt/vpn-stack/decoy-manifest.json
+AWG profiles: dns, quic-lite, video-call, mobile-low-mtu, random-balanced, custom
+AWG_MTU=auto with PMTU probe and 1280 fallback
+AWG overrides: AWG_JC/JMIN/JMAX/S1-S4/H1-H4/I1-I5/MTU/DNS/ALLOWED_IPS/KEEPALIVE/ENDPOINT_PORT
+AWG helpers: list, show, revoke, rotate, profile, show-config, explain, analyze, capture, analyze-live
+Decoy profiles: network-monitor, software-status, edge-docs, availability-lab
+Decoy controls: DECOY_PROFILE, DECOY_SEED, DECOY_BRAND, DECOY_REGION
+Decoy safety: static only, no external URLs, no forms, no JS, forbidden-word scan before nginx reload
+Tcpdump policy: never automatic during install; only explicit vpn-awg helper commands
+```
+
 ### 0.1 Текущее состояние
 
 Фактическая архитектура скрипта:
