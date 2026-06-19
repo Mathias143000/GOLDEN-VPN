@@ -218,8 +218,12 @@ write_resume_env() {
 }
 
 ensure_ssh_firewall_access() {
-  local ssh_port had_errexit=0 had_errtrace=0 old_err_trap
+  local mode="${1:-best-effort}"
+  local ssh_port current_ssh_port="" listener_ok=0 had_errexit=0 had_errtrace=0 old_err_trap
 
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    current_ssh_port="$(awk '{print $4}' <<<"${SSH_CONNECTION}" 2>/dev/null || true)"
+  fi
   old_err_trap="$(trap -p ERR || true)"
   case $- in
     *e*)
@@ -241,11 +245,8 @@ ensure_ssh_firewall_access() {
     ufw allow 22/tcp comment 'SSH default' || true
     ufw allow OpenSSH || true
 
-    if [[ -n "${SSH_CONNECTION:-}" ]]; then
-      ssh_port="$(awk '{print $4}' <<<"${SSH_CONNECTION}" 2>/dev/null || true)"
-      if [[ "${ssh_port}" =~ ^[0-9]+$ ]]; then
-        ufw allow "${ssh_port}/tcp" comment 'Current SSH session' || true
-      fi
+    if [[ "${current_ssh_port}" =~ ^[0-9]+$ ]]; then
+      ufw allow "${current_ssh_port}/tcp" comment 'Current SSH session' || true
     fi
 
     if command -v sshd >/dev/null 2>&1; then
@@ -280,6 +281,12 @@ ensure_ssh_firewall_access() {
     || true
   systemctl restart ssh.service >/dev/null 2>&1 || systemctl restart sshd.service >/dev/null 2>&1 || true
 
+  if ss -lntp 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:22[[:space:]]'; then
+    listener_ok=1
+  elif [[ "${current_ssh_port}" =~ ^[0-9]+$ ]] && ss -lntp 2>/dev/null | grep -Eq "(^|[[:space:]])[^[:space:]]*:${current_ssh_port}[[:space:]]"; then
+    listener_ok=1
+  fi
+
   if [[ -n "${old_err_trap}" ]]; then
     eval "${old_err_trap}"
   else
@@ -287,6 +294,10 @@ ensure_ssh_firewall_access() {
   fi
   [[ "${had_errtrace}" == "1" ]] && set -E
   [[ "${had_errexit}" == "1" ]] && set -e
+  if [[ "${mode}" == "require-listener" && "${listener_ok}" != "1" ]]; then
+    warn "SSH daemon is not listening on 22/tcp or the current SSH session port; refusing automatic reboot."
+    return 1
+  fi
   return 0
 }
 
@@ -452,7 +463,7 @@ schedule_resume_install_once() {
   write_resume_env
   install_resume_status_helper
   install_ssh_guard_once
-  ensure_ssh_firewall_access
+  ensure_ssh_firewall_access require-listener || die "SSH listener check failed before reboot. Start openssh-server manually, then rerun the installer."
 
   cat >"${RESUME_INSTALL_RUNNER}" <<EOF
 #!/usr/bin/env bash
