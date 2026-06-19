@@ -108,6 +108,7 @@ Initial client files:
 ```
 
 New client display labels and saved filenames use `TROJAN-<name>`, `HYSTERIA-<name>`, and `AWG-<name>`.
+Each client helper prints a terminal QR code, the raw link or config text, and the saved file path.
 
 The decoy site is generated at install time:
 

@@ -1549,6 +1549,18 @@ SERVICE="xray-trojan-xhttp-tls.service"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 uri_encode() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
+print_qr() {
+  local payload="$1"
+  if command -v qrencode >/dev/null 2>&1; then
+    printf '\nQR code:\n'
+    if ! printf '%s' "${payload}" | qrencode -t ANSIUTF8 -l L -m 1; then
+      echo "QR code render failed; use the text below." >&2
+    fi
+    printf '\n'
+  else
+    echo "QR code skipped: qrencode is not installed." >&2
+  fi
+}
 label_name() {
   local prefix="$1"
   local name="$2"
@@ -1600,7 +1612,10 @@ link="trojan://${password}@${domain}:443?security=tls&type=xhttp&path=${encoded_
 install -d -m 0700 "${KEY_DIR}"
 printf '%s\n' "${link}" >"${KEY_DIR}/${label}.txt"
 chmod 0600 "${KEY_DIR}/${label}.txt"
-printf '%s\n' "${link}"
+printf 'Client: %s\n' "${label}"
+print_qr "${link}"
+printf 'Link:\n%s\n' "${link}"
+printf 'Saved: %s\n' "${KEY_DIR}/${label}.txt"
 EOF
   chmod 0755 /usr/local/bin/vpn-trojan
 }
@@ -1619,6 +1634,18 @@ SERVICE="hysteria2.service"
 die() { echo "ERROR: $*" >&2; exit 1; }
 uri_encode() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
 rand_hex() { openssl rand -hex "$1"; }
+print_qr() {
+  local payload="$1"
+  if command -v qrencode >/dev/null 2>&1; then
+    printf '\nQR code:\n'
+    if ! printf '%s' "${payload}" | qrencode -t ANSIUTF8 -l L -m 1; then
+      echo "QR code render failed; use the text below." >&2
+    fi
+    printf '\n'
+  else
+    echo "QR code skipped: qrencode is not installed." >&2
+  fi
+}
 label_name() {
   local prefix="$1"
   local name="$2"
@@ -1678,7 +1705,10 @@ link="hysteria2://${name}:${password}@${domain}:8443?obfs=salamander&obfs-passwo
 install -d -m 0700 "${KEY_DIR}"
 printf '%s\n' "${link}" >"${KEY_DIR}/${label}.txt"
 chmod 0600 "${KEY_DIR}/${label}.txt"
-printf '%s\n' "${link}"
+printf 'Client: %s\n' "${label}"
+print_qr "${link}"
+printf 'Link:\n%s\n' "${link}"
+printf 'Saved: %s\n' "${KEY_DIR}/${label}.txt"
 EOF
   chmod 0755 /usr/local/bin/vpn-hysteria
 }
@@ -1698,6 +1728,18 @@ awg_genpsk() {
     awg genpsk
   else
     openssl rand -base64 32
+  fi
+}
+print_qr() {
+  local payload="$1"
+  if command -v qrencode >/dev/null 2>&1; then
+    printf '\nQR code:\n'
+    if ! printf '%s' "${payload}" | qrencode -t ANSIUTF8 -l L -m 1; then
+      echo "QR code render failed; use the text below." >&2
+    fi
+    printf '\n'
+  else
+    echo "QR code skipped: qrencode is not installed." >&2
   fi
 }
 label_name() {
@@ -1901,7 +1943,11 @@ AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF_CLIENT
 chmod 0600 "${out}"
+printf 'Client: %s\n' "${label}"
+print_qr "$(cat "${out}")"
+printf 'Config:\n'
 cat "${out}"
+printf 'Saved: %s\n' "${out}"
 EOF
   chmod 0755 /usr/local/bin/vpn-awg
 }
