@@ -121,6 +121,30 @@ trim_value() {
   printf '%s' "${value}"
 }
 
+valid_ascii_email() {
+  local value="$1"
+  [[ "${value}" =~ ^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$ ]]
+}
+
+ensure_valid_email() {
+  while true; do
+    EMAIL="$(trim_value "${EMAIL:-}")"
+    export EMAIL
+
+    if valid_ascii_email "${EMAIL}"; then
+      return 0
+    fi
+
+    if have_tty; then
+      printf 'EMAIL must be plain ASCII, example user@example.com. Non-ASCII or hidden characters are not accepted.\n' >/dev/tty
+      unset EMAIL
+      prompt_required_var EMAIL "EMAIL for ACME, ASCII only, example user@example.com"
+    else
+      die "EMAIL must be plain ASCII, example user@example.com. Current EMAIL contains invalid or non-ASCII characters."
+    fi
+  done
+}
+
 prompt_required_var() {
   local var="$1"
   local label="$2"
@@ -182,6 +206,7 @@ require_root_and_env() {
   load_saved_resume_env
   prompt_required_var DOMAIN "DOMAIN, without https://, example s5.example.com"
   prompt_required_var EMAIL "EMAIL for ZeroSSL/acme.sh"
+  ensure_valid_email
   prompt_required_var CF_Token "Cloudflare DNS API token (hidden input)" 1
   CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 }

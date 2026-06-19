@@ -102,6 +102,8 @@ EMAIL
 CF_Token
 ```
 
+`EMAIL` must be plain ASCII, for example `teriomta@gmail.com`. Do not paste Cyrillic lookalikes or hidden characters.
+
 `CF_Token` input is hidden. If the token cannot read the Cloudflare zone ID automatically, the installer also asks for `CF_Zone_ID`.
 
 For unattended install, export variables before running:
@@ -275,4 +277,12 @@ If DKMS still fails, check:
 
 ```bash
 tail -n 120 /var/lib/dkms/amneziawg/1.0.0/build/make.log
+```
+
+If acme.sh reports `invalid_email` or `contact email contains non-ASCII characters`, rerun with a clean ASCII email:
+
+```bash
+export EMAIL="teriomta@gmail.com"
+export VPN_STACK_IGNORE_SAVED_ENV=1
+./install-vpn-stack.sh
 ```
