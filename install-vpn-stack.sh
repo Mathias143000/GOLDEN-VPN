@@ -218,14 +218,22 @@ write_resume_env() {
 }
 
 ensure_ssh_firewall_access() {
-  local ssh_port had_errexit=0
+  local ssh_port had_errexit=0 had_errtrace=0 old_err_trap
 
+  old_err_trap="$(trap -p ERR || true)"
   case $- in
     *e*)
       had_errexit=1
-      set +e
       ;;
   esac
+  case $- in
+    *E*)
+      had_errtrace=1
+      ;;
+  esac
+  set +e
+  set +E
+  trap - ERR
 
   log "Ensuring SSH remains reachable before firewall/reboot changes."
 
@@ -272,9 +280,13 @@ ensure_ssh_firewall_access() {
     || true
   systemctl restart ssh.service >/dev/null 2>&1 || systemctl restart sshd.service >/dev/null 2>&1 || true
 
-  if [[ "${had_errexit}" == "1" ]]; then
-    set -e
+  if [[ -n "${old_err_trap}" ]]; then
+    eval "${old_err_trap}"
+  else
+    trap - ERR
   fi
+  [[ "${had_errtrace}" == "1" ]] && set -E
+  [[ "${had_errexit}" == "1" ]] && set -e
   return 0
 }
 
@@ -286,7 +298,7 @@ install_ssh_guard_once() {
 
   cat >"${SSH_GUARD_SCRIPT}" <<EOF
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -u
 
 log_file="/var/log/vpn-stack-ssh-guard.log"
 current_ssh_port="${current_ssh_port}"
