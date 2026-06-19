@@ -55,14 +55,21 @@ export VPN_STACK_AUTO_REBOOT_RESUME=1
 ./install-vpn-stack.sh
 ```
 
-If a kernel reboot is required for AmneziaWG DKMS, the interactive installer can create a one-time systemd resume unit, reboot, and continue automatically after the VPS comes back. The installer saves the entered values in the systemd `EnvironmentFile` `/etc/golden-vpn-installer/install.env` with `0600` permissions, runs `/root/vpn-stack-resume/install-vpn-stack.sh` once after boot through `vpn-stack-resume-install.service`, and removes the unit, copied installer, and saved env only after the installation finishes successfully.
+If a kernel reboot is required for AmneziaWG DKMS, the interactive installer can create a one-time systemd resume unit and boot timer, reboot, and continue automatically after the VPS comes back. The installer saves the entered values in the systemd `EnvironmentFile` `/etc/golden-vpn-installer/install.env` with `0600` permissions, runs `/root/vpn-stack-resume/install-vpn-stack.sh` once after boot through `vpn-stack-resume-install.service` and `vpn-stack-resume-install.timer`, and removes the unit, timer, copied installer, and saved env only after the installation finishes successfully.
 
 Resume logs:
 
 ```bash
+vpn-install-status
+vpn-install-status follow
 journalctl -u vpn-stack-resume-install.service -b --no-pager
+systemctl list-timers vpn-stack-resume-install.timer --no-pager
 cat /var/log/vpn-stack-resume-install.log
 ```
+
+While the resume service is active, do not run `install-vpn-stack.sh` manually. The installer holds a lock at `/run/golden-vpn-install.lock`; a second run exits with a status message instead of competing for `apt`/`dpkg`.
+
+The installer keeps SSH open before enabling UFW: it allows `22/tcp`, the current SSH session port from `SSH_CONNECTION`, and ports reported by `sshd`.
 
 ## Install With Git
 
@@ -146,6 +153,24 @@ Captures are saved under:
 ```
 
 ## Troubleshooting
+
+If SSH is blocked after a reboot, open the VPS provider web console or rescue console and restore SSH in UFW:
+
+```bash
+ufw allow 22/tcp
+ufw reload || ufw --force enable
+ufw status verbose
+systemctl status ssh sshd --no-pager
+ss -lntp | grep ':22'
+```
+
+If you see `Could not get lock /var/lib/dpkg/lock-frontend`, another install or resume process is still using `apt`. Do not remove the lock file. Watch the running installer instead:
+
+```bash
+vpn-install-status follow
+# or
+journalctl -fu vpn-stack-resume-install.service
+```
 
 If AmneziaWG DKMS fails and the log says the running kernel is older than the latest installed kernel, use the built-in one-time reboot/resume prompt or reboot first:
 

@@ -18,7 +18,14 @@ RESUME_INSTALL_ENV="${RESUME_INSTALL_ENV_DIR}/install.env"
 RESUME_INSTALL_RUNNER="/usr/local/sbin/vpn-stack-resume-install.sh"
 RESUME_INSTALL_SERVICE="vpn-stack-resume-install.service"
 RESUME_INSTALL_UNIT="/etc/systemd/system/${RESUME_INSTALL_SERVICE}"
+RESUME_INSTALL_TIMER="vpn-stack-resume-install.timer"
+RESUME_INSTALL_TIMER_UNIT="/etc/systemd/system/${RESUME_INSTALL_TIMER}"
 RESUME_INSTALL_LOG="/var/log/vpn-stack-resume-install.log"
+INSTALL_LOCK="/run/golden-vpn-install.lock"
+INSTALL_PROGRESS_FILE="${LOG_DIR}/install-progress.env"
+INSTALL_STATUS_HELPER="/usr/local/bin/vpn-install-status"
+INSTALL_TOTAL_STEPS=25
+INSTALL_STEP=0
 PUBLIC_IPV4=""
 EXT_IFACE=""
 SWAP_RESULT="not checked"
@@ -59,6 +66,34 @@ warn() {
 die() {
   printf '[vpn-stack] ERROR: %s\n' "$*" >&2
   exit 1
+}
+
+progress() {
+  local message="$1"
+  local width=24
+  local filled empty percent bar
+
+  INSTALL_STEP=$((INSTALL_STEP + 1))
+  if [[ "${INSTALL_STEP}" -gt "${INSTALL_TOTAL_STEPS}" ]]; then
+    INSTALL_STEP="${INSTALL_TOTAL_STEPS}"
+  fi
+
+  percent=$((INSTALL_STEP * 100 / INSTALL_TOTAL_STEPS))
+  filled=$((INSTALL_STEP * width / INSTALL_TOTAL_STEPS))
+  empty=$((width - filled))
+  bar="$(printf '%*s' "${filled}" '' | tr ' ' '#')$(printf '%*s' "${empty}" '' | tr ' ' '-')"
+  log "[${bar}] ${percent}% (${INSTALL_STEP}/${INSTALL_TOTAL_STEPS}) ${message}"
+
+  if mkdir -p "$(dirname "${INSTALL_PROGRESS_FILE}")" 2>/dev/null; then
+    {
+      printf 'STEP=%q\n' "${INSTALL_STEP}"
+      printf 'TOTAL=%q\n' "${INSTALL_TOTAL_STEPS}"
+      printf 'PERCENT=%q\n' "${percent}"
+      printf 'MESSAGE=%q\n' "${message}"
+      printf 'UPDATED_AT=%q\n' "$(date -Is)"
+    } >"${INSTALL_PROGRESS_FILE}" 2>/dev/null || true
+    chmod 0600 "${INSTALL_PROGRESS_FILE}" 2>/dev/null || true
+  fi
 }
 
 on_error() {
@@ -163,14 +198,71 @@ write_resume_env() {
   chmod 0600 "${RESUME_INSTALL_ENV}"
 }
 
+install_resume_status_helper() {
+  cat >"${INSTALL_STATUS_HELPER}" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+service="${RESUME_INSTALL_SERVICE}"
+timer="${RESUME_INSTALL_TIMER}"
+log_file="${RESUME_INSTALL_LOG}"
+progress_file="${INSTALL_PROGRESS_FILE}"
+lock_file="${INSTALL_LOCK}"
+
+show_status() {
+  echo "Golden VPN installer status"
+  echo
+  if [[ -r "\${progress_file}" ]]; then
+    # shellcheck disable=SC1090
+    source "\${progress_file}" || true
+    printf 'Progress: %s/%s %s%% - %s\n' "\${STEP:-?}" "\${TOTAL:-?}" "\${PERCENT:-?}" "\${MESSAGE:-unknown}"
+    printf 'Updated: %s\n' "\${UPDATED_AT:-unknown}"
+    echo
+  fi
+  systemctl status "\${service}" --no-pager -l || true
+  echo
+  systemctl list-timers "\${timer}" --no-pager || true
+  echo
+  if command -v fuser >/dev/null 2>&1 && fuser "\${lock_file}" >/dev/null 2>&1; then
+    echo "Installer lock is held: another install/resume run is active."
+  fi
+  echo
+  if [[ -r "\${log_file}" ]]; then
+    echo "Last log lines:"
+    tail -n 80 "\${log_file}" || true
+  else
+    echo "No log file yet: \${log_file}"
+  fi
+}
+
+case "\${1:-status}" in
+  follow|-f)
+    echo "Following \${service}. Press Ctrl+C to stop watching."
+    journalctl -fu "\${service}"
+    ;;
+  log)
+    tail -n "\${2:-200}" "\${log_file}" || true
+    ;;
+  status|"")
+    show_status
+    ;;
+  *)
+    echo "Usage: vpn-install-status [status|follow|log [lines]]" >&2
+    exit 2
+    ;;
+esac
+EOF
+  chmod 0755 "${INSTALL_STATUS_HELPER}"
+}
+
 cleanup_resume_install_state() {
   local had_state=0
-  for path in "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}"; do
+  for path in "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_TIMER_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}" "${INSTALL_STATUS_HELPER}"; do
     [[ -e "${path}" ]] && had_state=1
   done
 
-  systemctl disable "${RESUME_INSTALL_SERVICE}" >/dev/null 2>&1 || true
-  rm -f "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}"
+  systemctl disable "${RESUME_INSTALL_SERVICE}" "${RESUME_INSTALL_TIMER}" >/dev/null 2>&1 || true
+  rm -f "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_TIMER_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}" "${INSTALL_STATUS_HELPER}"
   rmdir "${RESUME_INSTALL_DIR}" 2>/dev/null || true
   rmdir "${RESUME_INSTALL_ENV_DIR}" 2>/dev/null || true
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -187,14 +279,18 @@ schedule_resume_install_once() {
   install -d -m 0700 "${RESUME_INSTALL_DIR}"
   install -m 0700 "${self}" "${RESUME_INSTALL_SCRIPT}"
   write_resume_env
+  install_resume_status_helper
 
   cat >"${RESUME_INSTALL_RUNNER}" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 service="${RESUME_INSTALL_SERVICE}"
+timer="${RESUME_INSTALL_TIMER}"
 unit="${RESUME_INSTALL_UNIT}"
+timer_unit="${RESUME_INSTALL_TIMER_UNIT}"
 runner="${RESUME_INSTALL_RUNNER}"
+status_helper="${INSTALL_STATUS_HELPER}"
 env_file="${RESUME_INSTALL_ENV}"
 env_dir="${RESUME_INSTALL_ENV_DIR}"
 installer="${RESUME_INSTALL_SCRIPT}"
@@ -207,6 +303,8 @@ chmod 0600 "\${log_file}" || true
 exec > >(tee -a "\${log_file}") 2>&1
 
 printf '%s resume start\n' "\$(date -Is)"
+printf 'Use "vpn-install-status follow" to watch this installation.\n'
+printf 'Do not start install-vpn-stack.sh manually while this service is active.\n'
 
 if [[ ! -r "\${env_file}" || ! -x "\${installer}" ]]; then
   printf '%s missing resume env or installer; keeping service for diagnostics\n' "\$(date -Is)"
@@ -229,8 +327,8 @@ set -e
 
 if [[ "\${status}" -eq 0 ]]; then
   printf '%s resume install succeeded; removing one-time unit and saved env\n' "\$(date -Is)"
-  systemctl disable "\${service}" >/dev/null 2>&1 || true
-  rm -f "\${unit}" "\${env_file}" "\${installer}" "\${runner}"
+  systemctl disable "\${service}" "\${timer}" >/dev/null 2>&1 || true
+  rm -f "\${unit}" "\${timer_unit}" "\${env_file}" "\${installer}" "\${runner}" "\${status_helper}"
   rmdir "\${resume_dir}" 2>/dev/null || true
   rmdir "\${env_dir}" 2>/dev/null || true
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -264,12 +362,30 @@ WantedBy=multi-user.target
 EOF
   chmod 0644 "${RESUME_INSTALL_UNIT}"
 
+  cat >"${RESUME_INSTALL_TIMER_UNIT}" <<EOF
+[Unit]
+Description=Start Golden VPN installer resume once after boot
+
+[Timer]
+OnBootSec=1min
+AccuracySec=15s
+Persistent=false
+Unit=${RESUME_INSTALL_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 0644 "${RESUME_INSTALL_TIMER_UNIT}"
+
   systemctl daemon-reload
-  systemctl enable "${RESUME_INSTALL_SERVICE}"
+  systemctl enable "${RESUME_INSTALL_SERVICE}" "${RESUME_INSTALL_TIMER}"
   log "One-time resume service installed: ${RESUME_INSTALL_SERVICE}"
+  log "One-time resume timer installed: ${RESUME_INSTALL_TIMER}"
   log "Resume env saved: ${RESUME_INSTALL_ENV}"
   log "Resume log after reboot: ${RESUME_INSTALL_LOG}"
   log "Resume journal after reboot: journalctl -u ${RESUME_INSTALL_SERVICE} -b --no-pager"
+  log "Resume timer after reboot: systemctl list-timers ${RESUME_INSTALL_TIMER} --no-pager"
+  log "Live resume output after reboot: vpn-install-status follow"
 }
 
 auto_reboot_resume_enabled() {
@@ -1199,12 +1315,34 @@ EOF
 
 configure_firewall() {
   log "Configuring UFW firewall."
+  local ssh_port
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow 22/tcp comment 'SSH default'
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    ssh_port="$(awk '{print $4}' <<<"${SSH_CONNECTION}" 2>/dev/null || true)"
+    if [[ "${ssh_port}" =~ ^[0-9]+$ ]]; then
+      ufw allow "${ssh_port}/tcp" comment 'Current SSH session'
+    fi
+  fi
+  if command -v sshd >/dev/null 2>&1; then
+    while read -r ssh_port; do
+      if [[ "${ssh_port}" =~ ^[0-9]+$ ]]; then
+        ufw allow "${ssh_port}/tcp" comment 'sshd configured port'
+      fi
+    done < <(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -n -u)
+  fi
+  if [[ -r /etc/ssh/sshd_config || -d /etc/ssh/sshd_config.d ]]; then
+    while read -r ssh_port; do
+      if [[ "${ssh_port}" =~ ^[0-9]+$ ]]; then
+        ufw allow "${ssh_port}/tcp" comment 'sshd config port'
+      fi
+    done < <(grep -RihE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print $2}' | sort -n -u)
+  fi
+  ufw allow OpenSSH || true
   ufw allow 443/tcp
   ufw allow 8443/udp
   ufw allow 51820/udp
-  if systemctl list-unit-files | grep -Eq '^(ssh|sshd)\.service'; then
-    ufw allow OpenSSH || ufw allow 22/tcp || true
-  fi
   ufw --force enable
 }
 
@@ -2036,37 +2174,83 @@ final_checks() {
 }
 
 main() {
+  progress "Checking input variables and kernel readiness"
   require_root_and_env
   check_dkms_kernel_ready
+  progress "Installing APT repositories"
   install_apt_repositories
+  progress "Installing base packages"
   install_base_packages
+  progress "Checking required commands"
   need_command ip
   need_command getent
   need_command curl
   need_command jq
   need_command openssl
+  progress "Detecting server network"
   detect_public_ipv4
   detect_external_iface
+  progress "Verifying DNS"
   verify_domain_dns
+  progress "Issuing TLS certificate"
   install_acme_certificate
+  progress "Installing Xray"
   install_xray
+  progress "Configuring VLESS XHTTP TLS"
   configure_xray
+  progress "Configuring nginx decoy and router"
   configure_nginx
+  progress "Installing Hysteria2"
   install_hysteria
+  progress "Configuring Hysteria2"
   configure_hysteria
+  progress "Installing AmneziaWG"
   install_amneziawg
+  progress "Configuring AmneziaWG"
   configure_amneziawg
+  progress "Configuring swap"
   configure_swap
+  progress "Configuring firewall"
   configure_firewall
+  progress "Installing VPN helper commands"
   install_helpers
+  progress "Configuring monitoring"
   configure_monitoring
+  progress "Configuring log retention"
   configure_log_limits
+  progress "Configuring timers"
   configure_timers
+  progress "Enabling and starting services"
   enable_and_start_services
+  progress "Waiting for listeners"
   wait_for_expected_listeners 90
+  progress "Running final checks"
   final_checks
+  progress "Cleaning one-time resume state"
   cleanup_resume_install_state
+  progress "Installation complete"
   log "Golden VPN stack installation complete."
 }
 
-main "$@"
+run_with_install_lock() {
+  if command -v flock >/dev/null 2>&1; then
+    exec 200>"${INSTALL_LOCK}"
+    if ! flock -n 200; then
+      warn "Another Golden VPN installation is already running."
+      warn "Do not start a second installer while apt/dpkg is active."
+      if [[ -x "${INSTALL_STATUS_HELPER}" ]]; then
+        warn "Watch progress with: vpn-install-status follow"
+      else
+        warn "Watch progress with: journalctl -fu ${RESUME_INSTALL_SERVICE}"
+        warn "Or: tail -f ${RESUME_INSTALL_LOG}"
+      fi
+      exit 75
+    fi
+  else
+    warn "flock is not available; continuing without installer concurrency guard."
+  fi
+
+  main "$@"
+}
+
+run_with_install_lock "$@"
