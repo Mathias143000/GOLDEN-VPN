@@ -177,11 +177,12 @@ vpn-install-status follow
 journalctl -fu vpn-stack-resume-install.service
 ```
 
-If ZeroSSL registration fails with `Cannot resolve _eab_id`, the installer tries the ZeroSSL EAB API automatically. If that also fails, export explicit EAB credentials before retrying:
+ZeroSSL is the primary CA. If ZeroSSL registration fails with `Cannot resolve _eab_id` or the ZeroSSL EAB API returns `403`, the installer automatically falls back to Let's Encrypt DNS-01 for this certificate and continues without asking for manual EAB credentials.
+
+To require strict ZeroSSL only, disable the fallback before retrying:
 
 ```bash
-export ZEROSSL_EAB_KID="..."
-export ZEROSSL_EAB_HMAC_KEY="..."
+export VPN_STACK_DISABLE_LE_FALLBACK=1
 ./install-vpn-stack.sh
 ```
 

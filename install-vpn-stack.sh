@@ -209,6 +209,7 @@ write_resume_env() {
     [[ -n "${CF_Account_ID:-}" ]] && printf 'CF_Account_ID=%q\n' "${CF_Account_ID}"
     [[ -n "${ZEROSSL_EAB_KID:-}" ]] && printf 'ZEROSSL_EAB_KID=%q\n' "${ZEROSSL_EAB_KID}"
     [[ -n "${ZEROSSL_EAB_HMAC_KEY:-}" ]] && printf 'ZEROSSL_EAB_HMAC_KEY=%q\n' "${ZEROSSL_EAB_HMAC_KEY}"
+    [[ -n "${VPN_STACK_DISABLE_LE_FALLBACK:-}" ]] && printf 'VPN_STACK_DISABLE_LE_FALLBACK=%q\n' "${VPN_STACK_DISABLE_LE_FALLBACK}"
     printf 'VPN_STACK_RESUMED=1\n'
     printf 'DEBIAN_FRONTEND=noninteractive\n'
   } >"${RESUME_INSTALL_ENV}"
@@ -719,12 +720,10 @@ ensure_zerossl_account() {
     return 0
   fi
 
-  warn "Automatic ZeroSSL account registration failed; trying explicit EAB credentials."
+  warn "Automatic ZeroSSL account registration failed; trying ZeroSSL EAB API."
   if ! fetch_zerossl_eab_credentials; then
-    prompt_required_var ZEROSSL_EAB_KID "ZeroSSL EAB KID"
-    prompt_required_var ZEROSSL_EAB_HMAC_KEY "ZeroSSL EAB HMAC key" 1
-    export ZEROSSL_EAB_KID ZEROSSL_EAB_HMAC_KEY
-    [[ -d "${RESUME_INSTALL_ENV_DIR}" ]] && write_resume_env
+    warn "ZeroSSL EAB credentials are unavailable; continuing with fallback CA."
+    return 1
   fi
 
   "${acme[@]}" --register-account \
@@ -736,6 +735,7 @@ ensure_zerossl_account() {
 
 install_acme_certificate() {
   log "Issuing ZeroSSL certificate with acme.sh DNS-01."
+  local acme_server="zerossl"
   install -d -m 0700 /root/.acme.sh /root/acme-zerossl
   install -d -m 0755 "${CERT_DIR}"
 
@@ -759,7 +759,15 @@ install_acme_certificate() {
 
   local acme=(/root/.acme.sh/acme.sh --home /root/.acme.sh --config-home /root/acme-zerossl)
   "${acme[@]}" --set-default-ca --server zerossl
-  ensure_zerossl_account "${acme[@]}"
+  if ! ensure_zerossl_account "${acme[@]}"; then
+    if [[ "${VPN_STACK_DISABLE_LE_FALLBACK:-0}" == "1" ]]; then
+      die "ZeroSSL account registration failed and Let's Encrypt fallback is disabled."
+    fi
+    warn "ZeroSSL registration failed. Falling back to Let's Encrypt DNS-01 for this certificate."
+    acme_server="letsencrypt"
+    "${acme[@]}" --set-default-ca --server letsencrypt
+    "${acme[@]}" --register-account -m "${EMAIL}" --server letsencrypt || true
+  fi
 
   if [[ -s "${CERT_DIR}/fullchain.pem" && -s "${CERT_DIR}/privkey.pem" ]] \
     && openssl x509 -checkend 2592000 -noout -in "${CERT_DIR}/fullchain.pem" >/dev/null 2>&1 \
@@ -768,7 +776,7 @@ install_acme_certificate() {
     return
   fi
 
-  "${acme[@]}" --issue --dns dns_cf -d "${DOMAIN}" --keylength ec-256 --server zerossl
+  "${acme[@]}" --issue --dns dns_cf -d "${DOMAIN}" --keylength ec-256 --server "${acme_server}"
   "${acme[@]}" --install-cert -d "${DOMAIN}" --ecc \
     --fullchain-file "${CERT_DIR}/fullchain.pem" \
     --key-file "${CERT_DIR}/privkey.pem" \
