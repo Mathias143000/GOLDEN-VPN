@@ -21,6 +21,9 @@ RESUME_INSTALL_UNIT="/etc/systemd/system/${RESUME_INSTALL_SERVICE}"
 RESUME_INSTALL_TIMER="vpn-stack-resume-install.timer"
 RESUME_INSTALL_TIMER_UNIT="/etc/systemd/system/${RESUME_INSTALL_TIMER}"
 RESUME_INSTALL_LOG="/var/log/vpn-stack-resume-install.log"
+SSH_GUARD_SCRIPT="/usr/local/sbin/vpn-stack-ssh-guard.sh"
+SSH_GUARD_SERVICE="vpn-stack-ssh-guard.service"
+SSH_GUARD_UNIT="/etc/systemd/system/${SSH_GUARD_SERVICE}"
 INSTALL_LOCK="/run/golden-vpn-install.lock"
 INSTALL_PROGRESS_FILE="${LOG_DIR}/install-progress.env"
 INSTALL_STATUS_HELPER="/usr/local/bin/vpn-install-status"
@@ -198,6 +201,115 @@ write_resume_env() {
   chmod 0600 "${RESUME_INSTALL_ENV}"
 }
 
+ensure_ssh_firewall_access() {
+  local ssh_port
+  log "Ensuring SSH remains reachable before firewall/reboot changes."
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow 22/tcp comment 'SSH default' || true
+    ufw allow OpenSSH || true
+
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+      ssh_port="$(awk '{print $4}' <<<"${SSH_CONNECTION}" 2>/dev/null || true)"
+      if [[ "${ssh_port}" =~ ^[0-9]+$ ]]; then
+        ufw allow "${ssh_port}/tcp" comment 'Current SSH session' || true
+      fi
+    fi
+
+    if command -v sshd >/dev/null 2>&1; then
+      while read -r ssh_port; do
+        if [[ "${ssh_port}" =~ ^[0-9]+$ ]]; then
+          ufw allow "${ssh_port}/tcp" comment 'sshd configured port' || true
+        fi
+      done < <(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -n -u)
+    fi
+
+    if [[ -r /etc/ssh/sshd_config || -d /etc/ssh/sshd_config.d ]]; then
+      while read -r ssh_port; do
+        if [[ "${ssh_port}" =~ ^[0-9]+$ ]]; then
+          ufw allow "${ssh_port}/tcp" comment 'sshd config port' || true
+        fi
+      done < <(grep -RihE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print $2}' | sort -n -u)
+    fi
+
+    ufw reload || true
+  fi
+
+  systemctl enable --now ssh >/dev/null 2>&1 || systemctl enable --now sshd >/dev/null 2>&1 || true
+}
+
+install_ssh_guard_once() {
+  local current_ssh_port=""
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    current_ssh_port="$(awk '{print $4}' <<<"${SSH_CONNECTION}" 2>/dev/null || true)"
+  fi
+
+  cat >"${SSH_GUARD_SCRIPT}" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+log_file="/var/log/vpn-stack-ssh-guard.log"
+current_ssh_port="${current_ssh_port}"
+
+{
+  printf '%s ssh guard start\n' "\$(date -Is)"
+
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow 22/tcp comment 'SSH default' || true
+    ufw allow OpenSSH || true
+
+    if [[ "\${current_ssh_port}" =~ ^[0-9]+$ ]]; then
+      ufw allow "\${current_ssh_port}/tcp" comment 'Current SSH session before reboot' || true
+    fi
+
+    if command -v sshd >/dev/null 2>&1; then
+      while read -r ssh_port; do
+        if [[ "\${ssh_port}" =~ ^[0-9]+$ ]]; then
+          ufw allow "\${ssh_port}/tcp" comment 'sshd configured port' || true
+        fi
+      done < <(sshd -T 2>/dev/null | awk '\$1 == "port" {print \$2}' | sort -n -u)
+    fi
+
+    if [[ -r /etc/ssh/sshd_config || -d /etc/ssh/sshd_config.d ]]; then
+      while read -r ssh_port; do
+        if [[ "\${ssh_port}" =~ ^[0-9]+$ ]]; then
+          ufw allow "\${ssh_port}/tcp" comment 'sshd config port' || true
+        fi
+      done < <(grep -RihE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print \$2}' | sort -n -u)
+    fi
+
+    ufw reload || true
+    ufw status verbose || true
+  fi
+
+  systemctl enable --now ssh || systemctl enable --now sshd || true
+  systemctl restart ssh || systemctl restart sshd || true
+  ss -lntp | grep -E ':(22|'"${current_ssh_port:-22}"')' || true
+  printf '%s ssh guard done\n' "\$(date -Is)"
+} >>"\${log_file}" 2>&1
+EOF
+  chmod 0755 "${SSH_GUARD_SCRIPT}"
+
+  cat >"${SSH_GUARD_UNIT}" <<EOF
+[Unit]
+Description=Keep SSH reachable during Golden VPN installer resume
+DefaultDependencies=no
+Before=network-online.target ${RESUME_INSTALL_SERVICE}
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=${SSH_GUARD_SCRIPT}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 "${SSH_GUARD_UNIT}"
+
+  systemctl daemon-reload
+  systemctl enable "${SSH_GUARD_SERVICE}" >/dev/null 2>&1 || true
+}
+
 install_resume_status_helper() {
   cat >"${INSTALL_STATUS_HELPER}" <<EOF
 #!/usr/bin/env bash
@@ -257,12 +369,12 @@ EOF
 
 cleanup_resume_install_state() {
   local had_state=0
-  for path in "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_TIMER_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}" "${INSTALL_STATUS_HELPER}"; do
+  for path in "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_TIMER_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}" "${INSTALL_STATUS_HELPER}" "${SSH_GUARD_UNIT}" "${SSH_GUARD_SCRIPT}"; do
     [[ -e "${path}" ]] && had_state=1
   done
 
-  systemctl disable "${RESUME_INSTALL_SERVICE}" "${RESUME_INSTALL_TIMER}" >/dev/null 2>&1 || true
-  rm -f "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_TIMER_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}" "${INSTALL_STATUS_HELPER}"
+  systemctl disable "${RESUME_INSTALL_SERVICE}" "${RESUME_INSTALL_TIMER}" "${SSH_GUARD_SERVICE}" >/dev/null 2>&1 || true
+  rm -f "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_TIMER_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}" "${INSTALL_STATUS_HELPER}" "${SSH_GUARD_UNIT}" "${SSH_GUARD_SCRIPT}"
   rmdir "${RESUME_INSTALL_DIR}" 2>/dev/null || true
   rmdir "${RESUME_INSTALL_ENV_DIR}" 2>/dev/null || true
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -280,6 +392,8 @@ schedule_resume_install_once() {
   install -m 0700 "${self}" "${RESUME_INSTALL_SCRIPT}"
   write_resume_env
   install_resume_status_helper
+  install_ssh_guard_once
+  ensure_ssh_firewall_access
 
   cat >"${RESUME_INSTALL_RUNNER}" <<EOF
 #!/usr/bin/env bash
@@ -291,6 +405,9 @@ unit="${RESUME_INSTALL_UNIT}"
 timer_unit="${RESUME_INSTALL_TIMER_UNIT}"
 runner="${RESUME_INSTALL_RUNNER}"
 status_helper="${INSTALL_STATUS_HELPER}"
+ssh_guard_service="${SSH_GUARD_SERVICE}"
+ssh_guard_unit="${SSH_GUARD_UNIT}"
+ssh_guard_script="${SSH_GUARD_SCRIPT}"
 env_file="${RESUME_INSTALL_ENV}"
 env_dir="${RESUME_INSTALL_ENV_DIR}"
 installer="${RESUME_INSTALL_SCRIPT}"
@@ -327,8 +444,8 @@ set -e
 
 if [[ "\${status}" -eq 0 ]]; then
   printf '%s resume install succeeded; removing one-time unit and saved env\n' "\$(date -Is)"
-  systemctl disable "\${service}" "\${timer}" >/dev/null 2>&1 || true
-  rm -f "\${unit}" "\${timer_unit}" "\${env_file}" "\${installer}" "\${runner}" "\${status_helper}"
+  systemctl disable "\${service}" "\${timer}" "\${ssh_guard_service}" >/dev/null 2>&1 || true
+  rm -f "\${unit}" "\${timer_unit}" "\${env_file}" "\${installer}" "\${runner}" "\${status_helper}" "\${ssh_guard_unit}" "\${ssh_guard_script}"
   rmdir "\${resume_dir}" 2>/dev/null || true
   rmdir "\${env_dir}" 2>/dev/null || true
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -381,6 +498,7 @@ EOF
   systemctl enable "${RESUME_INSTALL_SERVICE}" "${RESUME_INSTALL_TIMER}"
   log "One-time resume service installed: ${RESUME_INSTALL_SERVICE}"
   log "One-time resume timer installed: ${RESUME_INSTALL_TIMER}"
+  log "SSH guard installed for the reboot: ${SSH_GUARD_SERVICE}"
   log "Resume env saved: ${RESUME_INSTALL_ENV}"
   log "Resume log after reboot: ${RESUME_INSTALL_LOG}"
   log "Resume journal after reboot: journalctl -u ${RESUME_INSTALL_SERVICE} -b --no-pager"
@@ -1315,31 +1433,9 @@ EOF
 
 configure_firewall() {
   log "Configuring UFW firewall."
-  local ssh_port
   ufw default deny incoming
   ufw default allow outgoing
-  ufw allow 22/tcp comment 'SSH default'
-  if [[ -n "${SSH_CONNECTION:-}" ]]; then
-    ssh_port="$(awk '{print $4}' <<<"${SSH_CONNECTION}" 2>/dev/null || true)"
-    if [[ "${ssh_port}" =~ ^[0-9]+$ ]]; then
-      ufw allow "${ssh_port}/tcp" comment 'Current SSH session'
-    fi
-  fi
-  if command -v sshd >/dev/null 2>&1; then
-    while read -r ssh_port; do
-      if [[ "${ssh_port}" =~ ^[0-9]+$ ]]; then
-        ufw allow "${ssh_port}/tcp" comment 'sshd configured port'
-      fi
-    done < <(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -n -u)
-  fi
-  if [[ -r /etc/ssh/sshd_config || -d /etc/ssh/sshd_config.d ]]; then
-    while read -r ssh_port; do
-      if [[ "${ssh_port}" =~ ^[0-9]+$ ]]; then
-        ufw allow "${ssh_port}/tcp" comment 'sshd config port'
-      fi
-    done < <(grep -RihE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print $2}' | sort -n -u)
-  fi
-  ufw allow OpenSSH || true
+  ensure_ssh_firewall_access
   ufw allow 443/tcp
   ufw allow 8443/udp
   ufw allow 51820/udp
