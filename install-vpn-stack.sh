@@ -174,6 +174,7 @@ prompt_yes_no() {
 
 require_root_and_env() {
   [[ "${EUID}" -eq 0 ]] || die "Run this script as root."
+  load_saved_resume_env
   prompt_required_var DOMAIN "DOMAIN, without https://, example s5.example.com"
   prompt_required_var EMAIL "EMAIL for ZeroSSL/acme.sh"
   prompt_required_var CF_Token "Cloudflare DNS API token (hidden input)" 1
@@ -187,6 +188,17 @@ installer_self_path() {
   printf '%s\n' "${self}"
 }
 
+load_saved_resume_env() {
+  if [[ -z "${VPN_STACK_RESUMED:-}" && -r "${RESUME_INSTALL_ENV}" ]]; then
+    log "Loading saved installer environment from ${RESUME_INSTALL_ENV}."
+    set -a
+    # shellcheck disable=SC1090
+    source "${RESUME_INSTALL_ENV}"
+    set +a
+    export VPN_STACK_RESUMED=1
+  fi
+}
+
 write_resume_env() {
   install -d -m 0700 "${RESUME_INSTALL_ENV_DIR}"
   {
@@ -195,6 +207,8 @@ write_resume_env() {
     printf 'CF_Token=%q\n' "${CF_Token}"
     [[ -n "${CF_Zone_ID:-}" ]] && printf 'CF_Zone_ID=%q\n' "${CF_Zone_ID}"
     [[ -n "${CF_Account_ID:-}" ]] && printf 'CF_Account_ID=%q\n' "${CF_Account_ID}"
+    [[ -n "${ZEROSSL_EAB_KID:-}" ]] && printf 'ZEROSSL_EAB_KID=%q\n' "${ZEROSSL_EAB_KID}"
+    [[ -n "${ZEROSSL_EAB_HMAC_KEY:-}" ]] && printf 'ZEROSSL_EAB_HMAC_KEY=%q\n' "${ZEROSSL_EAB_HMAC_KEY}"
     printf 'VPN_STACK_RESUMED=1\n'
     printf 'DEBIAN_FRONTEND=noninteractive\n'
   } >"${RESUME_INSTALL_ENV}"
@@ -667,13 +681,70 @@ cloudflare_zone_from_domain() {
   return 1
 }
 
+fetch_zerossl_eab_credentials() {
+  local response kid hmac
+
+  if [[ -n "${ZEROSSL_EAB_KID:-}" && -n "${ZEROSSL_EAB_HMAC_KEY:-}" ]]; then
+    return 0
+  fi
+
+  log "Requesting ZeroSSL EAB credentials for ${EMAIL}."
+  response="$(curl -fsS --max-time 20 -X POST \
+    https://api.zerossl.com/acme/eab-credentials-email \
+    --data-urlencode "email=${EMAIL}" || true)"
+
+  kid="$(printf '%s' "${response}" | jq -r '.eab_kid // .kid // .data.eab_kid // empty' 2>/dev/null || true)"
+  hmac="$(printf '%s' "${response}" | jq -r '.eab_hmac_key // .hmac_key // .data.eab_hmac_key // empty' 2>/dev/null || true)"
+
+  if [[ -n "${kid}" && -n "${hmac}" ]]; then
+    ZEROSSL_EAB_KID="${kid}"
+    ZEROSSL_EAB_HMAC_KEY="${hmac}"
+    export ZEROSSL_EAB_KID ZEROSSL_EAB_HMAC_KEY
+    [[ -d "${RESUME_INSTALL_ENV_DIR}" ]] && write_resume_env
+    log "ZeroSSL EAB credentials received."
+    return 0
+  fi
+
+  warn "ZeroSSL EAB API did not return credentials for ${EMAIL}."
+  if [[ -n "${response}" ]]; then
+    printf '%s\n' "${response}" | jq -c . >&2 2>/dev/null || printf '%s\n' "${response}" >&2
+  fi
+  return 1
+}
+
+ensure_zerossl_account() {
+  local -a acme=("$@")
+
+  if "${acme[@]}" --register-account -m "${EMAIL}" --server zerossl; then
+    return 0
+  fi
+
+  warn "Automatic ZeroSSL account registration failed; trying explicit EAB credentials."
+  if ! fetch_zerossl_eab_credentials; then
+    prompt_required_var ZEROSSL_EAB_KID "ZeroSSL EAB KID"
+    prompt_required_var ZEROSSL_EAB_HMAC_KEY "ZeroSSL EAB HMAC key" 1
+    export ZEROSSL_EAB_KID ZEROSSL_EAB_HMAC_KEY
+    [[ -d "${RESUME_INSTALL_ENV_DIR}" ]] && write_resume_env
+  fi
+
+  "${acme[@]}" --register-account \
+    -m "${EMAIL}" \
+    --server zerossl \
+    --eab-kid "${ZEROSSL_EAB_KID}" \
+    --eab-hmac-key "${ZEROSSL_EAB_HMAC_KEY}"
+}
+
 install_acme_certificate() {
   log "Issuing ZeroSSL certificate with acme.sh DNS-01."
   install -d -m 0700 /root/.acme.sh /root/acme-zerossl
   install -d -m 0755 "${CERT_DIR}"
 
   if [[ ! -x /root/.acme.sh/acme.sh ]]; then
-    curl -fsSL https://get.acme.sh | sh -s email="${EMAIL}"
+    local acme_installer
+    acme_installer="$(mktemp)"
+    curl -fsSL https://get.acme.sh -o "${acme_installer}"
+    HOME=/root sh "${acme_installer}" email="${EMAIL}"
+    rm -f "${acme_installer}"
   fi
 
   export CF_Token
@@ -688,7 +759,7 @@ install_acme_certificate() {
 
   local acme=(/root/.acme.sh/acme.sh --home /root/.acme.sh --config-home /root/acme-zerossl)
   "${acme[@]}" --set-default-ca --server zerossl
-  "${acme[@]}" --register-account -m "${EMAIL}" --server zerossl || true
+  ensure_zerossl_account "${acme[@]}"
 
   if [[ -s "${CERT_DIR}/fullchain.pem" && -s "${CERT_DIR}/privkey.pem" ]] \
     && openssl x509 -checkend 2592000 -noout -in "${CERT_DIR}/fullchain.pem" >/dev/null 2>&1 \

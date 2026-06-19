@@ -72,6 +72,8 @@ cat /var/log/vpn-stack-resume-install.log
 
 While the resume service is active, do not run `install-vpn-stack.sh` manually. The installer holds a lock at `/run/golden-vpn-install.lock`; a second run exits with a status message instead of competing for `apt`/`dpkg`.
 
+If the resume service did not start, running `./install-vpn-stack.sh` manually after reboot loads `/etc/golden-vpn-installer/install.env` automatically and continues with the saved `DOMAIN`, `EMAIL`, and Cloudflare token.
+
 The installer keeps SSH open before enabling UFW: it allows `22/tcp`, the current SSH session port from `SSH_CONNECTION`, and ports reported by `sshd`.
 
 ## Install With Git
@@ -173,6 +175,14 @@ If you see `Could not get lock /var/lib/dpkg/lock-frontend`, another install or 
 vpn-install-status follow
 # or
 journalctl -fu vpn-stack-resume-install.service
+```
+
+If ZeroSSL registration fails with `Cannot resolve _eab_id`, the installer tries the ZeroSSL EAB API automatically. If that also fails, export explicit EAB credentials before retrying:
+
+```bash
+export ZEROSSL_EAB_KID="..."
+export ZEROSSL_EAB_HMAC_KEY="..."
+./install-vpn-stack.sh
 ```
 
 If AmneziaWG DKMS fails and the log says the running kernel is older than the latest installed kernel, use the built-in one-time reboot/resume prompt or reboot first:
