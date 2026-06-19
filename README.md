@@ -4,7 +4,7 @@ Golden install script for a fresh Ubuntu/Debian VPS.
 
 It deploys:
 
-- VLESS XHTTP TLS on `443/tcp` behind nginx and the domain certificate
+- Trojan XHTTP TLS on `443/tcp` behind nginx and the domain certificate
 - Hysteria2 Salamander on `8443/udp`
 - AmneziaWG 2.0 on `51820/udp`
 - randomized static decoy HTTPS site on `https://DOMAIN/`
@@ -94,7 +94,7 @@ chmod +x install-vpn-stack.sh
 Create clients:
 
 ```bash
-vpn-vless phone1
+vpn-trojan phone1
 vpn-hysteria phone1
 vpn-awg phone1
 ```
@@ -102,10 +102,12 @@ vpn-awg phone1
 Initial client files:
 
 ```text
-/root/vpn-keys/vless/main-vless.txt
-/root/vpn-keys/hysteria/main-hysteria-client.txt
-/root/vpn-keys/awg/main-awg.conf
+/root/vpn-keys/trojan/TROJAN-main-trojan.txt
+/root/vpn-keys/hysteria/HYSTERIA-main-hysteria-client.txt
+/root/vpn-keys/awg/AWG-main-awg.conf
 ```
+
+New client display labels and saved filenames use `TROJAN-<name>`, `HYSTERIA-<name>`, and `AWG-<name>`.
 
 The decoy site is generated at install time:
 

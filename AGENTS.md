@@ -1,5 +1,8 @@
 # Техническое задание: Golden Install VPN Stack
 
+> Актуальное изменение от 2026-06-19: основной TCP/443 контур заменен на Trojan XHTTP TLS.
+> Старые упоминания VLESS/REALITY ниже считаются устаревшими, если они противоречат `install-vpn-stack.sh` и `README.md`.
+
 ## 1. Назначение
 
 Необходимо разработать единый установочный скрипт `install-vpn-stack.sh`, который на чистом Ubuntu/Debian VPS автоматически разворачивает готовую VPN-инфраструктуру.
@@ -9,7 +12,7 @@
 Итоговая архитектура:
 
 ```text
-VLESS REALITY XHTTP → 443/tcp
+Trojan XHTTP TLS → 443/tcp
 Hysteria2 Salamander → 8443/udp
 AmneziaWG 2.0 → 51820/udp
 Decoy HTTPS site → https://DOMAIN/
@@ -20,7 +23,6 @@ Node Exporter Full dashboard → Grafana dashboard ID 1860
 В Golden Install не должны входить:
 
 ```text
-Trojan
 Cloudflare orange cloud CDN
 Cloudflare Tunnel
 WARP

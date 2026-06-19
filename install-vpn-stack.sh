@@ -10,7 +10,7 @@ XRAY_DIR="${STACK_DIR}/xray"
 HYSTERIA_DIR="${STACK_DIR}/hysteria"
 LOG_DIR="/var/log/vpn-stack"
 CERT_DIR="/etc/letsencrypt/live/${DOMAIN:-}"
-VLESS_XHTTP_SOCKET="/dev/shm/xray-vless-xhttp.sock"
+TROJAN_XHTTP_SOCKET="/dev/shm/xray-trojan-xhttp.sock"
 RESUME_INSTALL_DIR="/root/vpn-stack-resume"
 RESUME_INSTALL_SCRIPT="${RESUME_INSTALL_DIR}/install-vpn-stack.sh"
 RESUME_INSTALL_ENV_DIR="/etc/golden-vpn-installer"
@@ -800,6 +800,16 @@ uri_encode() {
   python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
 }
 
+label_name() {
+  local prefix="$1"
+  local name="$2"
+  if [[ "${name}" == "${prefix}-"* ]]; then
+    printf '%s' "${name}"
+  else
+    printf '%s-%s' "${prefix}" "${name}"
+  fi
+}
+
 pick_decoy_value() {
   local count="$#"
   local idx
@@ -813,45 +823,48 @@ pick_decoy_value() {
   printf '%s' "$1"
 }
 
-write_vless_link() {
-  local uuid="$1"
+write_trojan_link() {
+  local password="$1"
   local name="$2"
-  local domain path encoded_path fragment link
+  local domain path label encoded_path fragment link
   domain="$(<"${STACK_DIR}/domain.txt")"
-  path="$(<"${STACK_DIR}/vless-xhttp-path.txt")"
+  path="$(<"${STACK_DIR}/trojan-xhttp-path.txt")"
+  label="$(label_name "TROJAN" "${name}")"
   encoded_path="$(uri_encode "${path}")"
-  fragment="$(uri_encode "VLESS-XHTTP-TLS-${name}")"
-  link="vless://${uuid}@${domain}:443?security=tls&type=xhttp&encryption=none&path=${encoded_path}&mode=stream-one&sni=${domain}&host=${domain}&fp=chrome&alpn=h2%2Chttp%2F1.1#${fragment}"
-  install -d -m 0700 "${KEY_DIR}/vless"
-  printf '%s\n' "${link}" >"${KEY_DIR}/vless/${name}.txt"
-  chmod 0600 "${KEY_DIR}/vless/${name}.txt"
+  fragment="$(uri_encode "${label}")"
+  link="trojan://${password}@${domain}:443?security=tls&type=xhttp&path=${encoded_path}&mode=stream-one&sni=${domain}&host=${domain}&fp=chrome&alpn=h2%2Chttp%2F1.1#${fragment}"
+  install -d -m 0700 "${KEY_DIR}/trojan"
+  printf '%s\n' "${link}" >"${KEY_DIR}/trojan/${label}.txt"
+  chmod 0600 "${KEY_DIR}/trojan/${label}.txt"
   printf '%s\n' "${link}"
 }
 
 configure_xray() {
-  log "Configuring VLESS XHTTP TLS backend."
-  install -d -m 0700 "${STACK_DIR}" "${XRAY_DIR}" "${LOG_DIR}" "${KEY_DIR}/vless"
+  log "Configuring Trojan XHTTP TLS backend."
+  install -d -m 0700 "${STACK_DIR}" "${XRAY_DIR}" "${LOG_DIR}" "${KEY_DIR}/trojan"
   printf '%s\n' "${DOMAIN}" >"${STACK_DIR}/domain.txt"
   printf '%s\n' "${PUBLIC_IPV4}" >"${STACK_DIR}/public-ipv4.txt"
   printf '%s\n' "${EXT_IFACE}" >"${STACK_DIR}/external-interface.txt"
 
-  local uuid path
-  uuid="$(/usr/local/bin/xray uuid)"
+  local password path
+  password="$(rand_hex 24)"
   path="/$(rand_hex 8)/$(rand_hex 8)/"
 
-  printf '%s\n' "${uuid}" >"${STACK_DIR}/vless-xhttp-uuid.txt"
-  printf '%s\n' "${path}" >"${STACK_DIR}/vless-xhttp-path.txt"
-  printf '%s\n' "${VLESS_XHTTP_SOCKET}" >"${STACK_DIR}/vless-xhttp-socket.txt"
-  chmod 0600 "${STACK_DIR}"/vless-xhttp-*.txt
-  rm -f "${VLESS_XHTTP_SOCKET}"
-  rm -f "${STACK_DIR}"/vless-reality-*.txt
+  printf '%s\n' "${password}" >"${STACK_DIR}/trojan-xhttp-password.txt"
+  printf '%s\n' "${path}" >"${STACK_DIR}/trojan-xhttp-path.txt"
+  printf '%s\n' "${TROJAN_XHTTP_SOCKET}" >"${STACK_DIR}/trojan-xhttp-socket.txt"
+  chmod 0600 "${STACK_DIR}"/trojan-xhttp-*.txt
+  rm -f "${TROJAN_XHTTP_SOCKET}" /dev/shm/xray-vless-xhttp.sock
+  rm -f "${STACK_DIR}"/vless-xhttp-*.txt "${STACK_DIR}"/vless-reality-*.txt
+  systemctl disable --now xray-vless-xhttp-tls.service >/dev/null 2>&1 || true
   systemctl disable --now xray-vless-reality-xhttp.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/xray-vless-xhttp-tls.service
   rm -f /etc/systemd/system/xray-vless-reality-xhttp.service
 
   jq -n \
-    --arg uuid "${uuid}" \
+    --arg password "${password}" \
     --arg path "${path}" \
-    --arg listen "${VLESS_XHTTP_SOCKET},0666" \
+    --arg listen "${TROJAN_XHTTP_SOCKET},0666" \
     '{
       log: {
         loglevel: "warning",
@@ -860,14 +873,13 @@ configure_xray() {
       },
       inbounds: [
         {
-          tag: "vless-xhttp-tls",
+          tag: "trojan-xhttp-tls",
           listen: $listen,
-          protocol: "vless",
+          protocol: "trojan",
           settings: {
             clients: [
-              { id: $uuid, email: "main-vless" }
-            ],
-            decryption: "none"
+              { password: $password, email: "main-trojan" }
+            ]
           },
           streamSettings: {
             network: "xhttp",
@@ -889,38 +901,38 @@ configure_xray() {
     }' >"${XRAY_DIR}/config.json"
   chmod 0600 "${XRAY_DIR}/config.json"
 
-  cat >/etc/systemd/system/xray-vless-xhttp-tls.service <<EOF
+  cat >/etc/systemd/system/xray-trojan-xhttp-tls.service <<EOF
 [Unit]
-Description=Xray VLESS XHTTP TLS backend
+Description=Xray Trojan XHTTP TLS backend
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-ExecStartPre=/usr/bin/rm -f ${VLESS_XHTTP_SOCKET}
+ExecStartPre=/usr/bin/rm -f ${TROJAN_XHTTP_SOCKET}
 ExecStart=/usr/local/bin/xray run -config ${XRAY_DIR}/config.json
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=1048576
-RuntimeDirectory=xray-vless-xhttp
+RuntimeDirectory=xray-trojan-xhttp
 RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  chmod 0644 /etc/systemd/system/xray-vless-xhttp-tls.service
+  chmod 0644 /etc/systemd/system/xray-trojan-xhttp-tls.service
 
   /usr/local/bin/xray run -test -config "${XRAY_DIR}/config.json"
-  write_vless_link "${uuid}" "main-vless" >/dev/null
+  write_trojan_link "${password}" "main-trojan" >/dev/null
 }
 
 configure_nginx() {
-  log "Configuring nginx HTTPS decoy and VLESS XHTTP TLS path."
+  log "Configuring nginx HTTPS decoy and Trojan XHTTP TLS path."
   install -d -m 0755 /var/www/decoy/assets /etc/nginx/stream-conf.d /etc/nginx/sites-available /etc/nginx/sites-enabled
 
-  local vless_path brand tagline focus region primary accent bg surface build_id status_note docs_title
-  vless_path="$(<"${STACK_DIR}/vless-xhttp-path.txt")"
+  local trojan_path brand tagline focus region primary accent bg surface build_id status_note docs_title
+  trojan_path="$(<"${STACK_DIR}/trojan-xhttp-path.txt")"
   brand="$(pick_decoy_value "Netwatch" "Pulsegrid" "Uplink Labs" "Signal Harbor" "Lattice Monitor" "Northstar Systems")"
   tagline="$(pick_decoy_value "Lightweight network availability monitoring." "Practical uptime checks for distributed teams." "Quiet visibility for service availability." "Simple status signals for operations teams.")"
   focus="$(pick_decoy_value "availability checks" "edge route checks" "latency snapshots" "incident notes" "maintenance windows")"
@@ -1088,7 +1100,7 @@ server {
     root /var/www/decoy;
     index index.html;
 
-    location ^~ ${vless_path} {
+    location ^~ ${trojan_path} {
         client_max_body_size 0;
         client_body_timeout 5m;
         grpc_read_timeout 315s;
@@ -1096,7 +1108,7 @@ server {
         grpc_set_header Host \$host;
         grpc_set_header X-Real-IP \$remote_addr;
         grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        grpc_pass unix:${VLESS_XHTTP_SOCKET};
+        grpc_pass unix:${TROJAN_XHTTP_SOCKET};
     }
 
     location / {
@@ -1147,14 +1159,15 @@ hysteria_render_config() {
 write_hysteria_link() {
   local name="$1"
   local password="$2"
-  local obfs domain tag link
+  local obfs domain label tag link
   domain="$(<"${STACK_DIR}/domain.txt")"
   obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
-  tag="$(uri_encode "Hysteria2-${name}")"
+  label="$(label_name "HYSTERIA" "${name}")"
+  tag="$(uri_encode "${label}")"
   link="hysteria2://${name}:${password}@${domain}:8443?obfs=salamander&obfs-password=${obfs}&sni=${domain}#${tag}"
   install -d -m 0700 "${KEY_DIR}/hysteria"
-  printf '%s\n' "${link}" >"${KEY_DIR}/hysteria/${name}.txt"
-  chmod 0600 "${KEY_DIR}/hysteria/${name}.txt"
+  printf '%s\n' "${link}" >"${KEY_DIR}/hysteria/${label}.txt"
+  chmod 0600 "${KEY_DIR}/hysteria/${label}.txt"
   printf '%s\n' "${link}"
 }
 
@@ -1275,12 +1288,15 @@ write_awg_client_config() {
   local client_ip="$3"
   local server_public="$4"
   local psk="$5"
-  local out_file="${KEY_DIR}/awg/${name}.conf"
+  local label out_file
+  label="$(label_name "AWG" "${name}")"
+  out_file="${KEY_DIR}/awg/${label}.conf"
 
   # shellcheck disable=SC1091
   source "${STACK_DIR}/awg-params.env"
   install -d -m 0700 "${KEY_DIR}/awg"
   cat >"${out_file}" <<EOF
+# ${label}
 [Interface]
 PrivateKey = ${client_private}
 Address = ${client_ip}/32
@@ -1521,35 +1537,48 @@ configure_firewall() {
   ufw --force enable
 }
 
-install_helper_vless() {
-  cat >/usr/local/bin/vpn-vless <<'EOF'
+install_helper_trojan() {
+  cat >/usr/local/bin/vpn-trojan <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 CONFIG="/opt/vpn-stack/xray/config.json"
 STACK_DIR="/opt/vpn-stack"
-KEY_DIR="/root/vpn-keys/vless"
-SERVICE="xray-vless-xhttp-tls.service"
+KEY_DIR="/root/vpn-keys/trojan"
+SERVICE="xray-trojan-xhttp-tls.service"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 uri_encode() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
+label_name() {
+  local prefix="$1"
+  local name="$2"
+  if [[ "${name}" == "${prefix}-"* ]]; then
+    printf '%s' "${name}"
+  else
+    printf '%s-%s' "${prefix}" "${name}"
+  fi
+}
 
 [[ "${EUID}" -eq 0 ]] || die "Run as root."
-[[ $# -eq 1 ]] || die "Usage: vpn-vless <name>"
+[[ $# -eq 1 ]] || die "Usage: vpn-trojan <name>"
 name="$1"
 [[ "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || die "Use only letters, digits, dot, underscore, dash."
 [[ -f "${CONFIG}" ]] || die "Missing ${CONFIG}"
+label="$(label_name "TROJAN" "${name}")"
 
-if jq -e --arg email "${name}" '.inbounds[] | select(.tag=="vless-xhttp-tls") | .settings.clients[]? | select(.email==$email)' "${CONFIG}" >/dev/null; then
+if jq -e --arg email "${name}" '.inbounds[] | select(.tag=="trojan-xhttp-tls") | .settings.clients[]? | select(.email==$email)' "${CONFIG}" >/dev/null; then
   die "Client already exists: ${name}"
 fi
+if [[ -f "${KEY_DIR}/${label}.txt" ]]; then
+  die "Client key file already exists: ${KEY_DIR}/${label}.txt"
+fi
 
-uuid="$(/usr/local/bin/xray uuid)"
+password="$(openssl rand -hex 24)"
 tmp="$(mktemp)"
 backup="$(mktemp)"
 cp "${CONFIG}" "${backup}"
-jq --arg id "${uuid}" --arg email "${name}" \
-  '(.inbounds[] | select(.tag=="vless-xhttp-tls") | .settings.clients) += [{id: $id, email: $email}]' \
+jq --arg password "${password}" --arg email "${name}" \
+  '(.inbounds[] | select(.tag=="trojan-xhttp-tls") | .settings.clients) += [{password: $password, email: $email}]' \
   "${CONFIG}" >"${tmp}"
 install -m 0600 "${tmp}" "${CONFIG}"
 rm -f "${tmp}"
@@ -1563,17 +1592,17 @@ rm -f "${backup}"
 systemctl restart "${SERVICE}"
 
 domain="$(<"${STACK_DIR}/domain.txt")"
-path="$(<"${STACK_DIR}/vless-xhttp-path.txt")"
+path="$(<"${STACK_DIR}/trojan-xhttp-path.txt")"
 encoded_path="$(uri_encode "${path}")"
-fragment="$(uri_encode "VLESS-XHTTP-TLS-${name}")"
-link="vless://${uuid}@${domain}:443?security=tls&type=xhttp&encryption=none&path=${encoded_path}&mode=stream-one&sni=${domain}&host=${domain}&fp=chrome&alpn=h2%2Chttp%2F1.1#${fragment}"
+fragment="$(uri_encode "${label}")"
+link="trojan://${password}@${domain}:443?security=tls&type=xhttp&path=${encoded_path}&mode=stream-one&sni=${domain}&host=${domain}&fp=chrome&alpn=h2%2Chttp%2F1.1#${fragment}"
 
 install -d -m 0700 "${KEY_DIR}"
-printf '%s\n' "${link}" >"${KEY_DIR}/${name}.txt"
-chmod 0600 "${KEY_DIR}/${name}.txt"
+printf '%s\n' "${link}" >"${KEY_DIR}/${label}.txt"
+chmod 0600 "${KEY_DIR}/${label}.txt"
 printf '%s\n' "${link}"
 EOF
-  chmod 0755 /usr/local/bin/vpn-vless
+  chmod 0755 /usr/local/bin/vpn-trojan
 }
 
 install_helper_hysteria() {
@@ -1590,6 +1619,15 @@ SERVICE="hysteria2.service"
 die() { echo "ERROR: $*" >&2; exit 1; }
 uri_encode() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
 rand_hex() { openssl rand -hex "$1"; }
+label_name() {
+  local prefix="$1"
+  local name="$2"
+  if [[ "${name}" == "${prefix}-"* ]]; then
+    printf '%s' "${name}"
+  else
+    printf '%s-%s' "${prefix}" "${name}"
+  fi
+}
 
 render_config() {
   local obfs
@@ -1616,9 +1654,13 @@ render_config() {
 name="$1"
 [[ "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || die "Use only letters, digits, dot, underscore, dash."
 [[ -f "${CLIENTS}" ]] || die "Missing ${CLIENTS}"
+label="$(label_name "HYSTERIA" "${name}")"
 
 if jq -e --arg name "${name}" 'has($name)' "${CLIENTS}" >/dev/null; then
   die "Client already exists: ${name}"
+fi
+if [[ -f "${KEY_DIR}/${label}.txt" ]]; then
+  die "Client key file already exists: ${KEY_DIR}/${label}.txt"
 fi
 
 password="$(rand_hex 18)"
@@ -1631,11 +1673,11 @@ systemctl restart "${SERVICE}"
 
 domain="$(<"${STACK_DIR}/domain.txt")"
 obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
-tag="$(uri_encode "Hysteria2-${name}")"
+tag="$(uri_encode "${label}")"
 link="hysteria2://${name}:${password}@${domain}:8443?obfs=salamander&obfs-password=${obfs}&sni=${domain}#${tag}"
 install -d -m 0700 "${KEY_DIR}"
-printf '%s\n' "${link}" >"${KEY_DIR}/${name}.txt"
-chmod 0600 "${KEY_DIR}/${name}.txt"
+printf '%s\n' "${link}" >"${KEY_DIR}/${label}.txt"
+chmod 0600 "${KEY_DIR}/${label}.txt"
 printf '%s\n' "${link}"
 EOF
   chmod 0755 /usr/local/bin/vpn-hysteria
@@ -1656,6 +1698,15 @@ awg_genpsk() {
     awg genpsk
   else
     openssl rand -base64 32
+  fi
+}
+label_name() {
+  local prefix="$1"
+  local name="$2"
+  if [[ "${name}" == "${prefix}-"* ]]; then
+    printf '%s' "${name}"
+  else
+    printf '%s-%s' "${prefix}" "${name}"
   fi
 }
 
@@ -1784,8 +1835,9 @@ name="$1"
 [[ "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || die "Use only letters, digits, dot, underscore, dash."
 [[ -f "${CONFIG}" ]] || die "Missing ${CONFIG}"
 [[ -f "${STACK_DIR}/awg-params.env" ]] || die "Missing ${STACK_DIR}/awg-params.env"
-if [[ -f "${KEY_DIR}/${name}.conf" ]]; then
-  die "Client config already exists: ${KEY_DIR}/${name}.conf"
+label="$(label_name "AWG" "${name}")"
+if [[ -f "${KEY_DIR}/${label}.conf" || -f "${KEY_DIR}/${name}.conf" ]]; then
+  die "Client config already exists for: ${label}"
 fi
 
 # shellcheck disable=SC1091
@@ -1817,8 +1869,9 @@ else
 fi
 
 install -d -m 0700 "${KEY_DIR}"
-out="${KEY_DIR}/${name}.conf"
+out="${KEY_DIR}/${label}.conf"
 cat >"${out}" <<EOF_CLIENT
+# ${label}
 [Interface]
 PrivateKey = ${client_private}
 Address = ${client_ip}/32
@@ -1867,22 +1920,37 @@ show_key_if_exists() {
   fi
 }
 
+label_name() {
+  local prefix="$1"
+  local name="$2"
+  if [[ "${name}" == "${prefix}-"* ]]; then
+    printf '%s' "${name}"
+  else
+    printf '%s-%s' "${prefix}" "${name}"
+  fi
+}
+
 proto="${1:-}"
 name="${2:-}"
 
 case "${proto}" in
-  tls|xhttp|vless)
-    [[ -n "${name}" ]] && show_key_if_exists "/root/vpn-keys/vless/${name}.txt" && exit 0
-    echo "Create: vpn-vless <name>"
+  trojan|tls|xhttp)
+    [[ -n "${name}" ]] && show_key_if_exists "/root/vpn-keys/trojan/$(label_name "TROJAN" "${name}").txt" && exit 0
+    echo "Create: vpn-trojan <name>"
+    exit 0
+    ;;
+  vless)
+    echo "VLESS was replaced by Trojan XHTTP TLS."
+    echo "Create: vpn-trojan <name>"
     exit 0
     ;;
   hysteria)
-    [[ -n "${name}" ]] && show_key_if_exists "/root/vpn-keys/hysteria/${name}.txt" && exit 0
+    [[ -n "${name}" ]] && show_key_if_exists "/root/vpn-keys/hysteria/$(label_name "HYSTERIA" "${name}").txt" && exit 0
     echo "Create: vpn-hysteria <name>"
     exit 0
     ;;
   awg)
-    [[ -n "${name}" ]] && show_key_if_exists "/root/vpn-keys/awg/${name}.conf" && exit 0
+    [[ -n "${name}" ]] && show_key_if_exists "/root/vpn-keys/awg/$(label_name "AWG" "${name}").conf" && exit 0
     echo "Create: vpn-awg <name>"
     exit 0
     ;;
@@ -1892,7 +1960,7 @@ cat <<'HELP'
 Golden VPN helper commands
 
 Create clients:
-  vpn-vless phone1
+  vpn-trojan phone1
   vpn-hysteria phone1
   vpn-awg phone1
 
@@ -1902,20 +1970,20 @@ AmneziaWG diagnostics:
   vpn-awg capture 30
 
 Saved keys:
-  /root/vpn-keys/vless/<name>.txt
-  /root/vpn-keys/hysteria/<name>.txt
-  /root/vpn-keys/awg/<name>.conf
+  /root/vpn-keys/trojan/TROJAN-<name>.txt
+  /root/vpn-keys/hysteria/HYSTERIA-<name>.txt
+  /root/vpn-keys/awg/AWG-<name>.conf
 
 Show saved client material:
+  vpn-help trojan phone1
   vpn-help tls phone1
   vpn-help xhttp phone1
-  vpn-help vless phone1
   vpn-help hysteria phone1
   vpn-help awg phone1
 
 Check services:
   systemctl status nginx --no-pager
-  systemctl status xray-vless-xhttp-tls --no-pager
+  systemctl status xray-trojan-xhttp-tls --no-pager
   systemctl status hysteria2 --no-pager
   systemctl status awg-quick@awg0 --no-pager -l
   systemctl status prometheus --no-pager
@@ -1937,8 +2005,8 @@ EOF
 
 install_helpers() {
   log "Installing helper commands."
-  rm -f /usr/local/bin/vpn /usr/local/bin/vpn-trojan /usr/local/bin/vpn-vless-xhttp /usr/local/bin/vpn-vless-reality
-  install_helper_vless
+  rm -f /usr/local/bin/vpn /usr/local/bin/vpn-vless /usr/local/bin/vpn-vless-xhttp /usr/local/bin/vpn-vless-reality
+  install_helper_trojan
   install_helper_hysteria
   install_helper_awg
   install_helper_help
@@ -2089,7 +2157,7 @@ set -euo pipefail
 log_file="/var/log/vpn-stack-healthcheck.log"
 services=(
   nginx
-  xray-vless-xhttp-tls
+  xray-trojan-xhttp-tls
   hysteria2
   prometheus
   prometheus-node-exporter
@@ -2141,7 +2209,7 @@ enable_and_start_services() {
   systemctl daemon-reload
 
   systemctl enable nginx
-  systemctl enable xray-vless-xhttp-tls
+  systemctl enable xray-trojan-xhttp-tls
   systemctl enable hysteria2
   systemctl enable amneziawg-ensure-module
   systemctl enable awg-quick@awg0
@@ -2152,7 +2220,7 @@ enable_and_start_services() {
   systemctl enable vpn-stack-healthcheck.timer
 
   systemctl restart systemd-journald || true
-  systemctl restart xray-vless-xhttp-tls
+  systemctl restart xray-trojan-xhttp-tls
   systemctl restart nginx
   systemctl restart hysteria2
   systemctl restart amneziawg-ensure-module
@@ -2230,7 +2298,7 @@ wait_for_expected_listeners() {
     listen_any_port tcp 443 || missing+=("443/tcp")
     listen_any_port udp 8443 || missing+=("8443/udp")
     listen_any_port udp 51820 || missing+=("51820/udp")
-    [[ -S "${VLESS_XHTTP_SOCKET}" ]] || missing+=("${VLESS_XHTTP_SOCKET}")
+    [[ -S "${TROJAN_XHTTP_SOCKET}" ]] || missing+=("${TROJAN_XHTTP_SOCKET}")
     listen_local_port tcp 3000 || missing+=("127.0.0.1:3000")
     listen_local_port tcp 9090 || missing+=("127.0.0.1:9090")
     listen_local_port tcp 9100 || missing+=("127.0.0.1:9100")
@@ -2267,7 +2335,7 @@ Server IPv4: ${PUBLIC_IPV4}
 External interface: ${EXT_IFACE}
 
 Contours:
-  VLESS XHTTP TLS     : service $(service_summary xray-vless-xhttp-tls); external 443/tcp via nginx $(listen_label any tcp 443); backend ${VLESS_XHTTP_SOCKET} $(socket_label "${VLESS_XHTTP_SOCKET}")
+  Trojan XHTTP TLS   : service $(service_summary xray-trojan-xhttp-tls); external 443/tcp via nginx $(listen_label any tcp 443); backend ${TROJAN_XHTTP_SOCKET} $(socket_label "${TROJAN_XHTTP_SOCKET}")
   Hysteria2 Salamander: service $(service_summary hysteria2); external 8443/udp $(listen_label any udp 8443)
   AmneziaWG 2.0       : service $(service_summary awg-quick@awg0); external 51820/udp $(listen_label any udp 51820); interface awg0
   Decoy HTTPS site    : nginx $(service_summary nginx); https://${DOMAIN}/; randomized static site on 443/tcp
@@ -2307,12 +2375,12 @@ Storage limits:
   Prometheus retention: 7d / 1GB
 
 Initial client files:
-  ${KEY_DIR}/vless/main-vless.txt
-  ${KEY_DIR}/hysteria/main-hysteria-client.txt
-  ${KEY_DIR}/awg/main-awg.conf
+  ${KEY_DIR}/trojan/TROJAN-main-trojan.txt
+  ${KEY_DIR}/hysteria/HYSTERIA-main-hysteria-client.txt
+  ${KEY_DIR}/awg/AWG-main-awg.conf
 
 Create more clients:
-  vpn-vless phone1
+  vpn-trojan phone1
   vpn-hysteria phone1
   vpn-awg phone1
   vpn-help
@@ -2324,10 +2392,10 @@ final_checks() {
   log "Final listening socket check."
   set +e
   ss -lntup | grep -E ':443|:8443|:51820|:3000|:9090|:9100'
-  ls -l "${VLESS_XHTTP_SOCKET}"
+  ls -l "${TROJAN_XHTTP_SOCKET}"
 
   systemctl status nginx --no-pager
-  systemctl status xray-vless-xhttp-tls --no-pager
+  systemctl status xray-trojan-xhttp-tls --no-pager
   systemctl status hysteria2 --no-pager
   systemctl status awg-quick@awg0 --no-pager -l
   systemctl status prometheus --no-pager
@@ -2340,11 +2408,11 @@ final_checks() {
 
   log "Initial client files:"
   printf '  %s\n' \
-    "${KEY_DIR}/vless/main-vless.txt" \
-    "${KEY_DIR}/hysteria/main-hysteria-client.txt" \
-    "${KEY_DIR}/awg/main-awg.conf"
+    "${KEY_DIR}/trojan/TROJAN-main-trojan.txt" \
+    "${KEY_DIR}/hysteria/HYSTERIA-main-hysteria-client.txt" \
+    "${KEY_DIR}/awg/AWG-main-awg.conf"
   log "Optional helper smoke tests create extra clients:"
-  printf '  vpn-vless test-vless\n  vpn-hysteria test-hy2\n  vpn-awg test-awg\n'
+  printf '  vpn-trojan test-trojan\n  vpn-hysteria test-hy2\n  vpn-awg test-awg\n'
   print_install_summary
 }
 
@@ -2371,7 +2439,7 @@ main() {
   install_acme_certificate
   progress "Installing Xray"
   install_xray
-  progress "Configuring VLESS XHTTP TLS"
+  progress "Configuring Trojan XHTTP TLS"
   configure_xray
   progress "Configuring nginx decoy and router"
   configure_nginx
