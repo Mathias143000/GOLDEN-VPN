@@ -41,6 +41,7 @@ BASE_PACKAGES=(
   jq
   openssl
   ca-certificates
+  openssh-server
   socat
   qrencode
   ufw
@@ -258,7 +259,18 @@ ensure_ssh_firewall_access() {
     ufw reload || true
   fi
 
-  systemctl enable --now ssh >/dev/null 2>&1 || systemctl enable --now sshd >/dev/null 2>&1 || true
+  if ! command -v sshd >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+    apt-get update >/dev/null 2>&1 || true
+    apt-get install -y openssh-server >/dev/null 2>&1 || true
+  fi
+
+  ssh-keygen -A >/dev/null 2>&1 || true
+  systemctl unmask ssh sshd ssh.service sshd.service ssh.socket >/dev/null 2>&1 || true
+  systemctl enable --now ssh.service >/dev/null 2>&1 \
+    || systemctl enable --now sshd.service >/dev/null 2>&1 \
+    || systemctl enable --now ssh.socket >/dev/null 2>&1 \
+    || true
+  systemctl restart ssh.service >/dev/null 2>&1 || systemctl restart sshd.service >/dev/null 2>&1 || true
 
   if [[ "${had_errexit}" == "1" ]]; then
     set -e
@@ -310,8 +322,15 @@ current_ssh_port="${current_ssh_port}"
     ufw status verbose || true
   fi
 
-  systemctl enable --now ssh || systemctl enable --now sshd || true
-  systemctl restart ssh || systemctl restart sshd || true
+  if ! command -v sshd >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+    apt-get update || true
+    apt-get install -y openssh-server || true
+  fi
+
+  ssh-keygen -A || true
+  systemctl unmask ssh sshd ssh.service sshd.service ssh.socket || true
+  systemctl enable --now ssh.service || systemctl enable --now sshd.service || systemctl enable --now ssh.socket || true
+  systemctl restart ssh.service || systemctl restart sshd.service || true
   ss -lntp | grep -E ':(22|'"${current_ssh_port:-22}"')' || true
   printf '%s ssh guard done\n' "\$(date -Is)"
 } >>"\${log_file}" 2>&1
