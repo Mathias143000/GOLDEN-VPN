@@ -217,7 +217,15 @@ write_resume_env() {
 }
 
 ensure_ssh_firewall_access() {
-  local ssh_port
+  local ssh_port had_errexit=0
+
+  case $- in
+    *e*)
+      had_errexit=1
+      set +e
+      ;;
+  esac
+
   log "Ensuring SSH remains reachable before firewall/reboot changes."
 
   if command -v ufw >/dev/null 2>&1; then
@@ -251,6 +259,11 @@ ensure_ssh_firewall_access() {
   fi
 
   systemctl enable --now ssh >/dev/null 2>&1 || systemctl enable --now sshd >/dev/null 2>&1 || true
+
+  if [[ "${had_errexit}" == "1" ]]; then
+    set -e
+  fi
+  return 0
 }
 
 install_ssh_guard_once() {
