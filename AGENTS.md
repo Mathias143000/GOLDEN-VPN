@@ -3,6 +3,344 @@
 > Актуальное изменение от 2026-06-19: основной TCP/443 контур заменен на Trojan XHTTP TLS.
 > Старые упоминания VLESS/REALITY ниже считаются устаревшими, если они противоречат `install-vpn-stack.sh` и `README.md`.
 
+## 0. Аудит текущего скрипта и roadmap улучшений
+
+Этот раздел имеет приоритет над устаревшими пунктами ниже, если они расходятся с текущим `install-vpn-stack.sh`.
+
+### 0.1 Текущее состояние
+
+Фактическая архитектура скрипта:
+
+```text
+Trojan XHTTP TLS → 443/tcp через nginx HTTPS location + Xray unix socket
+Hysteria2 Salamander → 8443/udp
+AmneziaWG 2.0 → 51820/udp
+Decoy HTTPS site → встроенный статический генератор HTML/CSS
+Grafana + Prometheus + Node Exporter → localhost-only
+Client labels → <PROTOCOL>-<LOCATION>-<NAME>
+```
+
+Уже реализовано:
+
+```text
+SERVER_LOCATION из двух ASCII-букв
+TROJAN-<LOCATION>-<name>
+HYSTERIA-<LOCATION>-<name>
+AWG-<LOCATION>-<name>
+QR-коды в helper-командах
+ручной two-stage install без auto reboot/resume по умолчанию
+ожидание apt/dpkg lock через DPkg::Lock::Timeout
+ASCII-валидация EMAIL
+ZeroSSL primary + fallback CA через DNS-01
+AWG_OBFS_PROFILE=dns|quic-lite
+AWG_MTU по умолчанию 1280, допустимо 1200..1420
+ручные AWG diagnostics: vpn-awg analyze, vpn-awg capture
+рандомный decoy site без внешних CDN/JS/forms/backend
+```
+
+Главные проблемы текущего скрипта:
+
+```text
+AGENTS.md ниже содержит много устаревших требований про VLESS REALITY.
+AmneziaWG параметры рандомятся из двух грубых профилей, но нет объяснимого выбора под конкретную сеть.
+tcpdump не используется автоматически для принятия решений; он только ручной diagnostic helper.
+MTU задан явно, но нет PMTU/DF-probe и нет автоподбора по маршруту.
+Decoy site рандомится только из встроенных списков; нет профилей отрасли, seed, preview и контроля уникальности.
+Install flow все еще слишком монолитный: одна большая bash-программа без unit-тестов функций.
+Нет команд list/revoke/rotate для клиентов.
+Нет отдельного config/env-файла с полным описанием всех tunables.
+Нет audit report после установки в машинно-читаемом JSON.
+```
+
+### 0.2 Улучшения install flow
+
+Следующий желательный install flow:
+
+```text
+1. preflight-only:
+   - проверка root, OS, kernel, DNS, Cloudflare token, email, SERVER_LOCATION
+   - проверка SSH listener и UFW без изменения VPN-конфигов
+   - проверка apt/dpkg lock и pending reboot
+   - вывод понятного отчета PASS/WARN/FAIL
+
+2. manual reboot gate:
+   - скрипт не должен сам перезагружать VPS по умолчанию
+   - если нужен kernel reboot, скрипт останавливается с понятной командой
+   - auto resume допускается только через явный флаг и должен быть deprecated
+
+3. install:
+   - установка пакетов
+   - выпуск сертификата
+   - настройка контуров
+   - настройка monitoring/logrotate/timers
+
+4. verify:
+   - проверка listeners
+   - проверка systemd services
+   - проверка decoy HTTPS
+   - проверка helper-команд без создания лишних тестовых клиентов по умолчанию
+
+5. report:
+   - человекочитаемый summary
+   - JSON-report в /root/vpn-keys/install-report.json
+```
+
+Нужные команды:
+
+```bash
+./install-vpn-stack.sh preflight
+./install-vpn-stack.sh install
+./install-vpn-stack.sh verify
+./install-vpn-stack.sh report
+```
+
+### 0.3 Полная кастомизация AmneziaWG
+
+Сейчас AWG использует профили:
+
+```text
+AWG_OBFS_PROFILE=dns
+AWG_OBFS_PROFILE=quic-lite
+AWG_MTU=1280
+```
+
+Нужно развить это до полноценной системы профилей:
+
+```text
+AWG_OBFS_PROFILE=dns
+AWG_OBFS_PROFILE=quic-lite
+AWG_OBFS_PROFILE=video-call
+AWG_OBFS_PROFILE=mobile-low-mtu
+AWG_OBFS_PROFILE=random-balanced
+AWG_OBFS_PROFILE=custom
+```
+
+Для `custom` должны поддерживаться все поля:
+
+```text
+AWG_JC
+AWG_JMIN
+AWG_JMAX
+AWG_S1
+AWG_S2
+AWG_S3
+AWG_S4
+AWG_H1
+AWG_H2
+AWG_H3
+AWG_H4
+AWG_I1
+AWG_I2
+AWG_I3
+AWG_I4
+AWG_I5
+AWG_MTU
+AWG_DNS
+AWG_ALLOWED_IPS
+AWG_KEEPALIVE
+AWG_ENDPOINT_PORT
+```
+
+Требования к AWG tuning:
+
+```text
+не делать вид, что параметры "оптимальны", если они просто сгенерированы случайно
+логировать выбранный профиль и источник каждого значения: default/profile/user/random
+писать /opt/vpn-stack/awg-tuning-report.json
+писать комментарий в клиентский .conf с профилем, MTU и датой генерации
+добавить vpn-awg profile, vpn-awg show-config, vpn-awg explain
+добавить vpn-awg revoke <name>
+добавить vpn-awg list
+добавить vpn-awg rotate <name>
+```
+
+MTU надо улучшить:
+
+```text
+текущий default 1280 оставить безопасным fallback
+добавить AWG_MTU=auto
+при auto сделать PMTU probe через ping -M do -s ...
+проверять несколько targets: 1.1.1.1, 8.8.8.8, DOMAIN
+не запускать auto-MTU, если ICMP недоступен; fallback 1280
+писать результат probe в awg-tuning-report.json
+```
+
+tcpdump использовать только явно:
+
+```text
+не запускать tcpdump автоматически без явного согласия
+vpn-awg capture 30 сохраняет pcap
+vpn-awg analyze 20 делает pcap + summary размеров пакетов
+добавить vpn-awg analyze-live без сохранения pcap
+добавить redaction warning: pcap содержит метаданные и должен храниться приватно
+добавить авто-рекомендации: no packets / only inbound / only outbound / handshake seen
+```
+
+### 0.4 Decoy site roadmap
+
+Текущий decoy:
+
+```text
+встроенный статический HTML/CSS
+рандомный brand/tagline/focus/region/colors/build_id/status_note/docs_title
+страницы: /, /status, /docs, /privacy, /404.html, /robots.txt
+без JS, forms, cookies, analytics, external CDN
+```
+
+Нужно улучшить до профильного генератора:
+
+```text
+DECOY_PROFILE=monitoring
+DECOY_PROFILE=software
+DECOY_PROFILE=hosting
+DECOY_PROFILE=docs
+DECOY_PROFILE=status
+DECOY_PROFILE=consulting
+DECOY_PROFILE=random
+```
+
+Нужные переменные:
+
+```text
+DECOY_BRAND
+DECOY_PROFILE
+DECOY_SEED
+DECOY_REGION
+DECOY_LANG=en|ru
+DECOY_COLOR_MODE=auto|blue|green|slate|neutral
+DECOY_EXTRA_PAGES=0|1
+DECOY_ROBOTS_MODE=allow|quiet
+DECOY_CANONICAL_HOST
+```
+
+Требования к decoy:
+
+```text
+оставаться статичным
+не использовать внешние шрифты, CDN, аналитики, формы и login/admin
+не содержать слов vpn/proxy/tunnel/wireguard/trojan/hysteria/amnezia
+генерировать sitemap.xml опционально
+делать deterministic output при DECOY_SEED
+писать /opt/vpn-stack/decoy-manifest.json
+добавить команду vpn-decoy-regenerate
+добавить команду vpn-decoy-preview, которая показывает список файлов и sha256
+```
+
+Нужно добавить проверку decoy:
+
+```text
+curl -k https://DOMAIN/
+curl -k https://DOMAIN/status
+curl -k https://DOMAIN/404-does-not-exist
+проверить отсутствие external URLs в HTML/CSS
+проверить отсутствие forbidden words
+проверить, что Trojan path не светится в public HTML
+```
+
+### 0.5 Trojan/Hysteria/client lifecycle
+
+Нужно добавить полный lifecycle:
+
+```text
+vpn-trojan list
+vpn-trojan revoke <name>
+vpn-trojan rotate <name>
+vpn-trojan show <name>
+
+vpn-hysteria list
+vpn-hysteria revoke <name>
+vpn-hysteria rotate <name>
+vpn-hysteria show <name>
+
+vpn-awg list
+vpn-awg revoke <name>
+vpn-awg rotate <name>
+vpn-awg show <name>
+```
+
+Правила naming:
+
+```text
+имя клиента от пользователя: только [A-Za-z0-9._-]
+итоговый label: <PROTOCOL>-<SERVER_LOCATION>-<name>
+если пользователь уже ввел полный label, не дублировать prefix/location
+```
+
+### 0.6 Observability и диагностика
+
+Нужно улучшить мониторинг:
+
+```text
+systemd service health в Grafana
+node_exporter dashboard 1860 оставить
+добавить provisioned dashboard для VPN stack
+добавить textfile collector для:
+  - активные сервисы
+  - количество клиентов
+  - дата последнего успешного cert renewal
+  - swap status
+  - выбранный AWG profile и MTU
+```
+
+Логи:
+
+```text
+секреты не должны попадать в stdout/journal
+CF_Token, passwords, private keys не логировать
+ключи писать только в /root/vpn-keys с 0600
+install-report.json должен маскировать секреты
+```
+
+### 0.7 Тестирование и качество
+
+Нужно добавить локальный test harness:
+
+```text
+bash -n install-vpn-stack.sh
+shellcheck install-vpn-stack.sh
+тест извлеченных heredoc helper-скриптов через bash -n
+тест regex для EMAIL, DOMAIN, SERVER_LOCATION
+тест генерации label_name
+тест render decoy во временную директорию
+тест AWG profile generation в dry-run
+```
+
+Желательные режимы:
+
+```bash
+./install-vpn-stack.sh --dry-run
+./install-vpn-stack.sh --render-only /tmp/vpn-stack-render
+./install-vpn-stack.sh --validate-only
+```
+
+### 0.8 Приоритеты реализации
+
+Порядок улучшений:
+
+```text
+P0:
+  - убрать оставшиеся устаревшие VLESS/REALITY противоречия из AGENTS.md
+  - добавить --validate-only и preflight
+  - добавить install-report.json
+  - добавить AWG profile report
+
+P1:
+  - AWG custom profile со всеми параметрами
+  - AWG_MTU=auto через PMTU probe
+  - vpn-awg list/revoke/rotate/show
+  - decoy manifest + forbidden-word scanner
+
+P2:
+  - decoy profiles + DECOY_SEED
+  - vpn-decoy-regenerate / preview
+  - VPN stack Grafana dashboard
+
+P3:
+  - shellcheck/Bats CI
+  - test matrix Ubuntu 22.04/24.04/Debian 12
+  - structured JSON logs for install phases
+```
+
 ## 1. Назначение
 
 Необходимо разработать единый установочный скрипт `install-vpn-stack.sh`, который на чистом Ubuntu/Debian VPS автоматически разворачивает готовую VPN-инфраструктуру.
