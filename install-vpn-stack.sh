@@ -2484,6 +2484,18 @@ EOF
   sysctl --system >/dev/null || true
 }
 
+swap_report_label() {
+  if [[ "${SWAP_RESULT}" != "not checked" ]]; then
+    printf '%s' "${SWAP_RESULT}"
+  elif swapon --show --noheadings 2>/dev/null | awk '$1 == "/swapfile" {found=1} END {exit found ? 0 : 1}'; then
+    printf 'active /swapfile present'
+  elif swapon --show | awk 'NR>1 {found=1} END {exit found ? 0 : 1}'; then
+    printf 'active swap present'
+  else
+    printf 'none active'
+  fi
+}
+
 configure_firewall() {
   local awg_port="${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}"
   if [[ -f "${STACK_DIR}/awg-params.env" ]]; then
@@ -4095,9 +4107,10 @@ wait_for_expected_listeners() {
 }
 
 print_install_summary() {
-  local dashboard_status awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry
+  local dashboard_status awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_result
   load_installed_context
   awg_port="$(current_awg_port)"
+  swap_result="$(swap_report_label)"
   if [[ -s /var/lib/grafana/dashboards/node-exporter-full-1860.json ]]; then
     dashboard_status="provisioned from local JSON"
   else
@@ -4157,7 +4170,7 @@ Decoy:
   Manifest: ${DECOY_MANIFEST}
 
 Swap:
-  Install decision: ${SWAP_RESULT}
+  Status: ${swap_result}
 EOF
 
   if swapon --show | awk 'NR>1 {found=1} END {exit found ? 0 : 1}'; then
@@ -4202,9 +4215,10 @@ EOF
 }
 
 generate_install_report() {
-  local awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_active dashboard_status
+  local awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_active dashboard_status swap_result
   load_installed_context
   awg_port="$(current_awg_port)"
+  swap_result="$(swap_report_label)"
   awg_profile="$(grep -E '^AWG_OBFS_PROFILE=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')"
   awg_effective="$(grep -E '^AWG_EFFECTIVE_PROFILE=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')"
   awg_mtu="$(grep -E '^AWG_MTU=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')"
@@ -4273,7 +4287,7 @@ generate_install_report() {
   },
   "swap": {
     "active": ${swap_active},
-    "install_decision": $(json_escape "${SWAP_RESULT}")
+    "status": $(json_escape "${swap_result}")
   },
   "key_paths": {
     "trojan": $(json_escape "${KEY_DIR}/trojan"),
@@ -4419,6 +4433,7 @@ bootstrap_install() {
 main() {
   progress "Checking input variables and kernel readiness"
   require_root_and_env
+  install_resume_status_helper
   prompt_advanced_tuning
   check_dkms_kernel_ready
   progress "Installing APT repositories"
