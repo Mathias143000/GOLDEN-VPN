@@ -370,6 +370,7 @@ prompt_optional_var() {
 
 prompt_advanced_tuning() {
   [[ "${VPN_STACK_ASSUME_DEFAULTS:-0}" != "1" ]] || return 0
+  [[ "${VPN_STACK_RESUMED:-0}" != "1" ]] || return 0
   prompt_yes_no_default_no "Advanced tuning?" || return 0
 
   prompt_optional_var AWG_OBFS_PROFILE "AWG_OBFS_PROFILE" "${AWG_OBFS_PROFILE:-random-balanced}"
@@ -1841,7 +1842,7 @@ server {
         grpc_pass unix:${TROJAN_XHTTP_SOCKET};
     }
 
-    location ~ ^/s/([A-Za-z0-9]{32,64})/?$ {
+    location ~ "^/s/([A-Za-z0-9]{32,64})/?$" {
         root /var/www;
         access_log off;
         add_header X-Robots-Tag "noindex, nofollow" always;
@@ -1852,7 +1853,7 @@ server {
         try_files \$sub_entry =404;
     }
 
-    location ~ ^/s/([A-Za-z0-9]{32,64})/(sub\.txt|sub\.base64|awg\.conf)$ {
+    location ~ "^/s/([A-Za-z0-9]{32,64})/(sub\.txt|sub\.base64|awg\.conf)$" {
         root /var/www;
         access_log off;
         add_header X-Robots-Tag "noindex, nofollow" always;
@@ -1860,7 +1861,7 @@ server {
         try_files /subscriptions/\$1/\$2 =404;
     }
 
-    location ~ ^/s/([A-Za-z0-9]{32,64})/awg/?$ {
+    location ~ "^/s/([A-Za-z0-9]{32,64})/awg/?$" {
         root /var/www;
         access_log off;
         add_header X-Robots-Tag "noindex, nofollow" always;
