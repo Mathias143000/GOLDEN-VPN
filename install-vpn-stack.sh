@@ -68,6 +68,20 @@ BASE_PACKAGES=(
   grafana
 )
 
+BOOTSTRAP_PACKAGES=(
+  curl
+  wget
+  ca-certificates
+  openssh-server
+  ufw
+  gnupg
+  lsb-release
+  iproute2
+  iptables
+  psmisc
+  software-properties-common
+)
+
 log() {
   printf '[vpn-stack] %s\n' "$*"
 }
@@ -517,13 +531,14 @@ EOF
   cat >"${SSH_GUARD_UNIT}" <<EOF
 [Unit]
 Description=Keep SSH reachable during Golden VPN installer resume
-DefaultDependencies=no
-Before=network-online.target ${RESUME_INSTALL_SERVICE}
-After=local-fs.target
+Wants=network-online.target
+After=network-online.target
+Before=${RESUME_INSTALL_SERVICE}
 
 [Service]
 Type=oneshot
 ExecStart=${SSH_GUARD_SCRIPT}
+TimeoutStartSec=5min
 
 [Install]
 WantedBy=multi-user.target
@@ -756,15 +771,15 @@ EOF
   cat >"${RESUME_INSTALL_UNIT}" <<EOF
 [Unit]
 Description=Resume Golden VPN installer once after reboot
-After=network-online.target
-Wants=network-online.target
+After=network-online.target ${SSH_GUARD_SERVICE} ssh.service sshd.service ssh.socket
+Wants=network-online.target ${SSH_GUARD_SERVICE}
 ConditionPathExists=${RESUME_INSTALL_SCRIPT}
 ConditionPathExists=${RESUME_INSTALL_ENV}
 
 [Service]
 Type=oneshot
 EnvironmentFile=${RESUME_INSTALL_ENV}
-ExecStartPre=/bin/sleep 15
+ExecStartPre=/bin/sleep 30
 ExecStart=${RESUME_INSTALL_RUNNER}
 TimeoutStartSec=0
 RemainAfterExit=no
@@ -779,7 +794,7 @@ EOF
 Description=Start Golden VPN installer resume once after boot
 
 [Timer]
-OnBootSec=1min
+OnBootSec=2min
 AccuracySec=15s
 Persistent=false
 Unit=${RESUME_INSTALL_SERVICE}
@@ -790,8 +805,8 @@ EOF
   chmod 0644 "${RESUME_INSTALL_TIMER_UNIT}"
 
   systemctl daemon-reload
-  systemctl enable "${RESUME_INSTALL_SERVICE}" "${RESUME_INSTALL_TIMER}"
-  log "One-time resume service installed: ${RESUME_INSTALL_SERVICE}"
+  systemctl enable "${RESUME_INSTALL_TIMER}"
+  log "One-time resume service installed for timer start only: ${RESUME_INSTALL_SERVICE}"
   log "One-time resume timer installed: ${RESUME_INSTALL_TIMER}"
   log "SSH guard installed for the reboot: ${SSH_GUARD_SERVICE}"
   log "Resume env saved: ${RESUME_INSTALL_ENV}"
@@ -949,6 +964,12 @@ EOF
   chmod 0644 /etc/apt/sources.list.d/amneziawg.list
 
   apt_get update
+}
+
+install_bootstrap_packages() {
+  log "Installing bootstrap packages only."
+  apt_get update
+  apt_get install -y "${BOOTSTRAP_PACKAGES[@]}"
 }
 
 install_base_packages() {
@@ -4305,7 +4326,7 @@ final_checks() {
 }
 
 bootstrap_install() {
-  INSTALL_TOTAL_STEPS=7
+  INSTALL_TOTAL_STEPS=6
   INSTALL_STEP=0
 
   progress "Clearing stale one-time resume state"
@@ -4317,11 +4338,8 @@ bootstrap_install() {
   require_root_and_env
   prompt_advanced_tuning
 
-  progress "Installing APT repositories"
-  install_apt_repositories
-
   progress "Installing bootstrap packages"
-  install_base_packages
+  install_bootstrap_packages
 
   progress "Preparing SSH and firewall access"
   install_resume_status_helper

@@ -23,7 +23,7 @@ Before running the installer:
 
 Default install is a guided two-stage flow:
 
-1. `bootstrap` asks for required values, saves `/etc/golden-vpn-installer/install.env`, installs base dependencies, keeps SSH reachable, schedules one one-shot stage2 service, and reboots once.
+1. `bootstrap` asks for required values, saves `/etc/golden-vpn-installer/install.env`, installs only minimal bootstrap dependencies, keeps SSH reachable, schedules one one-shot stage2 timer, and reboots once.
 2. `install` runs once after reboot, reads the saved env, installs the full stack, writes reports, and removes the one-shot units after the first attempt.
 
 Run on a fresh VPS as `root`:
@@ -38,7 +38,7 @@ chmod +x install-vpn-stack.sh
 ./install-vpn-stack.sh
 ```
 
-The commands above install only the bootstrap download prerequisites. The installer itself installs the full package set, including `wget`, `gnupg`, `jq`, `nginx`, `grafana`, `dkms`, monitoring packages, and VPN dependencies.
+The commands above install only the bootstrap download prerequisites. Bootstrap then installs only the minimal boot-safe set: `openssh-server`, `curl`, `wget`, `ca-certificates`, `gnupg`, `iproute2`, `ufw`, and small support tools. Stage2 installs the full package set, including `jq`, `nginx`, `grafana`, `dkms`, monitoring packages, and VPN dependencies, after the reboot and SSH guard.
 
 The installer asks for `DOMAIN`, `EMAIL`, `SERVER_LOCATION`, and `CF_Token`. It also offers an optional `Advanced tuning? [y/N]` block for `AWG_OBFS_PROFILE`, `AWG_MTU`, `DECOY_PROFILE`, and `DECOY_SEED`.
 
@@ -351,11 +351,25 @@ AmneziaWG parameters are randomized from the selected profile. Supported profile
 If SSH is blocked after a reboot, open the VPS provider web console or rescue console and restore SSH in UFW:
 
 ```bash
+systemctl unmask ssh sshd ssh.service sshd.service ssh.socket || true
+systemctl enable --now ssh.service || systemctl enable --now sshd.service || systemctl enable --now ssh.socket
+systemctl restart ssh.service || systemctl restart sshd.service || true
 ufw allow 22/tcp
+ufw allow OpenSSH
 ufw reload || ufw --force enable
 ufw status verbose
 systemctl status ssh sshd --no-pager
 ss -lntp | grep ':22'
+```
+
+Then inspect the one-shot boot helpers:
+
+```bash
+journalctl -u vpn-stack-ssh-guard.service -b --no-pager
+journalctl -u vpn-stack-resume-install.service -b --no-pager
+systemctl list-timers vpn-stack-resume-install.timer --no-pager
+cat /var/log/vpn-stack-ssh-guard.log
+cat /var/log/vpn-stack-resume-install.log
 ```
 
 If you see `Could not get lock /var/lib/dpkg/lock-frontend`, another install or resume process is still using `apt`. Do not remove the lock file. Watch the running installer instead:
