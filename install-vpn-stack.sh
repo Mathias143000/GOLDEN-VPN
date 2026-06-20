@@ -2525,6 +2525,13 @@ SERVICE="xray-trojan-xhttp-tls.service"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 uri_encode() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
+usage() {
+  cat <<'USAGE'
+Usage:
+  vpn-trojan <name>    Create a Trojan XHTTP TLS client
+  vpn-trojan help      Show this help
+USAGE
+}
 print_qr() {
   local payload="$1"
   if command -v qrencode >/dev/null 2>&1; then
@@ -2557,6 +2564,12 @@ label_name() {
 }
 
 [[ "${EUID}" -eq 0 ]] || die "Run as root."
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
 [[ $# -eq 1 ]] || die "Usage: vpn-trojan <name>"
 name="$1"
 [[ "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || die "Use only letters, digits, dot, underscore, dash."
@@ -2619,6 +2632,13 @@ SERVICE="hysteria2.service"
 die() { echo "ERROR: $*" >&2; exit 1; }
 uri_encode() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
 rand_hex() { openssl rand -hex "$1"; }
+usage() {
+  cat <<'USAGE'
+Usage:
+  vpn-hysteria <name>    Create a Hysteria2 client
+  vpn-hysteria help      Show this help
+USAGE
+}
 print_qr() {
   local payload="$1"
   if command -v qrencode >/dev/null 2>&1; then
@@ -2671,6 +2691,12 @@ render_config() {
 }
 
 [[ "${EUID}" -eq 0 ]] || die "Run as root."
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
 [[ $# -eq 1 ]] || die "Usage: vpn-hysteria <name>"
 name="$1"
 [[ "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || die "Use only letters, digits, dot, underscore, dash."
@@ -3448,7 +3474,7 @@ create_subscription() {
   jq -n \
     --arg version "1" \
     --arg name "${name}" \
-    --arg label "${label}" \
+    --arg sub_label "${label}" \
     --arg token "${token}" \
     --arg created_at "${created_at}" \
     --arg portal "${base}" \
@@ -3462,7 +3488,7 @@ create_subscription() {
     '{
       version: ($version|tonumber),
       name: $name,
-      label: $label,
+      "label": $sub_label,
       token: $token,
       status: "active",
       created_at: $created_at,
