@@ -19,78 +19,50 @@ Before running the installer:
 - run as `root`
 - use a Cloudflare token with DNS edit access for the zone
 
-## Safe Two-Stage Install
+## Two-Stage Bootstrap Install
 
-Use this flow on fresh VPS hosts. It keeps SSH explicit, clears stale one-time resume units, performs one manual reboot, then installs from Git without installer-managed reboot/resume.
+Default install is a guided two-stage flow:
 
-Stage 1, run from the VPS console or SSH, then let it reboot:
+1. `bootstrap` asks for required values, saves `/etc/golden-vpn-installer/install.env`, installs base dependencies, keeps SSH reachable, schedules one one-shot stage2 service, and reboots once.
+2. `install` runs once after reboot, reads the saved env, installs the full stack, writes reports, and removes the one-shot units after the first attempt.
+
+Run on a fresh VPS as `root`:
 
 ```bash
-cat >/root/golden-vpn-preflight.sh <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-systemctl disable --now vpn-stack-resume-install.timer vpn-stack-resume-install.service vpn-stack-ssh-guard.service 2>/dev/null || true
-rm -f /etc/systemd/system/vpn-stack-resume-install.service /etc/systemd/system/vpn-stack-resume-install.timer /etc/systemd/system/vpn-stack-ssh-guard.service
-rm -f /usr/local/sbin/vpn-stack-resume-install.sh /usr/local/sbin/vpn-stack-ssh-guard.sh
-rm -f /root/vpn-stack-resume/install-vpn-stack.sh /etc/golden-vpn-installer/install.env
-rmdir /root/vpn-stack-resume /etc/golden-vpn-installer 2>/dev/null || true
-systemctl daemon-reload || true
-
-while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1; do
-  echo "Waiting for apt/dpkg lock..."
-  sleep 5
-done
-
-dpkg --configure -a
-apt-get -f install -y
 apt-get update
-apt-get install -y openssh-server curl ca-certificates git
-ssh-keygen -A
+apt-get install -y curl ca-certificates
 
-systemctl unmask ssh sshd ssh.service sshd.service ssh.socket || true
-systemctl enable --now ssh.service || systemctl enable --now sshd.service || systemctl enable --now ssh.socket
-systemctl restart ssh.service || systemctl restart sshd.service || true
+curl -fsSL https://raw.githubusercontent.com/Mathias143000/GOLDEN-VPN/main/install-vpn-stack.sh -o install-vpn-stack.sh
+chmod +x install-vpn-stack.sh
 
-ufw allow 22/tcp || true
-ufw allow OpenSSH || true
-ufw reload || ufw --force enable || true
-ss -lntp | grep -E ':(22)\b'
-
-reboot
-EOF
-
-bash /root/golden-vpn-preflight.sh
+./install-vpn-stack.sh
 ```
 
-Stage 2, after the VPS comes back and SSH works:
+The commands above install only the bootstrap download prerequisites. The installer itself installs the full package set, including `wget`, `gnupg`, `jq`, `nginx`, `grafana`, `dkms`, monitoring packages, and VPN dependencies.
+
+The installer asks for `DOMAIN`, `EMAIL`, `SERVER_LOCATION`, and `CF_Token`. It also offers an optional `Advanced tuning? [y/N]` block for `AWG_OBFS_PROFILE`, `AWG_MTU`, `DECOY_PROFILE`, and `DECOY_SEED`.
+
+After the reboot, reconnect by SSH and watch stage2:
 
 ```bash
-apt-get update
-apt-get install -y git curl ca-certificates
+vpn-install-status watch
+```
 
-if [ -d /root/GOLDEN-VPN/.git ]; then
-  git -C /root/GOLDEN-VPN pull --ff-only
-else
-  git clone https://github.com/Mathias143000/GOLDEN-VPN.git /root/GOLDEN-VPN
-fi
-cd /root/GOLDEN-VPN
+If stage2 fails, it disables the one-shot units so the VPS does not retry on every reboot. The saved env, installer copy, and log remain for manual retry:
 
-export VPN_STACK_NO_AUTO_REBOOT=1
-export VPN_STACK_IGNORE_SAVED_ENV=1
-
-if [ -n "${DOMAIN:-}" ] && [ -n "${EMAIL:-}" ] && [ -n "${SERVER_LOCATION:-}" ] && [ -n "${CF_Token:-}" ]; then
-  ./install-vpn-stack.sh preflight
-fi
-
-./install-vpn-stack.sh install
+```bash
+vpn-install-status status
+vpn-install-status log 200
+bash /root/vpn-stack-resume/install-vpn-stack.sh install
 ```
 
 ## Install From GitHub
 
+Same default two-stage bootstrap flow, shown without explanations:
+
 ```bash
 apt-get update
-apt-get install -y curl
+apt-get install -y curl ca-certificates
 
 curl -fsSL https://raw.githubusercontent.com/Mathias143000/GOLDEN-VPN/main/install-vpn-stack.sh -o install-vpn-stack.sh
 chmod +x install-vpn-stack.sh
@@ -101,6 +73,7 @@ chmod +x install-vpn-stack.sh
 Installer modes:
 
 ```bash
+./install-vpn-stack.sh bootstrap
 ./install-vpn-stack.sh preflight
 ./install-vpn-stack.sh install
 ./install-vpn-stack.sh validate
@@ -131,10 +104,6 @@ export SERVER_LOCATION="EE"
 export CF_Token="CLOUDFLARE_DNS_TOKEN"
 # Optional fallback:
 export CF_Zone_ID="CLOUDFLARE_ZONE_ID"
-# Recommended for manual two-stage installs:
-export VPN_STACK_NO_AUTO_REBOOT=1
-export VPN_STACK_IGNORE_SAVED_ENV=1
-
 ./install-vpn-stack.sh
 ```
 
@@ -154,36 +123,81 @@ export DECOY_BRAND="Optional Brand"
 export DECOY_REGION="EU-West"
 ```
 
-If a kernel reboot is required for AmneziaWG DKMS, the installer stops and asks you to reboot manually. Automatic reboot/resume is disabled by default to avoid losing SSH access. The old one-time resume prompt is available only when explicitly requested:
+If you want to skip bootstrap and run the full install immediately, use explicit stage2 mode:
 
 ```bash
-export VPN_STACK_ALLOW_REBOOT_PROMPT=1
+export VPN_STACK_NO_AUTO_REBOOT=1
+export VPN_STACK_IGNORE_SAVED_ENV=1
+./install-vpn-stack.sh install
 ```
 
-The older systemd resume flow saves values in `/etc/golden-vpn-installer/install.env` and runs `/root/vpn-stack-resume/install-vpn-stack.sh` once after boot. Prefer the Safe Two-Stage Install above for clean servers.
+Stage2 status:
+
+```bash
+vpn-install-status
+vpn-install-status watch
+journalctl -u vpn-stack-resume-install.service -b --no-pager
+systemctl list-timers vpn-stack-resume-install.timer --no-pager
+cat /var/log/vpn-stack-resume-install.log
+cat /var/log/vpn-stack-ssh-guard.log
+```
+
+While the resume service is active, do not run `install-vpn-stack.sh` manually. The installer holds a lock at `/run/golden-vpn-install.lock`; a second run exits with a status message instead of competing for `apt`/`dpkg`.
+
+The installer keeps SSH open before enabling UFW: it allows `22/tcp`, the current SSH session port from `SSH_CONNECTION`, and ports reported by `sshd`.
+
+Clean stale one-shot state before a reinstall:
+
+```bash
+systemctl disable --now vpn-stack-resume-install.timer vpn-stack-resume-install.service vpn-stack-ssh-guard.service 2>/dev/null || true
+rm -f /etc/systemd/system/vpn-stack-resume-install.service /etc/systemd/system/vpn-stack-resume-install.timer /etc/systemd/system/vpn-stack-ssh-guard.service
+rm -f /usr/local/sbin/vpn-stack-resume-install.sh /usr/local/sbin/vpn-stack-ssh-guard.sh
+rm -f /root/vpn-stack-resume/install-vpn-stack.sh /etc/golden-vpn-installer/install.env
+systemctl daemon-reload || true
+```
+
+Useful diagnostics:
+
+```bash
+journalctl -u vpn-stack-resume-install.service -b --no-pager
+systemctl status vpn-stack-resume-install.service --no-pager -l
+journalctl -u vpn-stack-ssh-guard.service -b --no-pager
+```
+
+Manual fallback after reboot:
+
+```bash
+apt-get update
+apt-get install -y git curl ca-certificates
+
+if [ -d /root/GOLDEN-VPN/.git ]; then
+  git -C /root/GOLDEN-VPN pull --ff-only
+else
+  git clone https://github.com/Mathias143000/GOLDEN-VPN.git /root/GOLDEN-VPN
+fi
+cd /root/GOLDEN-VPN
+
+export VPN_STACK_NO_AUTO_REBOOT=1
+export VPN_STACK_IGNORE_SAVED_ENV=1
+./install-vpn-stack.sh install
+```
 
 Resume logs:
 
 ```bash
 vpn-install-status
-vpn-install-status follow
+vpn-install-status watch
 journalctl -u vpn-stack-resume-install.service -b --no-pager
 systemctl list-timers vpn-stack-resume-install.timer --no-pager
 cat /var/log/vpn-stack-ssh-guard.log
 cat /var/log/vpn-stack-resume-install.log
 ```
 
-While the resume service is active, do not run `install-vpn-stack.sh` manually. The installer holds a lock at `/run/golden-vpn-install.lock`; a second run exits with a status message instead of competing for `apt`/`dpkg`.
-
-If the resume service did not start, running `./install-vpn-stack.sh` manually after reboot loads `/etc/golden-vpn-installer/install.env` automatically and continues with the saved `DOMAIN`, `EMAIL`, and Cloudflare token.
-
-The installer keeps SSH open before enabling UFW: it allows `22/tcp`, the current SSH session port from `SSH_CONNECTION`, and ports reported by `sshd`.
-
 ## Install With Git
 
 ```bash
 apt-get update
-apt-get install -y git
+apt-get install -y git curl ca-certificates
 
 git clone https://github.com/Mathias143000/GOLDEN-VPN.git
 cd GOLDEN-VPN
@@ -201,6 +215,41 @@ vpn-trojan phone1
 vpn-hysteria phone1
 vpn-awg phone1
 ```
+
+Create one Hiddify-style static subscription bundle:
+
+```bash
+vpn-sub create phone1
+vpn-sub show phone1
+```
+
+The subscription helper creates linked Trojan, Hysteria2, and AmneziaWG credentials. It prints a terminal QR code and a private import URL:
+
+```text
+https://DOMAIN/s/<token>
+```
+
+Subscription URL shape:
+
+```text
+Browser portal:  https://DOMAIN/s/<token>
+Client import:   https://DOMAIN/s/<token>
+Plain payload:   https://DOMAIN/s/<token>/sub.txt
+Base64 payload:  https://DOMAIN/s/<token>/sub.base64
+AWG download:    https://DOMAIN/s/<token>/awg.conf
+AWG preview:     https://DOMAIN/s/<token>/awg
+```
+
+Lifecycle:
+
+```bash
+vpn-sub list
+vpn-sub show phone1
+vpn-sub revoke phone1
+vpn-sub rotate phone1
+```
+
+Private metadata is stored in `/opt/vpn-stack/subscriptions/<token>/meta.json`; nginx-served files are stored in `/var/www/subscriptions/<token>/`. Install reports mention these paths but never include tokens or client secrets.
 
 Initial client files:
 
@@ -312,7 +361,7 @@ ss -lntp | grep ':22'
 If you see `Could not get lock /var/lib/dpkg/lock-frontend`, another install or resume process is still using `apt`. Do not remove the lock file. Watch the running installer instead:
 
 ```bash
-vpn-install-status follow
+vpn-install-status watch
 # or
 journalctl -fu vpn-stack-resume-install.service
 ```
@@ -326,7 +375,7 @@ export VPN_STACK_DISABLE_LE_FALLBACK=1
 ./install-vpn-stack.sh
 ```
 
-If AmneziaWG DKMS fails and the log says the running kernel is older than the latest installed kernel, use the built-in one-time reboot/resume prompt or reboot first:
+If AmneziaWG DKMS fails and the log says the running kernel is older than the latest installed kernel, reboot first:
 
 ```bash
 reboot
@@ -337,7 +386,7 @@ After the VPS comes back:
 ```bash
 apt-get -f install -y
 dpkg --configure -a
-./install-vpn-stack.sh
+./install-vpn-stack.sh install
 ```
 
 If DKMS still fails, check:

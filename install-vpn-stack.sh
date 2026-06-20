@@ -10,6 +10,8 @@ XRAY_DIR="${STACK_DIR}/xray"
 HYSTERIA_DIR="${STACK_DIR}/hysteria"
 LOG_DIR="/var/log/vpn-stack"
 CERT_DIR="/etc/letsencrypt/live/${DOMAIN:-}"
+SUBSCRIPTION_DIR="${STACK_DIR}/subscriptions"
+SUBSCRIPTION_WEB_DIR="/var/www/subscriptions"
 TROJAN_XHTTP_SOCKET="/dev/shm/xray-trojan-xhttp.sock"
 RESUME_INSTALL_DIR="/root/vpn-stack-resume"
 RESUME_INSTALL_SCRIPT="${RESUME_INSTALL_DIR}/install-vpn-stack.sh"
@@ -86,7 +88,7 @@ apt_get() {
 progress() {
   local message="$1"
   local width=24
-  local filled empty percent bar
+  local filled empty percent bar color reset tty_lines
 
   INSTALL_STEP=$((INSTALL_STEP + 1))
   if [[ "${INSTALL_STEP}" -gt "${INSTALL_TOTAL_STEPS}" ]]; then
@@ -98,6 +100,20 @@ progress() {
   empty=$((width - filled))
   bar="$(printf '%*s' "${filled}" '' | tr ' ' '#')$(printf '%*s' "${empty}" '' | tr ' ' '-')"
   log "[${bar}] ${percent}% (${INSTALL_STEP}/${INSTALL_TOTAL_STEPS}) ${message}"
+
+  if [[ -t 1 && "${TERM:-}" != "dumb" ]]; then
+    if ((percent < 34)); then
+      color=$'\033[31m'
+    elif ((percent < 67)); then
+      color=$'\033[33m'
+    else
+      color=$'\033[32m'
+    fi
+    reset=$'\033[0m'
+    tty_lines="$(tput lines 2>/dev/null || printf '999')"
+    printf '\0337\033[%s;1H\033[2K%s[%s]%s %s%% (%s/%s) %s\0338' \
+      "${tty_lines}" "${color}" "${bar}" "${reset}" "${percent}" "${INSTALL_STEP}" "${INSTALL_TOTAL_STEPS}" "${message}"
+  fi
 
   if mkdir -p "$(dirname "${INSTALL_PROGRESS_FILE}")" 2>/dev/null; then
     {
@@ -237,6 +253,56 @@ prompt_yes_no() {
         ;;
     esac
   done
+}
+
+prompt_yes_no_default_no() {
+  local prompt="$1"
+  local answer
+
+  have_tty || return 1
+  while true; do
+    printf '%s [y/N]: ' "${prompt}" >/dev/tty
+    IFS= read -r answer </dev/tty || return 1
+    answer="$(trim_value "${answer}")"
+    case "${answer}" in
+      ""|n|N|no|NO|No)
+        return 1
+        ;;
+      y|Y|yes|YES|Yes)
+        return 0
+        ;;
+      *)
+        printf 'Please answer y or n.\n' >/dev/tty
+        ;;
+    esac
+  done
+}
+
+prompt_optional_var() {
+  local var="$1"
+  local label="$2"
+  local default_value="$3"
+  local value
+
+  [[ -z "${!var:-}" ]] || return 0
+  have_tty || return 0
+
+  printf '%s [%s]: ' "${label}" "${default_value}" >/dev/tty
+  IFS= read -r value </dev/tty || return 0
+  value="$(trim_value "${value}")"
+  [[ -n "${value}" ]] || value="${default_value}"
+  printf -v "${var}" '%s' "${value}"
+  export "${var}"
+}
+
+prompt_advanced_tuning() {
+  [[ "${VPN_STACK_ASSUME_DEFAULTS:-0}" != "1" ]] || return 0
+  prompt_yes_no_default_no "Advanced tuning?" || return 0
+
+  prompt_optional_var AWG_OBFS_PROFILE "AWG_OBFS_PROFILE" "${AWG_OBFS_PROFILE:-random-balanced}"
+  prompt_optional_var AWG_MTU "AWG_MTU" "${AWG_MTU:-auto}"
+  prompt_optional_var DECOY_PROFILE "DECOY_PROFILE" "${DECOY_PROFILE:-random}"
+  prompt_optional_var DECOY_SEED "DECOY_SEED" "${DECOY_SEED:-}"
 }
 
 require_root_and_env() {
@@ -469,55 +535,120 @@ EOF
 }
 
 install_resume_status_helper() {
-  cat >"${INSTALL_STATUS_HELPER}" <<EOF
+  cat >"${INSTALL_STATUS_HELPER}" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-service="${RESUME_INSTALL_SERVICE}"
-timer="${RESUME_INSTALL_TIMER}"
-log_file="${RESUME_INSTALL_LOG}"
-progress_file="${INSTALL_PROGRESS_FILE}"
-lock_file="${INSTALL_LOCK}"
+service="vpn-stack-resume-install.service"
+timer="vpn-stack-resume-install.timer"
+log_file="/var/log/vpn-stack-resume-install.log"
+progress_file="/var/log/vpn-stack/install-progress.env"
+lock_file="/run/golden-vpn-install.lock"
+
+load_progress() {
+  STEP="?"
+  TOTAL="?"
+  PERCENT="?"
+  MESSAGE="waiting for installer"
+  UPDATED_AT="unknown"
+  if [[ -r "${progress_file}" ]]; then
+    # shellcheck disable=SC1090
+    source "${progress_file}" || true
+  fi
+}
+
+render_bar() {
+  local width=28 filled empty bar color reset
+  load_progress
+  if [[ "${PERCENT}" =~ ^[0-9]+$ ]]; then
+    filled=$((PERCENT * width / 100))
+  else
+    filled=0
+  fi
+  ((filled > width)) && filled="${width}"
+  empty=$((width - filled))
+  bar="$(printf '%*s' "${filled}" '' | tr ' ' '#')$(printf '%*s' "${empty}" '' | tr ' ' '-')"
+  if [[ -t 1 && "${TERM:-}" != "dumb" ]]; then
+    if [[ "${PERCENT}" =~ ^[0-9]+$ ]] && ((PERCENT >= 67)); then
+      color=$'\033[32m'
+    elif [[ "${PERCENT}" =~ ^[0-9]+$ ]] && ((PERCENT >= 34)); then
+      color=$'\033[33m'
+    else
+      color=$'\033[31m'
+    fi
+    reset=$'\033[0m'
+    printf '%s[%s]%s %s%% (%s/%s) %s\n' "${color}" "${bar}" "${reset}" "${PERCENT}" "${STEP}" "${TOTAL}" "${MESSAGE}"
+  else
+    printf '[%s] %s%% (%s/%s) %s\n' "${bar}" "${PERCENT}" "${STEP}" "${TOTAL}" "${MESSAGE}"
+  fi
+}
 
 show_status() {
   echo "Golden VPN installer status"
   echo
-  if [[ -r "\${progress_file}" ]]; then
-    # shellcheck disable=SC1090
-    source "\${progress_file}" || true
-    printf 'Progress: %s/%s %s%% - %s\n' "\${STEP:-?}" "\${TOTAL:-?}" "\${PERCENT:-?}" "\${MESSAGE:-unknown}"
-    printf 'Updated: %s\n' "\${UPDATED_AT:-unknown}"
-    echo
-  fi
-  systemctl status "\${service}" --no-pager -l || true
+  render_bar
+  printf 'Updated: %s\n\n' "${UPDATED_AT:-unknown}"
+  systemctl status "${service}" --no-pager -l || true
   echo
-  systemctl list-timers "\${timer}" --no-pager || true
+  systemctl list-timers "${timer}" --no-pager || true
   echo
-  if command -v fuser >/dev/null 2>&1 && fuser "\${lock_file}" >/dev/null 2>&1; then
+  if command -v fuser >/dev/null 2>&1 && fuser "${lock_file}" >/dev/null 2>&1; then
     echo "Installer lock is held: another install/resume run is active."
   fi
   echo
-  if [[ -r "\${log_file}" ]]; then
+  if [[ -r "${log_file}" ]]; then
     echo "Last log lines:"
-    tail -n 80 "\${log_file}" || true
+    tail -n 80 "${log_file}" || true
   else
-    echo "No log file yet: \${log_file}"
+    echo "No log file yet: ${log_file}"
   fi
 }
 
-case "\${1:-status}" in
+watch_status() {
+  local lines="${1:-22}"
+  [[ "${lines}" =~ ^[0-9]+$ ]] || lines=22
+  if [[ ! -t 1 || "${TERM:-}" == "dumb" ]]; then
+    show_status
+    [[ -r "${log_file}" ]] && tail -f "${log_file}"
+    exit 0
+  fi
+
+  tput civis 2>/dev/null || true
+  trap 'tput cnorm 2>/dev/null || true; printf "\n"' EXIT INT TERM
+  while true; do
+    clear
+    echo "Golden VPN installer watch"
+    echo
+    render_bar
+    printf 'Updated: %s\n' "${UPDATED_AT:-unknown}"
+    printf 'Service: '
+    systemctl is-active "${service}" 2>/dev/null || true
+    printf 'Log: %s\n\n' "${log_file}"
+    if [[ -r "${log_file}" ]]; then
+      tail -n "${lines}" "${log_file}" || true
+    else
+      echo "Waiting for log file..."
+    fi
+    sleep 1
+  done
+}
+
+case "${1:-status}" in
+  watch|-w)
+    watch_status "${2:-22}"
+    ;;
   follow|-f)
-    echo "Following \${service}. Press Ctrl+C to stop watching."
-    journalctl -fu "\${service}"
+    echo "Following ${service}. Press Ctrl+C to stop watching."
+    journalctl -fu "${service}"
     ;;
   log)
-    tail -n "\${2:-200}" "\${log_file}" || true
+    tail -n "${2:-200}" "${log_file}" || true
     ;;
   status|"")
     show_status
     ;;
   *)
-    echo "Usage: vpn-install-status [status|follow|log [lines]]" >&2
+    echo "Usage: vpn-install-status [status|watch [lines]|follow|log [lines]]" >&2
     exit 2
     ;;
 esac
@@ -527,12 +658,12 @@ EOF
 
 cleanup_resume_install_state() {
   local had_state=0
-  for path in "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_TIMER_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}" "${INSTALL_STATUS_HELPER}" "${SSH_GUARD_UNIT}" "${SSH_GUARD_SCRIPT}"; do
+  for path in "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_TIMER_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}" "${SSH_GUARD_UNIT}" "${SSH_GUARD_SCRIPT}"; do
     [[ -e "${path}" ]] && had_state=1
   done
 
   systemctl disable "${RESUME_INSTALL_SERVICE}" "${RESUME_INSTALL_TIMER}" "${SSH_GUARD_SERVICE}" >/dev/null 2>&1 || true
-  rm -f "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_TIMER_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}" "${INSTALL_STATUS_HELPER}" "${SSH_GUARD_UNIT}" "${SSH_GUARD_SCRIPT}"
+  rm -f "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_TIMER_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}" "${SSH_GUARD_UNIT}" "${SSH_GUARD_SCRIPT}"
   rmdir "${RESUME_INSTALL_DIR}" 2>/dev/null || true
   rmdir "${RESUME_INSTALL_ENV_DIR}" 2>/dev/null || true
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -578,7 +709,7 @@ chmod 0600 "\${log_file}" || true
 exec > >(tee -a "\${log_file}") 2>&1
 
 printf '%s resume start\n' "\$(date -Is)"
-printf 'Use "vpn-install-status follow" to watch this installation.\n'
+printf 'Use "vpn-install-status watch" to watch this installation.\n'
 printf 'Do not start install-vpn-stack.sh manually while this service is active.\n'
 
 if [[ ! -r "\${env_file}" || ! -x "\${installer}" ]]; then
@@ -596,19 +727,25 @@ export DEBIAN_FRONTEND=noninteractive
 printf '%s resume env loaded from %s\n' "\$(date -Is)" "\${env_file}"
 
 set +e
-bash "\${installer}"
+bash "\${installer}" install
 status="\$?"
 set -e
 
 if [[ "\${status}" -eq 0 ]]; then
   printf '%s resume install succeeded; removing one-time unit and saved env\n' "\$(date -Is)"
   systemctl disable "\${service}" "\${timer}" "\${ssh_guard_service}" >/dev/null 2>&1 || true
-  rm -f "\${unit}" "\${timer_unit}" "\${env_file}" "\${installer}" "\${runner}" "\${status_helper}" "\${ssh_guard_unit}" "\${ssh_guard_script}"
+  rm -f "\${unit}" "\${timer_unit}" "\${env_file}" "\${installer}" "\${runner}" "\${ssh_guard_unit}" "\${ssh_guard_script}"
   rmdir "\${resume_dir}" 2>/dev/null || true
   rmdir "\${env_dir}" 2>/dev/null || true
   systemctl daemon-reload >/dev/null 2>&1 || true
 else
-  printf '%s resume install failed; keeping unit/env for next boot or manual retry\n' "\$(date -Is)"
+  printf '%s resume install failed; disabling one-time unit and keeping env/log for manual retry\n' "\$(date -Is)"
+  systemctl disable "\${service}" "\${timer}" "\${ssh_guard_service}" >/dev/null 2>&1 || true
+  rm -f "\${unit}" "\${timer_unit}" "\${runner}" "\${ssh_guard_unit}" "\${ssh_guard_script}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  printf 'Saved env: %s\n' "\${env_file}"
+  printf 'Saved installer copy: %s\n' "\${installer}"
+  printf 'Manual retry: bash %s install\n' "\${installer}"
 fi
 
 printf '%s resume exit status=%s\n' "\$(date -Is)" "\${status}"
@@ -661,7 +798,7 @@ EOF
   log "Resume log after reboot: ${RESUME_INSTALL_LOG}"
   log "Resume journal after reboot: journalctl -u ${RESUME_INSTALL_SERVICE} -b --no-pager"
   log "Resume timer after reboot: systemctl list-timers ${RESUME_INSTALL_TIMER} --no-pager"
-  log "Live resume output after reboot: vpn-install-status follow"
+  log "Live resume output after reboot: vpn-install-status watch"
 }
 
 auto_reboot_resume_enabled() {
@@ -959,16 +1096,19 @@ uri_encode() {
 
 json_escape() {
   local value="$1"
-  if command -v jq >/dev/null 2>&1; then
-    jq -Rn --arg value "${value}" '$value'
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${value}"
-  else
-    value="${value//\\/\\\\}"
-    value="${value//\"/\\\"}"
-    value="${value//$'\n'/\\n}"
-    printf '"%s"\n' "${value}"
+  local escaped
+  if command -v jq >/dev/null 2>&1 && escaped="$(jq -Rn --arg value "${value}" '$value' 2>/dev/null)"; then
+    printf '%s\n' "${escaped}"
+    return 0
   fi
+  if command -v python3 >/dev/null 2>&1 && escaped="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${value}" 2>/dev/null)"; then
+    printf '%s\n' "${escaped}"
+    return 0
+  fi
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  printf '"%s"\n' "${value}"
 }
 
 label_name() {
@@ -1307,7 +1447,8 @@ EOF
   scan_decoy_tree "${target_dir}"
 
   if [[ -n "${manifest_path}" ]]; then
-    install -d -m 0700 "$(dirname "${manifest_path}")"
+    mkdir -p "$(dirname "${manifest_path}")"
+    chmod 0700 "$(dirname "${manifest_path}")" 2>/dev/null || true
     cat >"${manifest_path}" <<EOF
 {
   "generated_at": $(json_escape "$(date -Is)"),
@@ -1436,7 +1577,7 @@ EOF
 
 configure_nginx() {
   log "Configuring nginx HTTPS decoy and Trojan XHTTP TLS path."
-  install -d -m 0755 /var/www/decoy/assets /etc/nginx/stream-conf.d /etc/nginx/sites-available /etc/nginx/sites-enabled
+  install -d -m 0755 /var/www/decoy/assets "${SUBSCRIPTION_WEB_DIR}" /etc/nginx/stream-conf.d /etc/nginx/sites-available /etc/nginx/sites-enabled
 
   local trojan_path brand tagline focus region primary accent bg surface build_id status_note docs_title
   trojan_path="$(<"${STACK_DIR}/trojan-xhttp-path.txt")"
@@ -1618,6 +1759,32 @@ server {
         grpc_set_header X-Real-IP \$remote_addr;
         grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         grpc_pass unix:${TROJAN_XHTTP_SOCKET};
+    }
+
+    location ~ ^/s/([A-Za-z0-9]{32,64})/?$ {
+        root /var/www;
+        access_log off;
+        add_header X-Robots-Tag "noindex, nofollow" always;
+        set \$sub_entry "/subscriptions/\$1/index.html";
+        if (\$http_user_agent ~* "(Hiddify|Clash|sing-box|v2ray|Neko|Streisand|Shadowrocket|FoXray|SFI|Nekoray)") {
+            set \$sub_entry "/subscriptions/\$1/sub.txt";
+        }
+        try_files \$sub_entry =404;
+    }
+
+    location ~ ^/s/([A-Za-z0-9]{32,64})/(sub\.txt|sub\.base64|awg\.conf)$ {
+        root /var/www;
+        access_log off;
+        add_header X-Robots-Tag "noindex, nofollow" always;
+        default_type text/plain;
+        try_files /subscriptions/\$1/\$2 =404;
+    }
+
+    location ~ ^/s/([A-Za-z0-9]{32,64})/awg/?$ {
+        root /var/www;
+        access_log off;
+        add_header X-Robots-Tag "noindex, nofollow" always;
+        try_files /subscriptions/\$1/awg.html =404;
     }
 
     location / {
@@ -2906,6 +3073,465 @@ EOF
   chmod 0755 /usr/local/bin/vpn-awg
 }
 
+install_helper_subscriptions() {
+  cat >/usr/local/bin/vpn-sub <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+STACK_DIR="/opt/vpn-stack"
+SUB_DIR="${STACK_DIR}/subscriptions"
+WEB_ROOT="/var/www/subscriptions"
+KEY_ROOT="/root/vpn-keys"
+XRAY_CONFIG="${STACK_DIR}/xray/config.json"
+XRAY_SERVICE="xray-trojan-xhttp-tls.service"
+HYSTERIA_CONFIG="${STACK_DIR}/hysteria/config.yaml"
+HYSTERIA_CLIENTS="${STACK_DIR}/hysteria-clients.json"
+HYSTERIA_SERVICE="hysteria2.service"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  vpn-sub create <name>   Create Trojan + Hysteria2 + AmneziaWG subscription bundle
+  vpn-sub list            List active subscriptions
+  vpn-sub show <name>     Show subscription URLs and QR
+  vpn-sub revoke <name>   Remove served files and disable protocol credentials
+  vpn-sub rotate <name>   Revoke and recreate with a new token and credentials
+USAGE
+}
+
+print_qr() {
+  local payload="$1"
+  if command -v qrencode >/dev/null 2>&1; then
+    printf '\nQR code:\n'
+    printf '%s' "${payload}" | qrencode -t ANSIUTF8 -l L -m 1 || true
+    printf '\n'
+  fi
+}
+
+domain_name() {
+  [[ -r "${STACK_DIR}/domain.txt" ]] || die "Missing ${STACK_DIR}/domain.txt"
+  cat "${STACK_DIR}/domain.txt"
+}
+
+server_location() {
+  local location="XX"
+  [[ -r "${STACK_DIR}/server-location.txt" ]] && location="$(<"${STACK_DIR}/server-location.txt")"
+  location="$(printf '%s' "${location}" | tr '[:lower:]' '[:upper:]')"
+  [[ "${location}" =~ ^[A-Z]{2}$ ]] || location="XX"
+  printf '%s' "${location}"
+}
+
+label_name() {
+  local prefix="$1"
+  local name="$2"
+  local location
+  location="$(server_location)"
+  if [[ "${name}" == "${prefix}-${location}-"* ]]; then
+    printf '%s' "${name}"
+  else
+    printf '%s-%s-%s' "${prefix}" "${location}" "${name}"
+  fi
+}
+
+validate_name() {
+  local name="$1"
+  [[ "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || die "Use only letters, digits, dot, underscore, dash."
+}
+
+html_escape() {
+  python3 -c 'import html, sys; print(html.escape(sys.argv[1], quote=True))' "$1"
+}
+
+b64_nowrap() {
+  if base64 --help 2>/dev/null | grep -q -- '-w'; then
+    base64 -w0
+  else
+    base64 | tr -d '\n'
+  fi
+}
+
+resolve_token() {
+  local key="$1"
+  local meta token
+  [[ "${key}" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  if [[ -f "${SUB_DIR}/${key}/meta.json" ]]; then
+    printf '%s\n' "${key}"
+    return 0
+  fi
+  for meta in "${SUB_DIR}"/*/meta.json; do
+    [[ -e "${meta}" ]] || continue
+    if jq -e --arg key "${key}" '.name == $key or .label == $key' "${meta}" >/dev/null; then
+      token="$(basename "$(dirname "${meta}")")"
+      printf '%s\n' "${token}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+subscription_exists() {
+  resolve_token "$1" >/dev/null 2>&1
+}
+
+publish_permissions() {
+  local pubdir="$1"
+  chmod 0755 "${WEB_ROOT}" 2>/dev/null || true
+  if getent group www-data >/dev/null 2>&1; then
+    chgrp -R www-data "${pubdir}"
+    chmod 0750 "${pubdir}"
+    find "${pubdir}" -type f -exec chmod 0640 {} +
+  else
+    chmod 0755 "${pubdir}"
+    find "${pubdir}" -type f -exec chmod 0644 {} +
+  fi
+}
+
+render_hysteria_config() {
+  local obfs
+  obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
+  {
+    printf 'listen: :8443\n'
+    printf 'tls:\n'
+    printf '  cert: /etc/letsencrypt/live/%s/fullchain.pem\n' "$(domain_name)"
+    printf '  key: /etc/letsencrypt/live/%s/privkey.pem\n' "$(domain_name)"
+    printf 'auth:\n'
+    printf '  type: userpass\n'
+    printf '  userpass:\n'
+    jq -r 'to_entries[] | "    \(.key): \(.value)"' "${HYSTERIA_CLIENTS}"
+    printf 'obfs:\n'
+    printf '  type: salamander\n'
+    printf '  salamander:\n'
+    printf '    password: %s\n' "${obfs}"
+  } >"${HYSTERIA_CONFIG}"
+  chmod 0600 "${HYSTERIA_CONFIG}"
+}
+
+write_portal_files() {
+  local name="$1" token="$2" trojan_link="$3" hysteria_link="$4" awg_file="$5"
+  local pubdir base domain label safe_name safe_label
+  domain="$(domain_name)"
+  label="$(label_name "SUB" "${name}")"
+  safe_name="$(html_escape "${name}")"
+  safe_label="$(html_escape "${label}")"
+  base="https://${domain}/s/${token}"
+  pubdir="${WEB_ROOT}/${token}"
+
+  install -d -m 0755 "${WEB_ROOT}"
+  install -d -m 0750 "${pubdir}"
+  {
+    printf '%s\n' "${trojan_link}"
+    printf '%s\n' "${hysteria_link}"
+  } >"${pubdir}/sub.txt"
+  b64_nowrap <"${pubdir}/sub.txt" >"${pubdir}/sub.base64"
+  cp "${awg_file}" "${pubdir}/awg.conf"
+
+  cat >"${pubdir}/index.html" <<HTML
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>${safe_label}</title>
+  <style>
+    :root { color-scheme: light; --bg:#f6f8fb; --text:#172033; --muted:#637083; --line:#d9e2ec; --surface:#fff; --primary:#0f766e; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; font-family:Arial,Helvetica,sans-serif; background:var(--bg); color:var(--text); }
+    main { width:min(780px, calc(100% - 32px)); margin:0 auto; padding:56px 0; }
+    h1 { margin:0 0 10px; font-size:32px; letter-spacing:0; }
+    p { color:var(--muted); line-height:1.6; }
+    .panel { border:1px solid var(--line); border-radius:8px; background:var(--surface); padding:22px; margin-top:18px; }
+    .grid { display:grid; gap:12px; grid-template-columns:repeat(2,minmax(0,1fr)); }
+    a { display:block; border:1px solid var(--line); border-radius:8px; padding:14px 16px; color:var(--text); text-decoration:none; background:#fff; }
+    a strong { display:block; color:var(--primary); margin-bottom:4px; }
+    code { display:block; overflow-wrap:anywhere; padding:12px; border-radius:8px; background:#eef3f7; color:#26364a; }
+    @media (max-width:640px) { .grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${safe_label}</h1>
+    <p>Private subscription bundle for ${safe_name}. Use the import URL in compatible clients, or download individual files below.</p>
+    <div class="panel">
+      <p>Import URL</p>
+      <code>${base}</code>
+    </div>
+    <div class="panel grid">
+      <a href="${base}/sub.txt"><strong>Client subscription</strong>Trojan TLS and Hysteria2 links</a>
+      <a href="${base}/sub.base64"><strong>Base64 subscription</strong>Encoded subscription payload</a>
+      <a href="${base}/awg.conf"><strong>AmneziaWG config</strong>Download configuration file</a>
+      <a href="${base}/awg"><strong>AmneziaWG preview</strong>View configuration text</a>
+    </div>
+  </main>
+</body>
+</html>
+HTML
+
+  python3 - "${awg_file}" "${pubdir}/awg.html" "${safe_label}" "${base}" <<'PY'
+import html
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+label = sys.argv[3]
+base = sys.argv[4]
+conf = html.escape(source.read_text())
+target.write_text(f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>{label} AmneziaWG</title>
+  <style>
+    body {{ margin:0; font-family:Arial,Helvetica,sans-serif; background:#f6f8fb; color:#172033; }}
+    main {{ width:min(900px, calc(100% - 32px)); margin:0 auto; padding:42px 0; }}
+    pre {{ overflow:auto; white-space:pre-wrap; border:1px solid #d9e2ec; border-radius:8px; background:#fff; padding:18px; }}
+    a {{ color:#0f766e; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{label} AmneziaWG</h1>
+    <p><a href="{base}/awg.conf">Download awg.conf</a></p>
+    <pre>{conf}</pre>
+  </main>
+</body>
+</html>
+""")
+PY
+
+  publish_permissions "${pubdir}"
+}
+
+create_subscription() {
+  local name="$1" token private_dir domain base trojan_label hysteria_label awg_label
+  local trojan_file hysteria_file awg_file trojan_link hysteria_link label created_at
+
+  validate_name "${name}"
+  subscription_exists "${name}" && die "Subscription already exists: ${name}"
+  command -v vpn-trojan >/dev/null 2>&1 || die "Missing vpn-trojan helper."
+  command -v vpn-hysteria >/dev/null 2>&1 || die "Missing vpn-hysteria helper."
+  command -v vpn-awg >/dev/null 2>&1 || die "Missing vpn-awg helper."
+
+  install -d -m 0700 "${SUB_DIR}"
+  install -d -m 0755 "${WEB_ROOT}"
+
+  echo "Creating Trojan client..."
+  vpn-trojan "${name}"
+  echo "Creating Hysteria2 client..."
+  vpn-hysteria "${name}"
+  echo "Creating AmneziaWG client..."
+  vpn-awg "${name}"
+
+  trojan_label="$(label_name "TROJAN" "${name}")"
+  hysteria_label="$(label_name "HYSTERIA" "${name}")"
+  awg_label="$(label_name "AWG" "${name}")"
+  label="$(label_name "SUB" "${name}")"
+  trojan_file="${KEY_ROOT}/trojan/${trojan_label}.txt"
+  hysteria_file="${KEY_ROOT}/hysteria/${hysteria_label}.txt"
+  awg_file="${KEY_ROOT}/awg/${awg_label}.conf"
+  [[ -r "${trojan_file}" ]] || die "Missing ${trojan_file}"
+  [[ -r "${hysteria_file}" ]] || die "Missing ${hysteria_file}"
+  [[ -r "${awg_file}" ]] || die "Missing ${awg_file}"
+  trojan_link="$(<"${trojan_file}")"
+  hysteria_link="$(<"${hysteria_file}")"
+
+  token="$(openssl rand -hex 24)"
+  while [[ -e "${SUB_DIR}/${token}" || -e "${WEB_ROOT}/${token}" ]]; do
+    token="$(openssl rand -hex 24)"
+  done
+  private_dir="${SUB_DIR}/${token}"
+  install -d -m 0700 "${private_dir}"
+
+  write_portal_files "${name}" "${token}" "${trojan_link}" "${hysteria_link}" "${awg_file}"
+
+  domain="$(domain_name)"
+  base="https://${domain}/s/${token}"
+  created_at="$(date -Is)"
+  jq -n \
+    --arg version "1" \
+    --arg name "${name}" \
+    --arg label "${label}" \
+    --arg token "${token}" \
+    --arg created_at "${created_at}" \
+    --arg portal "${base}" \
+    --arg sub_txt "${base}/sub.txt" \
+    --arg sub_base64 "${base}/sub.base64" \
+    --arg awg_conf "${base}/awg.conf" \
+    --arg awg_preview "${base}/awg" \
+    --arg trojan_label "${trojan_label}" \
+    --arg hysteria_label "${hysteria_label}" \
+    --arg awg_label "${awg_label}" \
+    '{
+      version: ($version|tonumber),
+      name: $name,
+      label: $label,
+      token: $token,
+      status: "active",
+      created_at: $created_at,
+      labels: {trojan: $trojan_label, hysteria: $hysteria_label, awg: $awg_label},
+      urls: {portal: $portal, sub_txt: $sub_txt, sub_base64: $sub_base64, awg_conf: $awg_conf, awg_preview: $awg_preview}
+    }' >"${private_dir}/meta.json"
+  chmod 0600 "${private_dir}/meta.json"
+
+  printf '\nSubscription: %s\n' "${label}"
+  printf 'Portal/import URL: %s\n' "${base}"
+  printf 'Plain payload: %s/sub.txt\n' "${base}"
+  printf 'AmneziaWG config: %s/awg.conf\n' "${base}"
+  print_qr "${base}"
+}
+
+archive_file() {
+  local file="$1" bucket="$2"
+  [[ -e "${file}" ]] || return 0
+  install -d -m 0700 "${bucket}"
+  mv "${file}" "${bucket}/$(date +%Y%m%d-%H%M%S)-$(basename "${file}")"
+}
+
+revoke_trojan() {
+  local name="$1" tmp backup
+  [[ -f "${XRAY_CONFIG}" ]] || return 0
+  if ! jq -e --arg email "${name}" '.inbounds[] | select(.tag=="trojan-xhttp-tls") | .settings.clients[]? | select(.email==$email)' "${XRAY_CONFIG}" >/dev/null; then
+    return 0
+  fi
+  tmp="$(mktemp)"
+  backup="$(mktemp)"
+  cp "${XRAY_CONFIG}" "${backup}"
+  jq --arg email "${name}" \
+    '(.inbounds[] | select(.tag=="trojan-xhttp-tls") | .settings.clients) |= map(select(.email != $email))' \
+    "${XRAY_CONFIG}" >"${tmp}"
+  install -m 0600 "${tmp}" "${XRAY_CONFIG}"
+  rm -f "${tmp}"
+  if ! /usr/local/bin/xray run -test -config "${XRAY_CONFIG}"; then
+    install -m 0600 "${backup}" "${XRAY_CONFIG}"
+    rm -f "${backup}"
+    die "Xray config test failed; restored previous config."
+  fi
+  rm -f "${backup}"
+  systemctl restart "${XRAY_SERVICE}" || true
+}
+
+revoke_hysteria() {
+  local name="$1" tmp
+  [[ -f "${HYSTERIA_CLIENTS}" ]] || return 0
+  if ! jq -e --arg name "${name}" 'has($name)' "${HYSTERIA_CLIENTS}" >/dev/null; then
+    return 0
+  fi
+  tmp="$(mktemp)"
+  jq --arg name "${name}" 'del(.[$name])' "${HYSTERIA_CLIENTS}" >"${tmp}"
+  install -m 0600 "${tmp}" "${HYSTERIA_CLIENTS}"
+  rm -f "${tmp}"
+  render_hysteria_config
+  systemctl restart "${HYSTERIA_SERVICE}" || true
+}
+
+revoke_subscription() {
+  local key="$1" token meta name label trojan_label hysteria_label awg_label archive_dir
+  token="$(resolve_token "${key}")" || die "Subscription not found: ${key}"
+  meta="${SUB_DIR}/${token}/meta.json"
+  name="$(jq -r '.name' "${meta}")"
+  label="$(jq -r '.label' "${meta}")"
+  trojan_label="$(jq -r '.labels.trojan' "${meta}")"
+  hysteria_label="$(jq -r '.labels.hysteria' "${meta}")"
+  awg_label="$(jq -r '.labels.awg' "${meta}")"
+
+  revoke_trojan "${name}"
+  revoke_hysteria "${name}"
+  if command -v vpn-awg >/dev/null 2>&1; then
+    vpn-awg revoke "${name}" || true
+  fi
+
+  rm -rf "${WEB_ROOT:?}/${token}"
+  archive_file "${KEY_ROOT}/trojan/${trojan_label}.txt" "${KEY_ROOT}/trojan/revoked"
+  archive_file "${KEY_ROOT}/hysteria/${hysteria_label}.txt" "${KEY_ROOT}/hysteria/revoked"
+  archive_file "${KEY_ROOT}/awg/${awg_label}.conf" "${KEY_ROOT}/awg/revoked"
+
+  archive_dir="${SUB_DIR}/revoked/$(date +%Y%m%d-%H%M%S)-${token}"
+  install -d -m 0700 "$(dirname "${archive_dir}")"
+  mv "${SUB_DIR}/${token}" "${archive_dir}"
+  jq '.status = "revoked" | .revoked_at = now | .revoked_at_iso = (now | todateiso8601)' \
+    "${archive_dir}/meta.json" >"${archive_dir}/meta.json.tmp" && mv "${archive_dir}/meta.json.tmp" "${archive_dir}/meta.json"
+  chmod 0600 "${archive_dir}/meta.json"
+
+  printf 'Revoked: %s\n' "${label}"
+  printf 'Removed public files: %s/%s\n' "${WEB_ROOT}" "${token}"
+  printf 'Archived metadata: %s\n' "${archive_dir}/meta.json"
+}
+
+show_subscription() {
+  local key="$1" token meta
+  token="$(resolve_token "${key}")" || die "Subscription not found: ${key}"
+  meta="${SUB_DIR}/${token}/meta.json"
+  jq -r '
+    "Subscription: \(.label)",
+    "Name: \(.name)",
+    "Status: \(.status)",
+    "Created: \(.created_at)",
+    "Portal/import URL: \(.urls.portal)",
+    "Plain payload: \(.urls.sub_txt)",
+    "Base64 payload: \(.urls.sub_base64)",
+    "AmneziaWG config: \(.urls.awg_conf)",
+    "AmneziaWG preview: \(.urls.awg_preview)"
+  ' "${meta}"
+  print_qr "$(jq -r '.urls.portal' "${meta}")"
+}
+
+list_subscriptions() {
+  local meta
+  install -d -m 0700 "${SUB_DIR}"
+  printf 'NAME\tLABEL\tSTATUS\tCREATED\tPORTAL\n'
+  for meta in "${SUB_DIR}"/*/meta.json; do
+    [[ -e "${meta}" ]] || continue
+    jq -r '[.name, .label, .status, .created_at, .urls.portal] | @tsv' "${meta}"
+  done
+}
+
+rotate_subscription() {
+  local key="$1" token name
+  token="$(resolve_token "${key}")" || die "Subscription not found: ${key}"
+  name="$(jq -r '.name' "${SUB_DIR}/${token}/meta.json")"
+  revoke_subscription "${token}"
+  create_subscription "${name}"
+}
+
+[[ "${EUID}" -eq 0 ]] || die "Run as root."
+cmd="${1:-help}"
+case "${cmd}" in
+  create)
+    [[ -n "${2:-}" ]] || die "Usage: vpn-sub create <name>"
+    create_subscription "${2}"
+    ;;
+  list)
+    list_subscriptions
+    ;;
+  show)
+    [[ -n "${2:-}" ]] || die "Usage: vpn-sub show <name>"
+    show_subscription "${2}"
+    ;;
+  revoke)
+    [[ -n "${2:-}" ]] || die "Usage: vpn-sub revoke <name>"
+    revoke_subscription "${2}"
+    ;;
+  rotate)
+    [[ -n "${2:-}" ]] || die "Usage: vpn-sub rotate <name>"
+    rotate_subscription "${2}"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage >&2
+    die "Unknown command: ${cmd}"
+    ;;
+esac
+EOF
+  chmod 0755 /usr/local/bin/vpn-sub
+}
+
 install_helper_help() {
   cat >/usr/local/bin/vpn-help <<'EOF'
 #!/usr/bin/env bash
@@ -2973,6 +3599,13 @@ Create clients:
   vpn-hysteria phone1
   vpn-awg phone1
 
+Create Hiddify-style static subscription bundle:
+  vpn-sub create phone1
+  vpn-sub list
+  vpn-sub show phone1
+  vpn-sub revoke phone1
+  vpn-sub rotate phone1
+
 AmneziaWG diagnostics:
   vpn-awg analyze
   vpn-awg analyze 20
@@ -3006,6 +3639,11 @@ Install reports:
   /opt/vpn-stack/awg-tuning-report.json
   /opt/vpn-stack/decoy-manifest.json
 
+Subscription files:
+  metadata: /opt/vpn-stack/subscriptions/<token>/meta.json
+  public: /var/www/subscriptions/<token>/
+  browser/import URL: https://DOMAIN/s/<token>
+
 Check services:
   systemctl status nginx --no-pager
   systemctl status xray-trojan-xhttp-tls --no-pager
@@ -3034,6 +3672,7 @@ install_helpers() {
   install_helper_trojan
   install_helper_hysteria
   install_helper_awg
+  install_helper_subscriptions
   install_helper_help
 }
 
@@ -3462,6 +4101,16 @@ Create more clients:
   vpn-trojan phone1
   vpn-hysteria phone1
   vpn-awg phone1
+
+Subscription bundles:
+  Create: vpn-sub create phone1
+  Show: vpn-sub show phone1
+  Browser/import URL shape: https://${DOMAIN}/s/<token>
+  Plain payload: https://${DOMAIN}/s/<token>/sub.txt
+  AmneziaWG download: https://${DOMAIN}/s/<token>/awg.conf
+  Metadata root: ${SUBSCRIPTION_DIR}
+  Public root: ${SUBSCRIPTION_WEB_DIR}
+
   vpn-help
 
 Install reports:
@@ -3549,6 +4198,14 @@ generate_install_report() {
     "trojan": $(json_escape "${KEY_DIR}/trojan"),
     "hysteria": $(json_escape "${KEY_DIR}/hysteria"),
     "awg": $(json_escape "${KEY_DIR}/awg")
+  },
+  "subscriptions": {
+    "helper": "vpn-sub",
+    "metadata_root": $(json_escape "${SUBSCRIPTION_DIR}"),
+    "public_root": $(json_escape "${SUBSCRIPTION_WEB_DIR}"),
+    "url_shape": $(json_escape "https://${DOMAIN:-DOMAIN}/s/<token>"),
+    "payload": "sub.txt contains Trojan and Hysteria2 links; awg.conf is downloadable separately",
+    "token_policy": "unguessable per-subscription tokens are never included in install reports"
   }
 }
 EOF
@@ -3647,9 +4304,44 @@ final_checks() {
   print_install_summary
 }
 
+bootstrap_install() {
+  INSTALL_TOTAL_STEPS=7
+  INSTALL_STEP=0
+
+  progress "Clearing stale one-time resume state"
+  [[ "${EUID}" -eq 0 ]] || die "Run this script as root."
+  cleanup_resume_install_state
+
+  progress "Collecting installer variables"
+  export VPN_STACK_IGNORE_SAVED_ENV=1
+  require_root_and_env
+  prompt_advanced_tuning
+
+  progress "Installing APT repositories"
+  install_apt_repositories
+
+  progress "Installing bootstrap packages"
+  install_base_packages
+
+  progress "Preparing SSH and firewall access"
+  install_resume_status_helper
+  ensure_ssh_firewall_access require-listener || die "SSH listener check failed before reboot. Start openssh-server manually, then rerun bootstrap."
+
+  progress "Scheduling one-shot stage2 install"
+  export VPN_STACK_NO_AUTO_REBOOT=1
+  schedule_resume_install_once
+
+  progress "Rebooting into stage2"
+  log "The installer will continue once after reboot."
+  log "After SSH returns, watch it with: vpn-install-status watch"
+  systemctl reboot
+  exit 0
+}
+
 main() {
   progress "Checking input variables and kernel readiness"
   require_root_and_env
+  prompt_advanced_tuning
   check_dkms_kernel_ready
   progress "Installing APT repositories"
   install_apt_repositories
@@ -3776,7 +4468,7 @@ run_with_install_lock() {
       warn "Another Golden VPN installation is already running."
       warn "Do not start a second installer while apt/dpkg is active."
       if [[ -x "${INSTALL_STATUS_HELPER}" ]]; then
-        warn "Watch progress with: vpn-install-status follow"
+        warn "Watch progress with: vpn-install-status watch"
       else
         warn "Watch progress with: journalctl -fu ${RESUME_INSTALL_SERVICE}"
         warn "Or: tail -f ${RESUME_INSTALL_LOG}"
@@ -3793,21 +4485,40 @@ run_with_install_lock() {
 show_installer_usage() {
   cat <<'USAGE'
 Usage:
-  ./install-vpn-stack.sh                 Install the full Golden VPN stack
-  ./install-vpn-stack.sh install         Same as default install
+  ./install-vpn-stack.sh                 Run two-stage bootstrap, schedule stage2, and reboot once
+  ./install-vpn-stack.sh bootstrap       Same as default two-stage bootstrap
+  ./install-vpn-stack.sh install         Run stage2/full install now
   ./install-vpn-stack.sh preflight       Check inputs and host readiness without changing VPN configs
   ./install-vpn-stack.sh validate        Validate installed listeners, services, cert, and decoy
   ./install-vpn-stack.sh verify          Alias for validate
   ./install-vpn-stack.sh report          Write and print install reports
   ./install-vpn-stack.sh render-decoy [dir]  Render decoy site into dir without touching nginx
+
+During stage2:
+  vpn-install-status watch
 USAGE
 }
 
 dispatch() {
-  local cmd="${1:-install}"
+  local cmd="${1:-bootstrap}"
   local out_dir
   case "${cmd}" in
-    install|"")
+    bootstrap|stage1|"")
+      shift || true
+      run_with_bootstrap_lock() {
+        if command -v flock >/dev/null 2>&1; then
+          exec 200>"${INSTALL_LOCK}"
+          if ! flock -n 200; then
+            warn "Another Golden VPN installation is already running."
+            [[ -x "${INSTALL_STATUS_HELPER}" ]] && warn "Watch progress with: vpn-install-status watch"
+            exit 75
+          fi
+        fi
+        bootstrap_install "$@"
+      }
+      run_with_bootstrap_lock "$@"
+      ;;
+    install|stage2)
       shift || true
       run_with_install_lock "$@"
       ;;

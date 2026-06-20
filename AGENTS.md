@@ -26,6 +26,100 @@ Decoy profiles: network-monitor, software-status, edge-docs, availability-lab
 Decoy controls: DECOY_PROFILE, DECOY_SEED, DECOY_BRAND, DECOY_REGION
 Decoy safety: static only, no external URLs, no forms, no JS, forbidden-word scan before nginx reload
 Tcpdump policy: never automatic during install; only explicit vpn-awg helper commands
+Default install flow: two-stage bootstrap -> reboot -> one-shot install
+Installer status: vpn-install-status watch
+Subscription helper: vpn-sub create/list/show/revoke/rotate
+Subscription URL shape: https://DOMAIN/s/<token>
+```
+
+### 0.0.1 Two-stage installer flow
+
+This section is normative for new work.
+
+Default `./install-vpn-stack.sh` must run `bootstrap`, not the full monolithic install. The bootstrap stage must:
+
+```text
+ask interactively for DOMAIN, EMAIL, SERVER_LOCATION, CF_Token unless env overrides are already set
+offer Advanced tuning? [y/N] for AWG_OBFS_PROFILE, AWG_MTU, DECOY_PROFILE, DECOY_SEED
+save /etc/golden-vpn-installer/install.env with root-only permissions
+install bootstrap dependencies and wait for apt/dpkg locks through DPkg::Lock::Timeout
+verify/keep SSH reachable before firewall or reboot changes
+install vpn-install-status
+schedule vpn-stack-resume-install.service/timer for one stage2 attempt after reboot
+reboot once
+```
+
+The stage2 `install` run must:
+
+```text
+read the saved env
+configure the full VPN stack
+write progress to /var/log/vpn-stack/install-progress.env
+write logs to /var/log/vpn-stack-resume-install.log when systemd launched
+remove the one-shot service/timer after the first attempt
+keep env/log/status available after failure for manual retry
+not retry automatically on every reboot
+```
+
+`vpn-install-status watch` is the primary post-reboot UX. It should show pinned or periodically redrawn colored progress plus recent logs in TTY, and line-oriented status/logs in non-TTY.
+
+### 0.0.2 Subscription system roadmap
+
+Hiddify Manager (`https://github.com/hiddify/Hiddify-Manager`) is the UX and endpoint-behavior reference for subscription import flows. Golden VPN must not vendor Hiddify Manager, install Hiddify Panel, add x-ui, add a backend admin, add Cloudflare Tunnel, or add a database-backed panel.
+
+The lightweight subscription layer is static nginx + bash helpers:
+
+```text
+vpn-sub create <name>
+vpn-sub list
+vpn-sub show <name>
+vpn-sub revoke <name>
+vpn-sub rotate <name>
+```
+
+`vpn-sub create <name>` creates a linked bundle:
+
+```text
+Trojan XHTTP TLS client
+Hysteria2 client
+AmneziaWG client config
+unguessable token with at least 128-bit entropy
+metadata: /opt/vpn-stack/subscriptions/<token>/meta.json
+public files: /var/www/subscriptions/<token>/
+```
+
+URL model:
+
+```text
+Browser portal: https://DOMAIN/s/<token>
+Client import URL: https://DOMAIN/s/<token>
+Plain subscription payload: https://DOMAIN/s/<token>/sub.txt
+Base64 subscription payload: https://DOMAIN/s/<token>/sub.base64
+AmneziaWG download: https://DOMAIN/s/<token>/awg.conf
+AmneziaWG preview: https://DOMAIN/s/<token>/awg
+```
+
+Subscription payload v1:
+
+```text
+sub.txt contains trojan:// and hysteria2:// links
+sub.base64 contains a base64 encoded version of sub.txt
+index.html is a clean static portal with copy/download links
+awg.conf is downloadable separately because many clients do not reliably import AWG from mixed subscription payloads
+awg preview is a noindex static HTML page
+```
+
+Nginx and security requirements:
+
+```text
+/s/<token> is handled by a dedicated location outside decoy generation/scanning
+access_log off for subscription locations to avoid token leakage
+X-Robots-Tag: noindex, nofollow
+no directory listing
+no external JS, CDN, forms, login, admin, cookies, analytics
+install reports must mention feature paths and URL shape only, never tokens or client secrets
+revoke removes nginx-served files and disables protocol credentials
+rotate revokes old files/credentials and creates a fresh token plus fresh protocol credentials
 ```
 
 ### 0.1 Текущее состояние
