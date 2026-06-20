@@ -29,8 +29,8 @@ Default install is a guided two-stage flow:
 Run on a fresh VPS as `root`:
 
 ```bash
-apt-get update
-apt-get install -y curl ca-certificates
+apt-get -o DPkg::Lock::Timeout=1800 update
+apt-get -o DPkg::Lock::Timeout=1800 install -y curl ca-certificates
 
 curl -fsSL https://raw.githubusercontent.com/Mathias143000/GOLDEN-VPN/main/install-vpn-stack.sh -o install-vpn-stack.sh
 chmod +x install-vpn-stack.sh
@@ -61,8 +61,8 @@ bash /root/vpn-stack-resume/install-vpn-stack.sh install
 Same default two-stage bootstrap flow, shown without explanations:
 
 ```bash
-apt-get update
-apt-get install -y curl ca-certificates
+apt-get -o DPkg::Lock::Timeout=1800 update
+apt-get -o DPkg::Lock::Timeout=1800 install -y curl ca-certificates
 
 curl -fsSL https://raw.githubusercontent.com/Mathias143000/GOLDEN-VPN/main/install-vpn-stack.sh -o install-vpn-stack.sh
 chmod +x install-vpn-stack.sh
@@ -167,8 +167,8 @@ journalctl -u vpn-stack-ssh-guard.service -b --no-pager
 Manual fallback after reboot:
 
 ```bash
-apt-get update
-apt-get install -y git curl ca-certificates
+apt-get -o DPkg::Lock::Timeout=1800 update
+apt-get -o DPkg::Lock::Timeout=1800 install -y git curl ca-certificates
 
 if [ -d /root/GOLDEN-VPN/.git ]; then
   git -C /root/GOLDEN-VPN pull --ff-only
@@ -196,8 +196,8 @@ cat /var/log/vpn-stack-resume-install.log
 ## Install With Git
 
 ```bash
-apt-get update
-apt-get install -y git curl ca-certificates
+apt-get -o DPkg::Lock::Timeout=1800 update
+apt-get -o DPkg::Lock::Timeout=1800 install -y git curl ca-certificates
 
 git clone https://github.com/Mathias143000/GOLDEN-VPN.git
 cd GOLDEN-VPN
@@ -372,7 +372,7 @@ cat /var/log/vpn-stack-ssh-guard.log
 cat /var/log/vpn-stack-resume-install.log
 ```
 
-If you see `Could not get lock /var/lib/dpkg/lock-frontend`, another install or resume process is still using `apt`. Do not remove the lock file. Watch the running installer instead:
+If you see `Could not get lock /var/lib/dpkg/lock-frontend`, another install, cloud-init first-boot upgrade, or provider dist-upgrade is still using `apt`. Do not remove the lock file. The installer waits up to `APT_LOCK_TIMEOUT=1800` seconds and prints lock-holder PIDs. Watch the running installer instead:
 
 ```bash
 vpn-install-status watch

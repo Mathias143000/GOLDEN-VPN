@@ -3,6 +3,10 @@ set -Eeuo pipefail
 
 umask 077
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE="${NEEDRESTART_MODE:-a}"
+export APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND:-none}"
+
+: "${APT_LOCK_TIMEOUT:=1800}"
 
 STACK_DIR="/opt/vpn-stack"
 KEY_DIR="/root/vpn-keys"
@@ -95,8 +99,63 @@ die() {
   exit 1
 }
 
+package_lock_holders() {
+  local lock
+
+  command -v fuser >/dev/null 2>&1 || return 0
+
+  for lock in \
+    /var/lib/dpkg/lock-frontend \
+    /var/lib/dpkg/lock \
+    /var/cache/apt/archives/lock \
+    /var/lib/apt/lists/lock; do
+    [[ -e "${lock}" ]] || continue
+    (fuser "${lock}" 2>/dev/null || true) | tr ' ' '\n' | awk 'NF'
+  done | sort -n -u
+}
+
+describe_package_lock_holders() {
+  local pids pid_csv
+  mapfile -t pids < <(package_lock_holders)
+  [[ "${#pids[@]}" -gt 0 ]] || return 0
+
+  pid_csv="$(IFS=,; printf '%s' "${pids[*]}")"
+  ps -o pid,ppid,stat,etime,cmd -p "${pid_csv}" 2>/dev/null || true
+}
+
+wait_for_package_locks() {
+  local start now elapsed timeout next_log pids
+  timeout="${APT_LOCK_TIMEOUT:-1800}"
+  start="$(date +%s)"
+  next_log=0
+
+  command -v fuser >/dev/null 2>&1 || return 0
+
+  while true; do
+    mapfile -t pids < <(package_lock_holders)
+    [[ "${#pids[@]}" -gt 0 ]] || return 0
+
+    now="$(date +%s)"
+    elapsed=$((now - start))
+    if ((elapsed >= timeout)); then
+      warn "Timed out after ${timeout}s waiting for apt/dpkg locks."
+      describe_package_lock_holders >&2
+      return 1
+    fi
+
+    if ((elapsed >= next_log)); then
+      warn "Waiting for first-boot apt/dpkg work to finish (${elapsed}/${timeout}s). Lock holders:"
+      describe_package_lock_holders >&2
+      next_log=$((elapsed + 30))
+    fi
+
+    sleep 5
+  done
+}
+
 apt_get() {
-  apt-get -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT:-600}" "$@"
+  wait_for_package_locks
+  apt-get -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT:-1800}" "$@"
 }
 
 progress() {
