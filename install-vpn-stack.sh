@@ -2963,7 +2963,14 @@ revoke_client() {
   local file label private public tmp archive
   file="$(client_file_for "${name}")" || die "Client not found: ${name}"
   label="$(basename "${file}" .conf)"
-  private="$(awk -F'= *' '$1 ~ /^PrivateKey/ {print $2; exit}' "${file}")"
+  private="$(awk -F= '
+    $1 ~ /^[[:space:]]*PrivateKey[[:space:]]*$/ {
+      gsub(/\r/, "", $2)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+      print $2
+      exit
+    }
+  ' "${file}")"
   [[ -n "${private}" ]] || die "Could not read client private key from ${file}."
   public="$(printf '%s\n' "${private}" | awg pubkey)"
 
