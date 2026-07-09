@@ -66,7 +66,6 @@ BASE_PACKAGES=(
   build-essential
   dkms
   nginx
-  libnginx-mod-stream
   prometheus
   prometheus-node-exporter
   grafana
@@ -619,6 +618,10 @@ timer="vpn-stack-resume-install.timer"
 log_file="/var/log/vpn-stack-resume-install.log"
 progress_file="/var/log/vpn-stack/install-progress.env"
 lock_file="/run/golden-vpn-install.lock"
+env_file="/etc/golden-vpn-installer/install.env"
+installer="/root/vpn-stack-resume/install-vpn-stack.sh"
+service_unit="/etc/systemd/system/vpn-stack-resume-install.service"
+timer_unit="/etc/systemd/system/vpn-stack-resume-install.timer"
 
 load_progress() {
   STEP="?"
@@ -630,6 +633,30 @@ load_progress() {
     # shellcheck disable=SC1090
     source "${progress_file}" || true
   fi
+}
+
+lock_held() {
+  command -v fuser >/dev/null 2>&1 && fuser "${lock_file}" >/dev/null 2>&1
+}
+
+service_active() {
+  command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${service}" 2>/dev/null
+}
+
+timer_active() {
+  command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${timer}" 2>/dev/null
+}
+
+resume_units_present() {
+  [[ -e "${service_unit}" || -e "${timer_unit}" ]]
+}
+
+has_state() {
+  lock_held || service_active || timer_active || resume_units_present || [[ -r "${env_file}" || -x "${installer}" ]]
+}
+
+auto_watch_needed() {
+  lock_held || service_active || timer_active || resume_units_present
 }
 
 render_bar() {
@@ -658,6 +685,29 @@ render_bar() {
   fi
 }
 
+render_watch_screen() {
+  local lines="${1:-22}"
+  if [[ -n "${TERM:-}" ]] && command -v tput >/dev/null 2>&1; then
+    tput clear 2>/dev/null || printf '\033[H\033[2J'
+  else
+    printf '\033[H\033[2J'
+  fi
+  echo "Golden VPN installer watch"
+  echo
+  render_bar
+  printf 'Updated: %s\n' "${UPDATED_AT:-unknown}"
+  printf 'Service: '
+  systemctl is-active "${service}" 2>/dev/null || true
+  printf 'Timer: '
+  systemctl is-active "${timer}" 2>/dev/null || true
+  printf 'Log: %s\n\n' "${log_file}"
+  if [[ -r "${log_file}" ]]; then
+    tail -n "${lines}" "${log_file}" || true
+  else
+    echo "Waiting for log file..."
+  fi
+}
+
 show_status() {
   echo "Golden VPN installer status"
   echo
@@ -679,6 +729,33 @@ show_status() {
   fi
 }
 
+auto_status() {
+  local lines="${1:-22}"
+  [[ "${lines}" =~ ^[0-9]+$ ]] || lines=22
+
+  if ! has_state; then
+    return 1
+  fi
+
+  if [[ ! -t 1 || "${TERM:-}" == "dumb" ]]; then
+    show_status
+    return 0
+  fi
+
+  if ! auto_watch_needed; then
+    show_status
+    return 0
+  fi
+
+  tput civis 2>/dev/null || true
+  trap 'tput cnorm 2>/dev/null || true; printf "\n"' EXIT INT TERM
+  while auto_watch_needed; do
+    render_watch_screen "${lines}"
+    sleep 1
+  done
+  render_watch_screen "${lines}"
+}
+
 watch_status() {
   local lines="${1:-22}"
   [[ "${lines}" =~ ^[0-9]+$ ]] || lines=22
@@ -691,19 +768,7 @@ watch_status() {
   tput civis 2>/dev/null || true
   trap 'tput cnorm 2>/dev/null || true; printf "\n"' EXIT INT TERM
   while true; do
-    clear
-    echo "Golden VPN installer watch"
-    echo
-    render_bar
-    printf 'Updated: %s\n' "${UPDATED_AT:-unknown}"
-    printf 'Service: '
-    systemctl is-active "${service}" 2>/dev/null || true
-    printf 'Log: %s\n\n' "${log_file}"
-    if [[ -r "${log_file}" ]]; then
-      tail -n "${lines}" "${log_file}" || true
-    else
-      echo "Waiting for log file..."
-    fi
+    render_watch_screen "${lines}"
     sleep 1
   done
 }
@@ -719,16 +784,55 @@ case "${1:-status}" in
   log)
     tail -n "${2:-200}" "${log_file}" || true
     ;;
+  auto)
+    auto_status "${2:-22}"
+    ;;
+  has-state)
+    has_state
+    ;;
   status|"")
     show_status
     ;;
   *)
-    echo "Usage: vpn-install-status [status|watch [lines]|follow|log [lines]]" >&2
+    echo "Usage: vpn-install-status [status|watch [lines]|auto [lines]|follow|log [lines]|has-state]" >&2
     exit 2
     ;;
 esac
 EOF
   chmod 0755 "${INSTALL_STATUS_HELPER}"
+}
+
+install_shell_startup_hook() {
+  local bashrc="/root/.bashrc"
+  local tmp
+
+  install -d -m 0700 /root
+  touch "${bashrc}"
+  chmod 0600 "${bashrc}" || true
+
+  tmp="$(mktemp /root/.bashrc.golden-vpn.XXXXXX)" || die "Could not create temporary /root/.bashrc file; check disk space and inodes."
+  awk '
+    $0 == "# >>> Golden VPN startup >>>" {skip=1; next}
+    $0 == "# <<< Golden VPN startup <<<" {skip=0; next}
+    skip != 1 {print}
+  ' "${bashrc}" >"${tmp}"
+  cat "${tmp}" >"${bashrc}"
+  rm -f "${tmp}"
+
+  cat >>"${bashrc}" <<'EOF'
+# >>> Golden VPN startup >>>
+if [[ $- == *i* ]] && [[ -t 1 ]] && [[ -z "${GOLDEN_VPN_STARTUP_SHOWN:-}" ]] && [[ "${GOLDEN_VPN_NO_STARTUP:-0}" != "1" ]]; then
+  export GOLDEN_VPN_STARTUP_SHOWN=1
+  if command -v vpn-install-status >/dev/null 2>&1 && vpn-install-status has-state >/dev/null 2>&1; then
+    vpn-install-status auto 24 || true
+  fi
+  if command -v vpn-help >/dev/null 2>&1 && { ! command -v vpn-install-status >/dev/null 2>&1 || ! vpn-install-status has-state >/dev/null 2>&1; }; then
+    vpn-help --login || true
+  fi
+fi
+# <<< Golden VPN startup <<<
+EOF
+  chmod 0600 "${bashrc}" || true
 }
 
 cleanup_resume_install_state() {
@@ -2544,6 +2648,8 @@ print_qr() {
     echo "QR code skipped: qrencode is not installed." >&2
   fi
 }
+
+
 label_name() {
   local prefix="$1"
   local name="$2"
@@ -2651,6 +2757,8 @@ print_qr() {
     echo "QR code skipped: qrencode is not installed." >&2
   fi
 }
+
+
 label_name() {
   local prefix="$1"
   local name="$2"
@@ -2763,6 +2871,80 @@ print_qr() {
   else
     echo "QR code skipped: qrencode is not installed." >&2
   fi
+}
+
+
+storage_hint() {
+  local path="$1"
+  {
+    echo "Storage diagnostics for ${path}:"
+    df -h "${path}" 2>/dev/null || true
+    df -ih "${path}" 2>/dev/null || true
+  } >&2
+}
+
+require_writable_dir() {
+  local dir="$1"
+  if ! install -d -m 0700 "${dir}"; then
+    storage_hint "$(dirname "${dir}")"
+    die "Could not create ${dir}; check disk space and inodes."
+  fi
+  [[ -w "${dir}" ]] || die "Directory is not writable: ${dir}"
+}
+
+add_runtime_peer() {
+  local public="$1" psk="$2" ip="$3"
+  if ! awg set awg0 peer "${public}" preshared-key <(printf '%s\n' "${psk}") allowed-ips "${ip}/32"; then
+    storage_hint /tmp
+    storage_hint /run
+    die "Could not add AWG peer at runtime."
+  fi
+}
+
+remove_runtime_peer() {
+  local public="$1"
+  awg show awg0 >/dev/null 2>&1 && awg set awg0 peer "${public}" remove >/dev/null 2>&1 || true
+}
+
+drop_peer_from_config_by_public() {
+  local public="$1" tmp
+  tmp="$(mktemp "$(dirname "${CONFIG}")/.awg0.conf.rollback.XXXXXX")" || return 1
+  awk -v pub="${public}" '
+    function flush_peer() {
+      if (peer) {
+        if (!drop) printf "%s", block
+        peer = 0
+        block = ""
+        drop = 0
+      }
+    }
+    /^\[Peer\][[:space:]]*$/ {
+      flush_peer()
+      peer = 1
+      block = $0 ORS
+      next
+    }
+    peer {
+      block = block $0 ORS
+      line = $0
+      if (line ~ /^[[:space:]]*PublicKey[[:space:]]*=/) {
+        sub(/^[^=]*=[[:space:]]*/, "", line)
+        sub(/[[:space:]]*$/, "", line)
+        if (line == pub) drop = 1
+      }
+      next
+    }
+    {
+      flush_peer()
+      print
+    }
+    END {
+      flush_peer()
+    }
+  ' "${CONFIG}" >"${tmp}" && install -m 0600 "${tmp}" "${CONFIG}"
+  local status=$?
+  rm -f "${tmp}"
+  return "${status}"
 }
 label_name() {
   local prefix="$1"
@@ -2901,6 +3083,10 @@ analyze_awg() {
   systemctl is-enabled awg-quick@awg0.service 2>/dev/null | sed 's/^/  awg-quick@awg0 enabled: /' || true
   systemctl is-active amneziawg-ensure-module.service 2>/dev/null | sed 's/^/  amneziawg-ensure-module active: /' || true
   echo
+  echo "Storage:"
+  df -h / /tmp /run "$(dirname "${CONFIG}")" "${KEY_DIR}" 2>/dev/null | sed 's/^/  /' || true
+  df -ih / /tmp /run "$(dirname "${CONFIG}")" "${KEY_DIR}" 2>/dev/null | sed 's/^/  /' || true
+  echo
   echo "Kernel/module:"
   lsmod | awk '$1 ~ /^(amneziawg|wireguard)$/ {print "  " $0}' || true
   echo
@@ -2976,7 +3162,11 @@ revoke_client() {
   [[ -n "${private}" ]] || die "Could not read client private key from ${file}."
   public="$(printf '%s\n' "${private}" | awg pubkey)"
 
-  tmp="$(mktemp)"
+  tmp="$(mktemp "$(dirname "${CONFIG}")/.awg0.conf.revoke.XXXXXX")" || {
+    storage_hint "$(dirname "${CONFIG}")"
+    die "Could not create temp config next to ${CONFIG}; check disk space and inodes."
+  }
+
   awk -v pub="${public}" '
     function flush_peer() {
       if (peer) {
@@ -3135,28 +3325,37 @@ client_private="$(awg genkey)"
 client_public="$(printf '%s\n' "${client_private}" | awg pubkey)"
 psk="$(awg_genpsk)"
 
-cat >>"${CONFIG}" <<EOF_PEER
+require_writable_dir "${KEY_DIR}"
+out="${KEY_DIR}/${label}.conf"
+runtime_peer_added=0
+
+if awg show awg0 >/dev/null 2>&1; then
+  add_runtime_peer "${client_public}" "${psk}" "${client_ip}"
+  runtime_peer_added=1
+fi
+
+if ! cat >>"${CONFIG}" <<EOF_PEER
 
 [Peer]
 PublicKey = ${client_public}
 PresharedKey = ${psk}
 AllowedIPs = ${client_ip}/32
 EOF_PEER
+then
+  [[ "${runtime_peer_added}" -eq 1 ]] && remove_runtime_peer "${client_public}"
+  storage_hint "$(dirname "${CONFIG}")"
+  die "Could not append peer to ${CONFIG}; runtime peer was rolled back."
+fi
 chmod 0600 "${CONFIG}"
 
-if awg show awg0 >/dev/null 2>&1; then
-  psk_file="$(mktemp)"
-  chmod 0600 "${psk_file}"
-  printf '%s\n' "${psk}" >"${psk_file}"
-  awg set awg0 peer "${client_public}" preshared-key "${psk_file}" allowed-ips "${client_ip}/32"
-  rm -f "${psk_file}"
-else
-  systemctl restart awg-quick@awg0.service
+if [[ "${runtime_peer_added}" -eq 0 ]]; then
+  if ! systemctl restart awg-quick@awg0.service; then
+    drop_peer_from_config_by_public "${client_public}" || true
+    die "Could not restart awg-quick@awg0.service; persistent peer was rolled back."
+  fi
 fi
 
-install -d -m 0700 "${KEY_DIR}"
-out="${KEY_DIR}/${label}.conf"
-cat >"${out}" <<EOF_CLIENT
+if ! cat >"${out}" <<EOF_CLIENT
 # ${label}
 # GeneratedAt = $(date -Is)
 # ObfuscationProfile = ${AWG_OBFS_PROFILE:-unknown}
@@ -3191,6 +3390,12 @@ Endpoint = ${domain}:${AWG_ENDPOINT_PORT:-51820}
 AllowedIPs = ${AWG_ALLOWED_IPS:-0.0.0.0/0, ::/0}
 PersistentKeepalive = ${AWG_KEEPALIVE:-25}
 EOF_CLIENT
+then
+  remove_runtime_peer "${client_public}"
+  drop_peer_from_config_by_public "${client_public}" || true
+  storage_hint "${KEY_DIR}"
+  die "Could not write ${out}; AWG peer was rolled back."
+fi
 chmod 0600 "${out}"
 printf 'Client: %s\n' "${label}"
 print_qr "$(cat "${out}")"
@@ -3527,6 +3732,7 @@ revoke_trojan() {
     return 0
   fi
   tmp="$(mktemp)"
+
   backup="$(mktemp)"
   cp "${XRAY_CONFIG}" "${backup}"
   jq --arg email "${name}" \
@@ -3550,6 +3756,7 @@ revoke_hysteria() {
     return 0
   fi
   tmp="$(mktemp)"
+
   jq --arg name "${name}" 'del(.[$name])' "${HYSTERIA_CLIENTS}" >"${tmp}"
   install -m 0600 "${tmp}" "${HYSTERIA_CLIENTS}"
   rm -f "${tmp}"
@@ -3665,12 +3872,42 @@ install_helper_help() {
 #!/usr/bin/env bash
 set -euo pipefail
 
+is_tty() {
+  [[ -t 1 && "${TERM:-}" != "dumb" ]]
+}
+
+if is_tty; then
+  bold=$'\033[1m'
+  dim=$'\033[2m'
+  cyan=$'\033[36m'
+  green=$'\033[32m'
+  yellow=$'\033[33m'
+  reset=$'\033[0m'
+else
+  bold=""
+  dim=""
+  cyan=""
+  green=""
+  yellow=""
+  reset=""
+fi
+
 show_key_if_exists() {
   local file="$1"
   if [[ -f "${file}" ]]; then
     cat "${file}"
   else
     echo "No saved key yet: ${file}"
+  fi
+}
+
+read_value() {
+  local file="$1"
+  local fallback="$2"
+  if [[ -r "${file}" ]]; then
+    cat "${file}"
+  else
+    printf '%s' "${fallback}"
   fi
 }
 
@@ -3693,73 +3930,136 @@ label_name() {
   fi
 }
 
-proto="${1:-}"
-name="${2:-}"
+print_header() {
+  local domain location
+  domain="$(read_value /opt/vpn-stack/domain.txt DOMAIN)"
+  location="$(read_value /opt/vpn-stack/server-location.txt XX)"
 
-case "${proto}" in
-  trojan|tls|xhttp)
-    [[ -n "${name}" ]] && show_key_if_exists "/root/vpn-keys/trojan/$(label_name "TROJAN" "${name}").txt" && exit 0
-    echo "Create: vpn-trojan <name>"
-    exit 0
-    ;;
-  vless)
-    echo "VLESS was replaced by Trojan XHTTP TLS."
-    echo "Create: vpn-trojan <name>"
-    exit 0
-    ;;
-  hysteria)
-    [[ -n "${name}" ]] && show_key_if_exists "/root/vpn-keys/hysteria/$(label_name "HYSTERIA" "${name}").txt" && exit 0
-    echo "Create: vpn-hysteria <name>"
-    exit 0
-    ;;
-  awg)
-    [[ -n "${name}" ]] && show_key_if_exists "/root/vpn-keys/awg/$(label_name "AWG" "${name}").conf" && exit 0
-    echo "Create: vpn-awg <name>"
-    exit 0
-    ;;
-esac
+  printf '%sGolden VPN menu%s\n' "${bold}${cyan}" "${reset}"
+  printf 'Domain: %s    Location: %s\n' "${domain}" "${location}"
+  printf '%sUse: vpn-help <number> [name], for example: vpn-help 1 phone1%s\n\n' "${dim}" "${reset}"
+}
 
-cat <<'HELP'
-Golden VPN helper commands
+menu_item() {
+  local num="$1"
+  local title="$2"
+  local hint="$3"
+  printf '  %2s. %s%-34s%s %s\n' "${num}" "${green}" "${title}" "${reset}" "${hint}"
+}
 
-Create clients:
+print_menu() {
+  print_header
+  menu_item 1 "Trojan XHTTP TLS" "create/show client"
+  menu_item 2 "Hysteria2" "create/show client"
+  menu_item 3 "AmneziaWG" "create/show client"
+  menu_item 4 "Subscription bundle" "create/list/show/revoke/rotate"
+  menu_item 5 "Saved keys and reports" "where files are stored"
+  menu_item 6 "AWG tools" "profile, explain, diagnostics"
+  menu_item 7 "Install status" "progress, logs, reports"
+  menu_item 8 "Service health" "systemd checks"
+  menu_item 9 "Grafana access" "SSH tunnel and dashboard 1860"
+  menu_item 10 "Decoy and public URLs" "site and subscription URL shapes"
+  printf '\n%sNo prompt is shown on login; this menu is printed and your shell stays usable.%s\n' "${yellow}" "${reset}"
+}
+
+topic_trojan() {
+  local name="${1:-}"
+  if [[ -n "${name}" ]]; then
+    show_key_if_exists "/root/vpn-keys/trojan/$(label_name "TROJAN" "${name}").txt"
+    return 0
+  fi
+  cat <<'HELP'
+1. Trojan XHTTP TLS
+
+Create a client:
   vpn-trojan phone1
+
+Show saved client material:
+  vpn-help 1 phone1
+  vpn-help trojan phone1
+
+Saved path:
+  /root/vpn-keys/trojan/TROJAN-<LOCATION>-<name>.txt
+HELP
+}
+
+topic_hysteria() {
+  local name="${1:-}"
+  if [[ -n "${name}" ]]; then
+    show_key_if_exists "/root/vpn-keys/hysteria/$(label_name "HYSTERIA" "${name}").txt"
+    return 0
+  fi
+  cat <<'HELP'
+2. Hysteria2
+
+Create a client:
   vpn-hysteria phone1
+
+Show saved client material:
+  vpn-help 2 phone1
+  vpn-help hysteria phone1
+
+Saved path:
+  /root/vpn-keys/hysteria/HYSTERIA-<LOCATION>-<name>.txt
+HELP
+}
+
+topic_awg() {
+  local name="${1:-}"
+  if [[ -n "${name}" ]]; then
+    show_key_if_exists "/root/vpn-keys/awg/$(label_name "AWG" "${name}").conf"
+    return 0
+  fi
+  cat <<'HELP'
+3. AmneziaWG
+
+Create a client:
   vpn-awg phone1
 
-Create Hiddify-style static subscription bundle:
+Show saved client material:
+  vpn-help 3 phone1
+  vpn-help awg phone1
+
+Lifecycle:
+  vpn-awg list
+  vpn-awg show phone1
+  vpn-awg revoke phone1
+  vpn-awg rotate phone1
+
+Saved path:
+  /root/vpn-keys/awg/AWG-<LOCATION>-<name>.conf
+HELP
+}
+
+topic_subscription() {
+  cat <<'HELP'
+4. Subscription bundle
+
+Create a Hiddify-style static bundle:
   vpn-sub create phone1
+
+Manage bundles:
   vpn-sub list
   vpn-sub show phone1
   vpn-sub revoke phone1
   vpn-sub rotate phone1
 
-AmneziaWG diagnostics:
-  vpn-awg analyze
-  vpn-awg analyze 20
-  vpn-awg capture 30
-  vpn-awg analyze-live 20
-  vpn-awg profile
-  vpn-awg explain
-  vpn-awg show-config
+URL shape:
+  https://DOMAIN/s/<token>
+  https://DOMAIN/s/<token>/sub.txt
+  https://DOMAIN/s/<token>/sub.base64
+  https://DOMAIN/s/<token>/awg.conf
+HELP
+}
 
-Saved keys:
-  /root/vpn-keys/trojan/TROJAN-<LOCATION>-<name>.txt
-  /root/vpn-keys/hysteria/HYSTERIA-<LOCATION>-<name>.txt
-  /root/vpn-keys/awg/AWG-<LOCATION>-<name>.conf
+topic_files() {
+  cat <<'HELP'
+5. Saved keys and reports
 
-Show saved client material:
-  vpn-help trojan phone1
-  vpn-help tls phone1
-  vpn-help xhttp phone1
-  vpn-help hysteria phone1
-  vpn-help awg phone1
-
-AmneziaWG lifecycle:
-  vpn-awg list
-  vpn-awg show phone1
-  vpn-awg revoke phone1
-  vpn-awg rotate phone1
+Client material:
+  /root/vpn-keys/trojan/
+  /root/vpn-keys/hysteria/
+  /root/vpn-keys/awg/
 
 Install reports:
   /root/vpn-keys/install-report.txt
@@ -3770,7 +4070,49 @@ Install reports:
 Subscription files:
   metadata: /opt/vpn-stack/subscriptions/<token>/meta.json
   public: /var/www/subscriptions/<token>/
-  browser/import URL: https://DOMAIN/s/<token>
+HELP
+}
+
+topic_awg_tools() {
+  cat <<'HELP'
+6. AWG tools
+
+Profile and current config:
+  vpn-awg profile
+  vpn-awg explain
+  vpn-awg show-config
+
+Diagnostics are explicit only:
+  vpn-awg analyze
+  vpn-awg analyze 20
+  vpn-awg capture 30
+  vpn-awg analyze-live 20
+
+Packet captures can contain metadata. Keep pcap files private.
+HELP
+}
+
+topic_install_status() {
+  cat <<'HELP'
+7. Install status
+
+Automatic login behavior:
+  /root/.bashrc runs vpn-install-status auto during reboot resume.
+  No command input is required after reboot to see progress and logs.
+
+Manual commands:
+  vpn-install-status status
+  vpn-install-status watch
+  vpn-install-status log 200
+
+Resume log:
+  /var/log/vpn-stack-resume-install.log
+HELP
+}
+
+topic_services() {
+  cat <<'HELP'
+8. Service health
 
 Check services:
   systemctl status nginx --no-pager
@@ -3781,15 +4123,98 @@ Check services:
   systemctl status prometheus-node-exporter --no-pager
   systemctl status grafana-server --no-pager
 
-Grafana SSH tunnel:
+Validate the installed stack:
+  install-vpn-stack.sh validate
+HELP
+}
+
+topic_grafana() {
+  cat <<'HELP'
+9. Grafana access
+
+Grafana is localhost-only on the server.
+
+SSH tunnel:
   ssh -L 3000:127.0.0.1:3000 root@SERVER_IP
-  Open http://localhost:3000
-  Default login: admin / admin
+
+Open:
+  http://localhost:3000
+
+Default login:
+  admin / admin
 
 Dashboard:
   Node Exporter Full dashboard ID 1860 is provisioned when download succeeds.
-  Manual import path: Grafana -> Dashboards -> New -> Import -> 1860 -> datasource Prometheus
+  Manual import: Grafana -> Dashboards -> New -> Import -> 1860 -> datasource Prometheus
 HELP
+}
+
+topic_public_urls() {
+  cat <<'HELP'
+10. Decoy and public URLs
+
+Decoy site:
+  https://DOMAIN/
+
+Regenerate or preview decoy:
+  vpn-decoy-regenerate
+  vpn-decoy-preview
+
+Subscription URL shape:
+  https://DOMAIN/s/<token>
+
+Install reports never print subscription tokens or client secrets.
+HELP
+}
+
+topic="${1:-menu}"
+name="${2:-}"
+
+case "${topic}" in
+  ""|menu|--menu|--login|-h|--help|help)
+    print_menu
+    ;;
+  1|trojan|tls|xhttp)
+    topic_trojan "${name}"
+    ;;
+  vless|reality)
+    echo "VLESS/REALITY was replaced by Trojan XHTTP TLS in this installer."
+    topic_trojan "${name}"
+    ;;
+  2|hysteria|hy2)
+    topic_hysteria "${name}"
+    ;;
+  3|awg|amneziawg)
+    topic_awg "${name}"
+    ;;
+  4|sub|subs|subscription|subscriptions)
+    topic_subscription
+    ;;
+  5|keys|files|reports)
+    topic_files
+    ;;
+  6|awg-tools|diagnostics)
+    topic_awg_tools
+    ;;
+  7|status|install|progress)
+    topic_install_status
+    ;;
+  8|services|health)
+    topic_services
+    ;;
+  9|grafana|monitoring)
+    topic_grafana
+    ;;
+  10|decoy|urls|public)
+    topic_public_urls
+    ;;
+  *)
+    print_menu >&2
+    echo >&2
+    echo "Unknown menu item: ${topic}" >&2
+    exit 2
+    ;;
+esac
 EOF
   chmod 0755 /usr/local/bin/vpn-help
 }
@@ -3802,6 +4227,7 @@ install_helpers() {
   install_helper_awg
   install_helper_subscriptions
   install_helper_help
+  install_shell_startup_hook
 }
 
 configure_monitoring() {
@@ -3906,6 +4332,25 @@ EOF
 }
 EOF
   chmod 0644 /etc/logrotate.d/vpn-stack
+
+  if [[ -f /etc/logrotate.d/rsyslog ]] && ! grep -q 'maxsize 50M' /etc/logrotate.d/rsyslog; then
+    sed -i '/^[[:space:]]*weekly[[:space:]]*$/a\    maxsize 50M' /etc/logrotate.d/rsyslog
+  fi
+
+  cat >/etc/logrotate.d/grafana-server <<'EOF'
+/var/log/grafana/*.log /var/log/grafana/*.log.* {
+    daily
+    rotate 3
+    maxsize 20M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 grafana adm
+}
+EOF
+  chmod 0644 /etc/logrotate.d/grafana-server
 }
 
 configure_timers() {
@@ -4452,6 +4897,7 @@ bootstrap_install() {
 
   progress "Preparing SSH and firewall access"
   install_resume_status_helper
+  install_shell_startup_hook
   ensure_ssh_firewall_access require-listener || die "SSH listener check failed before reboot. Start openssh-server manually, then rerun bootstrap."
 
   progress "Scheduling one-shot stage2 install"
@@ -4460,7 +4906,8 @@ bootstrap_install() {
 
   progress "Rebooting into stage2"
   log "The installer will continue once after reboot."
-  log "After SSH returns, watch it with: vpn-install-status watch"
+  log "After SSH login, /root/.bashrc shows installer progress automatically."
+  log "Manual watcher remains available: vpn-install-status watch"
   systemctl reboot
   exit 0
 }

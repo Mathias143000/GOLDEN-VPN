@@ -42,7 +42,9 @@ The commands above install only the bootstrap download prerequisites. Bootstrap 
 
 The installer asks for `DOMAIN`, `EMAIL`, `SERVER_LOCATION`, and `CF_Token`. It also offers an optional `Advanced tuning? [y/N]` block for `AWG_OBFS_PROFILE`, `AWG_MTU`, `DECOY_PROFILE`, and `DECOY_SEED`.
 
-After the reboot, reconnect by SSH and watch stage2:
+After the reboot, reconnect by SSH. The installer adds a guarded block to `/root/.bashrc`, so an interactive root login automatically shows the colored stage2 progress and recent logs with `vpn-install-status auto`. No command input is required after reboot.
+
+Manual watcher:
 
 ```bash
 vpn-install-status watch
@@ -135,6 +137,7 @@ Stage2 status:
 
 ```bash
 vpn-install-status
+vpn-install-status auto
 vpn-install-status watch
 journalctl -u vpn-stack-resume-install.service -b --no-pager
 systemctl list-timers vpn-stack-resume-install.timer --no-pager
@@ -282,10 +285,12 @@ Preview a decoy render without touching nginx:
 ./install-vpn-stack.sh render-decoy /tmp/decoy-preview
 ```
 
-Show help:
+Show the numbered helper menu. The same menu is printed automatically on interactive root login after install state is no longer active:
 
 ```bash
 vpn-help
+vpn-help 1 phone1
+vpn-help 7
 ```
 
 Validate and print install reports:
@@ -348,6 +353,13 @@ AmneziaWG parameters are randomized from the selected profile. Supported profile
 
 ## Troubleshooting
 
+If `vpn-awg <name>` reports `printf: write error: No space left on device` while `/` is not full, check `/tmp`, `/run`, and inode usage. Older helpers wrote the AWG preshared key through a `mktemp` file, so a full tmpfs or exhausted inode table could break client creation even with free root-disk space. Current helpers avoid that temp file and `vpn-awg analyze` prints storage diagnostics.
+
+```bash
+vpn-awg analyze
+df -h / /tmp /run /etc/amnezia/amneziawg /root/vpn-keys/awg
+df -ih / /tmp /run /etc/amnezia/amneziawg /root/vpn-keys/awg
+```
 If SSH is blocked after a reboot, open the VPS provider web console or rescue console and restore SSH in UFW:
 
 ```bash
