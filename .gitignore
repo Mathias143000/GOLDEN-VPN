@@ -1,0 +1,4 @@
+# Local operator access and server-audit artifacts may contain sensitive data.
+.codex-ssh/
+audit/
+log,txt

@@ -15,6 +15,7 @@ Implemented DoD items:
 
 ```text
 CLI modes: install, preflight, validate/verify, report, render-decoy
+Safe existing-stack modes: upgrade-check, upgrade
 Reports: /root/vpn-keys/install-report.txt and /root/vpn-keys/install-report.json
 AWG report: /opt/vpn-stack/awg-tuning-report.json
 Decoy manifest: /opt/vpn-stack/decoy-manifest.json
@@ -30,6 +31,8 @@ Default install flow: two-stage bootstrap -> reboot -> one-shot install
 Installer status: vpn-install-status watch
 Subscription helper: vpn-sub create/list/show/revoke/rotate
 Subscription URL shape: https://DOMAIN/s/<token>
+Bot export helper: vpn-bot-export audit/keys/emergency/fingerprint
+Upgrade invariant: existing Xray clients, Hysteria users, AWG peers, client files, and subscription bundles remain byte-for-byte unchanged
 ```
 
 ### 0.0.1 Two-stage installer flow
@@ -120,6 +123,56 @@ no external JS, CDN, forms, login, admin, cookies, analytics
 install reports must mention feature paths and URL shape only, never tokens or client secrets
 revoke removes nginx-served files and disables protocol credentials
 rotate revokes old files/credentials and creates a fresh token plus fresh protocol credentials
+```
+
+### 0.0.3 Bot export and migration readiness
+
+`vpn-seller-lite` is the current bot integration target. Its v1 import/emergency flows are AWG-only, so Golden VPN must export AmneziaWG `.conf` inventory for the bot and keep Trojan/Hysteria2 in Golden subscription bundles.
+
+Required helper:
+
+```text
+vpn-bot-export audit --out /root/vpn-keys/bot-export/server-audit.json
+vpn-bot-export keys --plan plan_30 --out /root/vpn-keys/bot-export/keys.sqlite
+vpn-bot-export emergency --map /root/vpn-migration/map.csv --out /root/vpn-keys/bot-export/emergency.sqlite
+vpn-bot-export fingerprint /root/vpn-keys/awg/AWG-US-phone1.conf
+```
+
+Bot import bundle schema:
+
+```sql
+CREATE TABLE keys (
+  plan_code TEXT NOT NULL,
+  conf_text TEXT NOT NULL,
+  external_ref TEXT,
+  comment TEXT,
+  expires_at TEXT
+);
+```
+
+Bot emergency bundle schema:
+
+```sql
+CREATE TABLE emergency_replacements (
+  old_key_fingerprint TEXT,
+  old_conf_text TEXT,
+  new_conf_text TEXT NOT NULL,
+  plan_code TEXT,
+  new_external_ref TEXT,
+  new_comment TEXT,
+  expires_at TEXT
+);
+```
+
+Security and migration rules:
+
+```text
+audit JSON must never include private keys or full config bodies
+SQLite key/emergency bundles do contain client configs and must be root-only 0600
+export output root is /root/vpn-keys/bot-export with 0700 directory permissions
+old_key_fingerprint is preferred for emergency mappings; old_conf_path may be used locally to derive it
+the bot database remains the source of truth for issued users/orders
+current audited migration keeps USA, France, and Estonia; Sweden and Netherlands are retired only after confirmed user moves
 ```
 
 ### 0.1 Текущее состояние

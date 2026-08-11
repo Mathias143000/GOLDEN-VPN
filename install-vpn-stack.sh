@@ -8,6 +8,8 @@ export APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND:-none}"
 
 : "${APT_LOCK_TIMEOUT:=1800}"
 
+GOLDEN_VPN_VERSION="2026.08.11"
+
 STACK_DIR="/opt/vpn-stack"
 KEY_DIR="/root/vpn-keys"
 XRAY_DIR="${STACK_DIR}/xray"
@@ -35,9 +37,17 @@ INSTALL_PROGRESS_FILE="${LOG_DIR}/install-progress.env"
 INSTALL_STATUS_HELPER="/usr/local/bin/vpn-install-status"
 INSTALL_REPORT_TXT="${KEY_DIR}/install-report.txt"
 INSTALL_REPORT_JSON="${KEY_DIR}/install-report.json"
+UPGRADE_BACKUP_ROOT="${KEY_DIR}/upgrade-backups"
+UPGRADE_REPORT="${KEY_DIR}/upgrade-report.json"
+INSTALLER_VERSION_FILE="${STACK_DIR}/installer-version.txt"
 DECOY_MANIFEST="${STACK_DIR}/decoy-manifest.json"
 AWG_TUNING_REPORT="${STACK_DIR}/awg-tuning-report.json"
+AWG_CONFIG="/etc/amnezia/amneziawg/awg0.conf"
 AWG_DEFAULT_PORT=51820
+BOOTSTRAP_MIN_FREE_MB=1024
+INSTALL_MIN_FREE_MB=5120
+UPGRADE_MIN_FREE_MB=256
+MIN_FREE_INODE_PERCENT=5
 INSTALL_TOTAL_STEPS=25
 INSTALL_STEP=0
 PUBLIC_IPV4=""
@@ -57,6 +67,7 @@ BASE_PACKAGES=(
   qrencode
   ufw
   lsb-release
+  logrotate
   gnupg
   iptables
   iproute2
@@ -155,6 +166,36 @@ wait_for_package_locks() {
 apt_get() {
   wait_for_package_locks
   apt-get -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT:-1800}" "$@"
+}
+
+root_free_mb() {
+  df -Pk / | awk 'NR == 2 {print int($4 / 1024)}'
+}
+
+root_free_inode_percent() {
+  df -Pi / | awk 'NR == 2 {gsub(/%/, "", $5); print 100 - $5}'
+}
+
+require_install_storage() {
+  local required_mb="$1" stage="$2" free_mb free_inode_percent
+  free_mb="$(root_free_mb)"
+  free_inode_percent="$(root_free_inode_percent)"
+
+  if [[ ! "${free_mb}" =~ ^[0-9]+$ ]] || [[ ! "${free_inode_percent}" =~ ^[0-9]+$ ]]; then
+    die "Could not determine free disk space and inode capacity on /."
+  fi
+
+  if ((free_mb < required_mb)); then
+    storage_hint /
+    die "${stage} requires at least ${required_mb} MB free on /; only ${free_mb} MB is available. Clean logs/cache or enlarge the disk, then retry."
+  fi
+
+  if ((free_inode_percent < MIN_FREE_INODE_PERCENT)); then
+    storage_hint /
+    die "${stage} requires at least ${MIN_FREE_INODE_PERCENT}% free inodes on /; only ${free_inode_percent}% is available."
+  fi
+
+  log "Storage gate passed for ${stage}: ${free_mb} MB and ${free_inode_percent}% inodes free on /."
 }
 
 progress() {
@@ -296,7 +337,7 @@ prompt_required_var() {
     value="$(trim_value "${value}")"
     if [[ -n "${value}" ]]; then
       printf -v "${var}" '%s' "${value}"
-      export "${var}"
+      export "${var?}"
       return 0
     fi
 
@@ -364,7 +405,7 @@ prompt_optional_var() {
   value="$(trim_value "${value}")"
   [[ -n "${value}" ]] || value="${default_value}"
   printf -v "${var}" '%s' "${value}"
-  export "${var}"
+  export "${var?}"
 }
 
 prompt_advanced_tuning() {
@@ -1028,7 +1069,7 @@ EOF
       exit 0
     fi
 
-    if [[ "${mode}" == "prompt" && "${DKMS_KERNEL_REBOOT_PROMPTED}" != "1" && reboot_prompt_enabled ]]; then
+    if [[ "${mode}" == "prompt" && "${DKMS_KERNEL_REBOOT_PROMPTED}" != "1" ]] && reboot_prompt_enabled; then
       DKMS_KERNEL_REBOOT_PROMPTED=1
       if prompt_yes_no "Reboot now and resume installer once after boot?"; then
         schedule_resume_install_once
@@ -2164,7 +2205,7 @@ detect_awg_auto_mtu() {
 
   for target in "${targets[@]}"; do
     for payload in 1372 1352 1332 1312 1292 1272 1252 1232 1212 1172; do
-      if ping -4 -c 1 -W 1 -M do -s "${payload}" "${target}" >/dev/null 2>&1; then
+      if ping -4 -c 1 -W 1 -M 'do' -s "${payload}" "${target}" >/dev/null 2>&1; then
         ((payload > best)) && best="${payload}"
         break
       fi
@@ -3867,6 +3908,400 @@ EOF
   chmod 0755 /usr/local/bin/vpn-sub
 }
 
+install_helper_bot_export() {
+  cat >/usr/local/bin/vpn-bot-export <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  vpn-bot-export audit --out /root/vpn-keys/bot-export/server-audit.json
+  vpn-bot-export keys --plan plan_30 --out /root/vpn-keys/bot-export/keys.sqlite
+  vpn-bot-export emergency --map /root/vpn-migration/map.csv --out /root/vpn-keys/bot-export/emergency.sqlite
+  vpn-bot-export fingerprint /root/vpn-keys/awg/AWG-US-phone1.conf
+
+Options:
+  --source DIR       AWG config source directory for audit/keys, default /root/vpn-keys/awg
+  --plan CODE        Bot plan code for keys export, or fallback plan for emergency rows
+  --out FILE         Output JSON/SQLite file
+  --map FILE         CSV map for emergency export
+  --expires-at ISO   Optional expires_at value for keys export
+  --comment TEXT     Optional comment for keys export
+
+Emergency CSV columns:
+  client_name,old_key_fingerprint,old_conf_path,new_conf_path,plan_code,new_external_ref,new_comment,expires_at
+
+Bot compatibility:
+  keys.sqlite table: keys(plan_code, conf_text, external_ref, comment, expires_at)
+  emergency.sqlite table: emergency_replacements(old_key_fingerprint, old_conf_text, new_conf_text, plan_code, new_external_ref, new_comment, expires_at)
+USAGE
+}
+
+if [[ "${EUID}" -ne 0 && "${VPN_BOT_EXPORT_ALLOW_NON_ROOT:-0}" != "1" ]]; then
+  die "Run as root, or set VPN_BOT_EXPORT_ALLOW_NON_ROOT=1 for local tests only."
+fi
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" || $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+python3 - "$@" <<'PY'
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+STACK_DIR = Path("/opt/vpn-stack")
+KEY_ROOT = Path("/root/vpn-keys")
+AWG_DIR = KEY_ROOT / "awg"
+EXPORT_DIR = KEY_ROOT / "bot-export"
+
+
+def fail(message: str) -> None:
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def ensure_private_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+
+
+def write_json(path: Path, payload: dict) -> None:
+    ensure_private_parent(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+def connect_sqlite_out(path: Path) -> tuple[sqlite3.Connection, Path]:
+    ensure_private_parent(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    if tmp.exists():
+        tmp.unlink()
+    return sqlite3.connect(tmp), tmp
+
+
+def finish_sqlite(connection: sqlite3.Connection, tmp: Path, out: Path) -> None:
+    connection.commit()
+    connection.close()
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, out)
+    os.chmod(out, 0o600)
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        fail(f"{path} is not valid UTF-8: {exc}")
+    except OSError as exc:
+        fail(f"Cannot read {path}: {exc}")
+
+
+def normalize_conf_text(value: str) -> str:
+    text = value.replace("\r\n", "\n").replace("\r", "\n").strip("\ufeff \t\r\n")
+    return "\n".join(line.rstrip() for line in text.split("\n"))
+
+
+def read_conf(path: Path) -> str:
+    if not path.is_file():
+        fail(f"Config file not found: {path}")
+    return normalize_conf_text(read_text(path))
+
+
+def fingerprint_text(conf_text: str) -> str:
+    return hashlib.sha256(normalize_conf_text(conf_text).encode("utf-8")).hexdigest()
+
+
+def read_optional(path: Path, default: str = "") -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return default
+
+
+def awg_files(source: Path) -> list[Path]:
+    if not source.is_dir():
+        fail(f"AWG source directory not found: {source}")
+    return sorted(path for path in source.iterdir() if path.is_file() and path.suffix == ".conf")
+
+
+def conf_value(conf_text: str, key: str) -> str | None:
+    prefix = f"{key} ="
+    for line in conf_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            return stripped.split("=", 1)[1].strip()
+    return None
+
+
+def server_location() -> str:
+    value = read_optional(STACK_DIR / "server-location.txt", "XX").upper()
+    if len(value) == 2 and value.isalpha() and value.isascii():
+        return value
+    return "XX"
+
+
+def default_external_ref(label: str) -> str:
+    return f"golden-vpn:{server_location()}:{label}"
+
+
+def key_rows(source: Path, plan: str, expires_at: str | None, comment: str | None) -> list[tuple[str, str, str, str | None, str | None]]:
+    if not plan:
+        fail("--plan is required for keys export")
+    rows = []
+    for path in awg_files(source):
+        conf = read_conf(path)
+        label = path.stem
+        rows.append((plan, conf, default_external_ref(label), comment or f"Golden VPN AWG {label}", expires_at))
+    if not rows:
+        fail(f"No .conf files found in {source}")
+    return rows
+
+
+def command_keys(args: argparse.Namespace) -> None:
+    out = Path(args.out or EXPORT_DIR / "keys.sqlite")
+    rows = key_rows(Path(args.source), args.plan, args.expires_at, args.comment)
+    connection, tmp = connect_sqlite_out(out)
+    try:
+        connection.execute(
+            "CREATE TABLE export_meta (format_version TEXT NOT NULL, exported_at TEXT NOT NULL, source TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO export_meta(format_version, exported_at, source) VALUES (?, ?, ?)",
+            ("vpn-seller-lite.keys.v1", now_iso(), "golden-vpn"),
+        )
+        connection.execute(
+            """
+            CREATE TABLE keys (
+              plan_code TEXT NOT NULL,
+              conf_text TEXT NOT NULL,
+              external_ref TEXT,
+              comment TEXT,
+              expires_at TEXT
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO keys(plan_code, conf_text, external_ref, comment, expires_at) VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        finish_sqlite(connection, tmp, out)
+    except Exception:
+        connection.close()
+        if tmp.exists():
+            tmp.unlink()
+        raise
+    print(f"Exported {len(rows)} AWG configs: {out}")
+    print("Import in vpn-seller-lite with /admin_import.")
+
+
+def command_audit(args: argparse.Namespace) -> None:
+    source = Path(args.source)
+    out = Path(args.out or EXPORT_DIR / "server-audit.json")
+    domain = read_optional(STACK_DIR / "domain.txt", "unknown")
+    location = server_location()
+    params = {}
+    params_path = STACK_DIR / "awg-params.env"
+    if params_path.exists():
+        for line in read_text(params_path).splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                key, value = line.split("=", 1)
+                if key.startswith("AWG_"):
+                    params[key] = value.strip().strip('"').strip("'")
+    report_path = KEY_ROOT / "install-report.json"
+    report_status = {"path": str(report_path), "exists": report_path.exists()}
+    if report_path.exists():
+        try:
+            report_json = json.loads(read_text(report_path))
+            report_status["generated_at"] = report_json.get("generated_at")
+        except Exception as exc:
+            report_status["error"] = str(exc)
+
+    keys = []
+    for path in awg_files(source):
+        conf = read_conf(path)
+        keys.append(
+            {
+                "label": path.stem,
+                "path": str(path),
+                "fingerprint": fingerprint_text(conf),
+                "address": conf_value(conf, "Address"),
+                "endpoint": conf_value(conf, "Endpoint"),
+                "mtime": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+            }
+        )
+    payload = {
+        "format_version": "golden-vpn.bot-audit.v1",
+        "generated_at": now_iso(),
+        "domain": domain,
+        "server_location": location,
+        "awg": {
+            "source_dir": str(source),
+            "endpoint_port": params.get("AWG_ENDPOINT_PORT", "51820"),
+            "profile": params.get("AWG_OBFS_PROFILE", "unknown"),
+            "mtu": params.get("AWG_MTU", "unknown"),
+            "key_count": len(keys),
+            "keys": keys,
+        },
+        "install_report": report_status,
+        "notes": "No private keys or config bodies are included in this audit JSON.",
+    }
+    write_json(out, payload)
+    print(f"Audit written: {out}")
+    print(f"AWG key count: {len(keys)}")
+
+
+def require_csv_columns(fieldnames: list[str] | None, required: set[str], source: Path) -> None:
+    if not fieldnames:
+        fail(f"CSV has no header: {source}")
+    missing = required - set(fieldnames)
+    if missing:
+        fail(f"CSV is missing required columns: {', '.join(sorted(missing))}")
+
+
+def command_emergency(args: argparse.Namespace) -> None:
+    source = Path(args.map)
+    out = Path(args.out or EXPORT_DIR / "emergency.sqlite")
+    if not source.is_file():
+        fail(f"CSV map not found: {source}")
+    rows = []
+    with source.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        require_csv_columns(reader.fieldnames, {"new_conf_path"}, source)
+        for row_number, row in enumerate(reader, start=2):
+            client_name = (row.get("client_name") or "").strip()
+            old_fingerprint = (row.get("old_key_fingerprint") or "").strip()
+            old_conf_path = (row.get("old_conf_path") or "").strip()
+            new_conf_path = (row.get("new_conf_path") or "").strip()
+            if not new_conf_path:
+                fail(f"Row {row_number}: new_conf_path is required")
+            if not old_fingerprint:
+                if not old_conf_path:
+                    fail(f"Row {row_number}: old_key_fingerprint or old_conf_path is required")
+                old_fingerprint = fingerprint_text(read_conf(Path(old_conf_path)))
+            new_conf = read_conf(Path(new_conf_path))
+            plan_code = (row.get("plan_code") or args.plan or "").strip() or None
+            new_external_ref = (row.get("new_external_ref") or "").strip()
+            if not new_external_ref:
+                new_external_ref = default_external_ref(Path(new_conf_path).stem)
+            new_comment = (row.get("new_comment") or "").strip()
+            if not new_comment:
+                new_comment = f"Golden VPN emergency replacement {client_name or Path(new_conf_path).stem}"
+            expires_at = (row.get("expires_at") or "").strip() or None
+            rows.append((old_fingerprint, None, new_conf, plan_code, new_external_ref, new_comment, expires_at))
+    if not rows:
+        fail(f"CSV map has no rows: {source}")
+
+    connection, tmp = connect_sqlite_out(out)
+    try:
+        connection.execute(
+            "CREATE TABLE export_meta (format_version TEXT NOT NULL, exported_at TEXT NOT NULL, source TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO export_meta(format_version, exported_at, source) VALUES (?, ?, ?)",
+            ("vpn-seller-lite.emergency.v1", now_iso(), "golden-vpn"),
+        )
+        connection.execute(
+            """
+            CREATE TABLE emergency_replacements (
+              old_key_fingerprint TEXT,
+              old_conf_text TEXT,
+              new_conf_text TEXT NOT NULL,
+              plan_code TEXT,
+              new_external_ref TEXT,
+              new_comment TEXT,
+              expires_at TEXT
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO emergency_replacements(
+              old_key_fingerprint, old_conf_text, new_conf_text, plan_code,
+              new_external_ref, new_comment, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        finish_sqlite(connection, tmp, out)
+    except Exception:
+        connection.close()
+        if tmp.exists():
+            tmp.unlink()
+        raise
+    print(f"Exported {len(rows)} emergency replacements: {out}")
+    print("Apply in vpn-seller-lite with /admin_emergency.")
+
+
+def command_fingerprint(args: argparse.Namespace) -> None:
+    print(fingerprint_text(read_conf(Path(args.conf_path))))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="vpn-bot-export", add_help=True)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    audit = sub.add_parser("audit", help="write a secret-free server audit JSON")
+    audit.add_argument("--source", default=str(AWG_DIR))
+    audit.add_argument("--out", default=str(EXPORT_DIR / "server-audit.json"))
+    audit.set_defaults(func=command_audit)
+
+    keys = sub.add_parser("keys", help="export AWG configs as vpn-seller-lite keys.sqlite")
+    keys.add_argument("--source", default=str(AWG_DIR))
+    keys.add_argument("--plan", required=True)
+    keys.add_argument("--out", default=str(EXPORT_DIR / "keys.sqlite"))
+    keys.add_argument("--expires-at")
+    keys.add_argument("--comment")
+    keys.set_defaults(func=command_keys)
+
+    emergency = sub.add_parser("emergency", help="export vpn-seller-lite emergency replacement bundle")
+    emergency.add_argument("--map", required=True)
+    emergency.add_argument("--plan")
+    emergency.add_argument("--out", default=str(EXPORT_DIR / "emergency.sqlite"))
+    emergency.set_defaults(func=command_emergency)
+
+    fingerprint = sub.add_parser("fingerprint", help="print bot-compatible config fingerprint")
+    fingerprint.add_argument("conf_path")
+    fingerprint.set_defaults(func=command_fingerprint)
+    return parser
+
+
+def main(argv: list[str]) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+PY
+EOF
+  chmod 0755 /usr/local/bin/vpn-bot-export
+}
+
 install_helper_help() {
   cat >/usr/local/bin/vpn-help <<'EOF'
 #!/usr/bin/env bash
@@ -3959,6 +4394,7 @@ print_menu() {
   menu_item 8 "Service health" "systemd checks"
   menu_item 9 "Grafana access" "SSH tunnel and dashboard 1860"
   menu_item 10 "Decoy and public URLs" "site and subscription URL shapes"
+  menu_item 11 "Bot export" "AWG SQLite bundles for vpn-seller-lite"
   printf '\n%sNo prompt is shown on login; this menu is printed and your shell stays usable.%s\n' "${yellow}" "${reset}"
 }
 
@@ -4167,6 +4603,28 @@ Install reports never print subscription tokens or client secrets.
 HELP
 }
 
+topic_bot_export() {
+  cat <<'HELP'
+11. Bot export
+
+Export AWG configs into vpn-seller-lite SQLite bundles.
+
+Secret-free server audit:
+  vpn-bot-export audit --out /root/vpn-keys/bot-export/server-audit.json
+
+Importable stock bundle:
+  vpn-bot-export keys --plan plan_30 --out /root/vpn-keys/bot-export/keys.sqlite
+
+Emergency replacement bundle:
+  vpn-bot-export emergency --map /root/vpn-migration/map.csv --out /root/vpn-keys/bot-export/emergency.sqlite
+
+Config fingerprint:
+  vpn-bot-export fingerprint /root/vpn-keys/awg/AWG-US-phone1.conf
+
+The bot v1 import format is AWG-only. Trojan and Hysteria remain in Golden subscription bundles.
+HELP
+}
+
 topic="${1:-menu}"
 name="${2:-}"
 
@@ -4208,6 +4666,9 @@ case "${topic}" in
   10|decoy|urls|public)
     topic_public_urls
     ;;
+  11|bot|export|bot-export|migration)
+    topic_bot_export
+    ;;
   *)
     print_menu >&2
     echo >&2
@@ -4226,6 +4687,7 @@ install_helpers() {
   install_helper_hysteria
   install_helper_awg
   install_helper_subscriptions
+  install_helper_bot_export
   install_helper_help
   install_shell_startup_hook
 }
@@ -4310,14 +4772,76 @@ EOF
   fi
 }
 
+set_ini_section_value() {
+  local file="$1" section="$2" key="$3" value="$4" tmp
+  [[ -f "${file}" ]] || return 0
+  tmp="$(mktemp "${file}.XXXXXX")"
+  awk -v target="${section}" -v key="${key}" -v value="${value}" '
+    BEGIN {in_target=0; section_seen=0; key_seen=0}
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+      if (in_target && !key_seen) print key " = " value
+      header=$0
+      gsub(/^[[:space:]]*\[/, "", header)
+      gsub(/\][[:space:]]*$/, "", header)
+      in_target=(header == target)
+      if (in_target) {section_seen=1; key_seen=0}
+      print
+      next
+    }
+    in_target {
+      candidate=$0
+      sub(/^[[:space:];#]*/, "", candidate)
+      if (candidate ~ ("^" key "[[:space:]]*=")) {
+        if (!key_seen) print key " = " value
+        key_seen=1
+        next
+      }
+    }
+    {print}
+    END {
+      if (in_target && !key_seen) print key " = " value
+      if (!section_seen) {
+        print ""
+        print "[" target "]"
+        print key " = " value
+      }
+    }
+  ' "${file}" >"${tmp}"
+  cat "${tmp}" >"${file}"
+  chmod 0640 "${file}"
+  rm -f "${tmp}"
+}
+
+ensure_logrotate_path_maxsize() {
+  local file="$1" path_pattern="$2" value="$3" tmp
+  [[ -f "${file}" ]] || return 0
+  tmp="$(mktemp "${file}.XXXXXX")"
+  awk -v path_pattern="${path_pattern}" -v value="${value}" '
+    BEGIN {in_target=0; maxsize_seen=0}
+    $0 ~ path_pattern {in_target=1; maxsize_seen=0}
+    in_target && /^[[:space:]]*maxsize[[:space:]]+/ {maxsize_seen=1}
+    in_target && /^[[:space:]]*}[[:space:]]*$/ {
+      if (!maxsize_seen) print "    maxsize " value
+      in_target=0
+    }
+    {print}
+  ' "${file}" >"${tmp}"
+  install -m 0644 "${tmp}" "${file}"
+  rm -f "${tmp}"
+}
+
 configure_log_limits() {
   log "Configuring log retention limits."
-  install -d -m 0755 /etc/systemd/journald.conf.d "${LOG_DIR}"
+  install -d -m 0755 \
+    /etc/systemd/journald.conf.d \
+    /etc/systemd/system/logrotate.timer.d \
+    "${LOG_DIR}"
   cat >/etc/systemd/journald.conf.d/limits.conf <<'EOF'
 [Journal]
 SystemMaxUse=200M
 SystemMaxFileSize=50M
 MaxRetentionSec=7day
+Compress=yes
 EOF
   chmod 0644 /etc/systemd/journald.conf.d/limits.conf
 
@@ -4329,16 +4853,15 @@ EOF
     copytruncate
     missingok
     notifempty
+    su root root
 }
 EOF
   chmod 0644 /etc/logrotate.d/vpn-stack
 
-  if [[ -f /etc/logrotate.d/rsyslog ]] && ! grep -q 'maxsize 50M' /etc/logrotate.d/rsyslog; then
-    sed -i '/^[[:space:]]*weekly[[:space:]]*$/a\    maxsize 50M' /etc/logrotate.d/rsyslog
-  fi
+  ensure_logrotate_path_maxsize /etc/logrotate.d/rsyslog '^[[:space:]]*/var/log/syslog([[:space:]]|$)' 50M
 
   cat >/etc/logrotate.d/grafana-server <<'EOF'
-/var/log/grafana/*.log /var/log/grafana/*.log.* {
+/var/log/grafana/grafana.log {
     daily
     rotate 3
     maxsize 20M
@@ -4351,6 +4874,102 @@ EOF
 }
 EOF
   chmod 0644 /etc/logrotate.d/grafana-server
+
+  if [[ -f /etc/grafana/grafana.ini ]]; then
+    set_ini_section_value /etc/grafana/grafana.ini log.file max_lines 100000
+    set_ini_section_value /etc/grafana/grafana.ini log.file max_size_shift 24
+    set_ini_section_value /etc/grafana/grafana.ini log.file daily_rotation true
+    set_ini_section_value /etc/grafana/grafana.ini log.file max_days 3
+  fi
+
+  cat >/etc/logrotate.d/golden-vpn-external-logs <<'EOF'
+/var/log/x-ui/*.log {
+    size 20M
+    rotate 3
+    compress
+    copytruncate
+    missingok
+    notifempty
+    su root root
+}
+
+/var/lib/docker/containers/*/*-json.log {
+    size 20M
+    rotate 3
+    compress
+    copytruncate
+    missingok
+    notifempty
+    su root root
+}
+EOF
+  chmod 0644 /etc/logrotate.d/golden-vpn-external-logs
+
+  cat >/etc/systemd/system/logrotate.timer.d/golden-vpn.conf <<'EOF'
+[Timer]
+OnCalendar=
+OnCalendar=hourly
+RandomizedDelaySec=5m
+Persistent=true
+EOF
+  chmod 0644 /etc/systemd/system/logrotate.timer.d/golden-vpn.conf
+
+  cat >/usr/local/sbin/vpn-storage-maintenance.sh <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+journalctl --rotate >/dev/null 2>&1 || true
+journalctl --vacuum-size=200M --vacuum-time=7d >/dev/null 2>&1 || true
+apt-get clean >/dev/null 2>&1 || true
+
+if [[ -d /var/log/grafana ]]; then
+  find /var/log/grafana -xdev -maxdepth 1 -type f \
+    -name 'grafana.log.*' -mtime +3 -delete 2>/dev/null || true
+fi
+
+usage="$(df -P / | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')"
+if [[ "${usage}" =~ ^[0-9]+$ ]] && ((usage >= 90)); then
+  logger -p daemon.warning -t vpn-storage-maintenance \
+    "root filesystem usage is ${usage}%; forcing bounded log rotation"
+  journalctl --vacuum-size=100M >/dev/null 2>&1 || true
+  logrotate --force /etc/logrotate.d/golden-vpn-external-logs >/dev/null 2>&1 || true
+  logrotate --force /etc/logrotate.d/grafana-server >/dev/null 2>&1 || true
+  logrotate /etc/logrotate.d/rsyslog >/dev/null 2>&1 || true
+fi
+EOF
+  chmod 0755 /usr/local/sbin/vpn-storage-maintenance.sh
+
+  cat >/etc/systemd/system/vpn-storage-maintenance.service <<'EOF'
+[Unit]
+Description=Golden VPN bounded log and cache maintenance
+After=local-fs.target systemd-journald.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpn-storage-maintenance.sh
+EOF
+  chmod 0644 /etc/systemd/system/vpn-storage-maintenance.service
+
+  cat >/etc/systemd/system/vpn-storage-maintenance.timer <<'EOF'
+[Unit]
+Description=Run Golden VPN storage maintenance hourly
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+Persistent=true
+Unit=vpn-storage-maintenance.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 0644 /etc/systemd/system/vpn-storage-maintenance.timer
+
+  journalctl --rotate >/dev/null 2>&1 || true
+  journalctl --vacuum-size=200M --vacuum-time=7d >/dev/null 2>&1 || true
+  logrotate /etc/logrotate.d/golden-vpn-external-logs >/dev/null 2>&1 || true
+  logrotate /etc/logrotate.d/grafana-server >/dev/null 2>&1 || true
+  logrotate /etc/logrotate.d/rsyslog >/dev/null 2>&1 || true
 }
 
 configure_timers() {
@@ -4395,6 +5014,8 @@ log_file="/var/log/vpn-stack-healthcheck.log"
 services=(
   nginx
   xray-trojan-xhttp-tls
+  xray-vless-xhttp-tls
+  xray-vless-reality-xhttp
   hysteria2
   prometheus
   prometheus-node-exporter
@@ -4405,6 +5026,7 @@ services=(
 
 printf '%s healthcheck start\n' "$(date -Is)" >>"${log_file}"
 for svc in "${services[@]}"; do
+  systemctl cat "${svc}.service" >/dev/null 2>&1 || continue
   if ! systemctl is-active --quiet "${svc}"; then
     printf '%s restarting %s\n' "$(date -Is)" "${svc}" >>"${log_file}"
     systemctl restart "${svc}" >>"${log_file}" 2>&1 || true
@@ -4453,6 +5075,8 @@ enable_and_start_services() {
   systemctl enable prometheus
   systemctl enable prometheus-node-exporter
   systemctl enable grafana-server
+  systemctl enable logrotate.timer
+  systemctl enable vpn-storage-maintenance.timer
   systemctl enable vpn-soft-reboot.timer
   systemctl enable vpn-stack-healthcheck.timer
 
@@ -4465,6 +5089,8 @@ enable_and_start_services() {
   systemctl restart prometheus
   systemctl restart prometheus-node-exporter
   systemctl restart grafana-server
+  systemctl restart logrotate.timer
+  systemctl restart vpn-storage-maintenance.timer
   systemctl restart vpn-soft-reboot.timer
   systemctl restart vpn-stack-healthcheck.timer
 }
@@ -4663,7 +5289,11 @@ EOF
 
 Storage limits:
   journald: /etc/systemd/journald.conf.d/limits.conf
-  logrotate: /etc/logrotate.d/vpn-stack
+  VPN logs: /etc/logrotate.d/vpn-stack
+  Docker/x-ui logs: /etc/logrotate.d/golden-vpn-external-logs
+  Grafana logs: native 16MB rotation / 3 days plus logrotate fallback
+  Maintenance: vpn-storage-maintenance.timer
+  Logrotate schedule: hourly
   Prometheus retention: 7d / 1GB
 
 Initial client files:
@@ -4684,6 +5314,12 @@ Subscription bundles:
   AmneziaWG download: https://${DOMAIN}/s/<token>/awg.conf
   Metadata root: ${SUBSCRIPTION_DIR}
   Public root: ${SUBSCRIPTION_WEB_DIR}
+
+Bot export for vpn-seller-lite:
+  Audit: vpn-bot-export audit --out ${KEY_DIR}/bot-export/server-audit.json
+  Stock: vpn-bot-export keys --plan plan_30 --out ${KEY_DIR}/bot-export/keys.sqlite
+  Emergency: vpn-bot-export emergency --map /root/vpn-migration/map.csv --out ${KEY_DIR}/bot-export/emergency.sqlite
+  Output root: ${KEY_DIR}/bot-export
 
   vpn-help
 
@@ -4781,6 +5417,14 @@ generate_install_report() {
     "url_shape": $(json_escape "https://${DOMAIN:-DOMAIN}/s/<token>"),
     "payload": "sub.txt contains Trojan and Hysteria2 links; awg.conf is downloadable separately",
     "token_policy": "unguessable per-subscription tokens are never included in install reports"
+  },
+  "bot_export": {
+    "helper": "vpn-bot-export",
+    "output_root": $(json_escape "${KEY_DIR}/bot-export"),
+    "stock_bundle": $(json_escape "${KEY_DIR}/bot-export/keys.sqlite"),
+    "emergency_bundle": $(json_escape "${KEY_DIR}/bot-export/emergency.sqlite"),
+    "audit_json": $(json_escape "${KEY_DIR}/bot-export/server-audit.json"),
+    "bot_contract": "vpn-seller-lite AWG-only SQLite v1; reports never include client config bodies"
   }
 }
 EOF
@@ -4833,6 +5477,12 @@ validate_stack() {
   check_pass "prometheus active" systemctl is-active --quiet prometheus
   check_pass "node exporter active" systemctl is-active --quiet prometheus-node-exporter
   check_pass "grafana active" systemctl is-active --quiet grafana-server
+  check_pass "hourly logrotate timer active" systemctl is-active --quiet logrotate.timer
+  check_pass "storage maintenance timer active" systemctl is-active --quiet vpn-storage-maintenance.timer
+  check_pass "journald capped at 200M" grep -Eq '^SystemMaxUse=200M$' /etc/systemd/journald.conf.d/limits.conf
+  check_pass "logrotate configuration valid" logrotate --debug /etc/logrotate.conf
+  # shellcheck disable=SC2016
+  check_pass "root filesystem usage below 95%" bash -c 'usage=$(df -P / | awk '\''NR == 2 {gsub(/%/, "", $5); print $5}'\''); [[ "$usage" =~ ^[0-9]+$ ]] && ((usage < 95))'
   check_pass "decoy forbidden-word scan" scan_decoy_tree /var/www/decoy
   check_pass "certificate readable" openssl x509 -in "${CERT_DIR}/fullchain.pem" -noout
   check_pass "private key readable" openssl pkey -in "${CERT_DIR}/privkey.pem" -noout
@@ -4885,6 +5535,7 @@ bootstrap_install() {
 
   progress "Clearing stale one-time resume state"
   [[ "${EUID}" -eq 0 ]] || die "Run this script as root."
+  require_install_storage "${BOOTSTRAP_MIN_FREE_MB}" "Bootstrap"
   cleanup_resume_install_state
 
   progress "Collecting installer variables"
@@ -4912,9 +5563,292 @@ bootstrap_install() {
   exit 0
 }
 
+detect_installed_xray_protocol() {
+  local config="${XRAY_DIR}/config.json"
+
+  if [[ -s "${config}" ]] && jq -e . "${config}" >/dev/null 2>&1; then
+    if jq -e '[.inbounds[]?.protocol] | index("trojan") != null' "${config}" >/dev/null; then
+      printf 'trojan\n'
+      return 0
+    fi
+    if jq -e '[.inbounds[]?.protocol] | index("vless") != null' "${config}" >/dev/null; then
+      printf 'vless\n'
+      return 0
+    fi
+  fi
+
+  printf 'unknown\n'
+}
+
+upgrade_profile_roots() {
+  local path
+  local -a candidates=(
+    "${XRAY_DIR}"
+    "${STACK_DIR}/trojan-xhttp-password.txt"
+    "${STACK_DIR}/trojan-xhttp-path.txt"
+    "${STACK_DIR}/vless-xhttp-uuid.txt"
+    "${STACK_DIR}/vless-xhttp-path.txt"
+    "${STACK_DIR}/vless-reality-uuid.txt"
+    "${STACK_DIR}/vless-reality-path.txt"
+    "${HYSTERIA_DIR}"
+    "${STACK_DIR}/hysteria-clients.json"
+    "${STACK_DIR}/hysteria-auth.txt"
+    "${STACK_DIR}/hysteria-obfs.txt"
+    "${AWG_CONFIG}"
+    "${KEY_DIR}/trojan"
+    "${KEY_DIR}/vless"
+    "${KEY_DIR}/vless-xhttp"
+    "${KEY_DIR}/vless-reality"
+    "${KEY_DIR}/hysteria"
+    "${KEY_DIR}/awg"
+    "${SUBSCRIPTION_DIR}"
+    "${SUBSCRIPTION_WEB_DIR}"
+  )
+
+  for path in "${candidates[@]}"; do
+    [[ -e "${path}" ]] || continue
+    printf '%s\n' "${path#/}"
+  done
+}
+
+write_upgrade_profile_manifest() {
+  local output="$1" tmp file sum peer_count
+  tmp="$(mktemp "${output}.XXXXXX")"
+
+  {
+    printf 'manifest_version\t1\n'
+    printf 'xray_protocol\t%s\n' "$(detect_installed_xray_protocol)"
+
+    if [[ -s "${XRAY_DIR}/config.json" ]]; then
+      jq -r '
+        .inbounds[]? as $inbound
+        | ($inbound.settings.clients // [])[]
+        | ["xray_client", ($inbound.protocol // "unknown"), (.email // "(unlabelled)")]
+        | @tsv
+      ' "${XRAY_DIR}/config.json" 2>/dev/null | LC_ALL=C sort
+    fi
+
+    if [[ -s "${STACK_DIR}/hysteria-clients.json" ]]; then
+      jq -r '
+        if type == "object" then
+          keys[] | ["hysteria_client", .] | @tsv
+        else empty end
+      ' "${STACK_DIR}/hysteria-clients.json" 2>/dev/null | LC_ALL=C sort
+    fi
+
+    if [[ -s "${AWG_CONFIG}" ]]; then
+      peer_count="$(grep -Ec '^[[:space:]]*\[Peer\][[:space:]]*$' "${AWG_CONFIG}" || true)"
+      printf 'awg_peer_count\t%s\n' "${peer_count:-0}"
+    else
+      printf 'awg_peer_count\t0\n'
+    fi
+
+    while IFS= read -r -d '' file; do
+      sum="$(sha256sum -- "${file}" | awk '{print $1}')"
+      printf 'file\t%s\t%s\n' "${file#/}" "${sum}"
+    done < <(
+      while IFS= read -r root; do
+        if [[ -d "/${root}" ]]; then
+          find "/${root}" -xdev -type f -print0
+        elif [[ -f "/${root}" ]]; then
+          printf '%s\0' "/${root}"
+        fi
+      done < <(upgrade_profile_roots) | LC_ALL=C sort -z
+    )
+  } >"${tmp}"
+
+  install -m 0600 "${tmp}" "${output}"
+  rm -f "${tmp}"
+}
+
+manifest_record_count() {
+  local manifest="$1" record="$2"
+  awk -F '\t' -v record="${record}" '$1 == record {count++} END {print count + 0}' "${manifest}"
+}
+
+create_upgrade_backup() {
+  local stamp backup_dir roots_file archive
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  install -d -m 0700 "${UPGRADE_BACKUP_ROOT}"
+  backup_dir="$(mktemp -d "${UPGRADE_BACKUP_ROOT}/${stamp}.XXXXXX")"
+  chmod 0700 "${backup_dir}"
+  roots_file="${backup_dir}/profile-roots.txt"
+  archive="${backup_dir}/profiles.tar"
+
+  upgrade_profile_roots >"${roots_file}"
+  chmod 0600 "${roots_file}"
+  [[ -s "${roots_file}" ]] || die "No existing Golden VPN profile paths were found to back up."
+
+  tar -C / -cpf "${archive}" -T "${roots_file}"
+  tar -tf "${archive}" >/dev/null
+  sha256sum "${archive}" >"${archive}.sha256"
+  chmod 0600 "${archive}" "${archive}.sha256"
+  write_upgrade_profile_manifest "${backup_dir}/profiles.before.tsv"
+
+  printf '%s\n' "${backup_dir}"
+}
+
+upgrade_preflight() {
+  local protocol free_mb
+  [[ "${EUID}" -eq 0 ]] || die "Run upgrade as root."
+  [[ -d "${STACK_DIR}" ]] || die "${STACK_DIR} does not exist; use install for a clean server."
+  need_command jq
+  need_command tar
+  need_command sha256sum
+  load_installed_context
+
+  if [[ "${SERVER_LOCATION}" == "XX" ]]; then
+    if have_tty; then
+      unset SERVER_LOCATION
+      ensure_valid_server_location
+    else
+      die "SERVER_LOCATION is unknown. Export the two-letter location before upgrade, for example SERVER_LOCATION=FR."
+    fi
+  fi
+  [[ -n "${DOMAIN:-}" ]] || die "Installed DOMAIN could not be determined. Export DOMAIN before upgrade."
+
+  protocol="$(detect_installed_xray_protocol)"
+  [[ "${protocol}" != "unknown" ]] || die "Existing Xray protocol could not be identified safely."
+  [[ -s "${STACK_DIR}/hysteria-clients.json" ]] || die "Hysteria client registry is missing."
+  jq -e 'type == "object"' "${STACK_DIR}/hysteria-clients.json" >/dev/null \
+    || die "Hysteria client registry is not a JSON object."
+  [[ -s "${AWG_CONFIG}" ]] || die "AmneziaWG server config is missing."
+
+  free_mb="$(root_free_mb)"
+  [[ "${free_mb}" =~ ^[0-9]+$ ]] || die "Could not determine free disk space."
+  ((free_mb >= UPGRADE_MIN_FREE_MB)) \
+    || die "Upgrade requires at least ${UPGRADE_MIN_FREE_MB} MB free on /."
+
+  log "Upgrade preflight passed: protocol=${protocol}, domain=${DOMAIN:-unknown}, location=${SERVER_LOCATION}."
+  if [[ "${protocol}" == "vless" ]]; then
+    warn "Legacy VLESS detected. Upgrade will preserve it and will not install Trojan/subscription helpers."
+  fi
+}
+
+install_upgrade_helpers() {
+  local protocol
+  protocol="$(detect_installed_xray_protocol)"
+  log "Installing profile-preserving helper updates."
+
+  [[ -s "${AWG_CONFIG}" ]] && install_helper_awg
+  if [[ -s "${STACK_DIR}/hysteria-clients.json" ]]; then
+    install_helper_hysteria
+  fi
+  install_helper_bot_export
+
+  if [[ "${protocol}" == "trojan" ]]; then
+    install_helper_trojan
+    install_helper_subscriptions
+    install_helper_help
+  else
+    warn "Keeping existing VLESS and vpn-help commands unchanged on this legacy server."
+  fi
+
+  install_shell_startup_hook
+  install_resume_status_helper
+}
+
+apply_upgrade_overlay() {
+  install_upgrade_helpers
+
+  if [[ -d /etc/prometheus && -d /etc/grafana ]]; then
+    configure_monitoring
+  else
+    warn "Monitoring packages are incomplete; monitoring configuration was skipped."
+  fi
+
+  configure_log_limits
+  configure_timers
+  systemctl daemon-reload
+  systemctl restart systemd-journald || true
+  systemctl enable --now logrotate.timer vpn-storage-maintenance.timer
+  systemctl enable vpn-soft-reboot.timer vpn-stack-healthcheck.timer
+
+  if systemctl cat prometheus.service >/dev/null 2>&1; then
+    systemctl enable prometheus.service
+    systemctl restart prometheus.service
+  fi
+  if systemctl cat prometheus-node-exporter.service >/dev/null 2>&1; then
+    systemctl enable prometheus-node-exporter.service
+    systemctl restart prometheus-node-exporter.service
+  fi
+  if systemctl cat grafana-server.service >/dev/null 2>&1; then
+    systemctl enable grafana-server.service
+    systemctl restart grafana-server.service
+  fi
+}
+
+write_upgrade_report() {
+  local backup_dir="$1" before="$2" after="$3" protocol
+  protocol="$(detect_installed_xray_protocol)"
+  install -d -m 0700 "${KEY_DIR}"
+  cat >"${UPGRADE_REPORT}" <<EOF
+{
+  "version": $(json_escape "${GOLDEN_VPN_VERSION}"),
+  "upgraded_at": $(json_escape "$(date -Is)"),
+  "xray_protocol": $(json_escape "${protocol}"),
+  "profiles_preserved": true,
+  "backup_dir": $(json_escape "${backup_dir}"),
+  "counts": {
+    "xray": $(manifest_record_count "${before}" xray_client),
+    "hysteria": $(manifest_record_count "${before}" hysteria_client),
+    "awg": $(awk -F '\t' '$1 == "awg_peer_count" {print $2}' "${before}")
+  },
+  "before_manifest_sha256": $(json_escape "$(sha256sum "${before}" | awk '{print $1}')"),
+  "after_manifest_sha256": $(json_escape "$(sha256sum "${after}" | awk '{print $1}')")
+}
+EOF
+  chmod 0600 "${UPGRADE_REPORT}"
+}
+
+upgrade_existing_stack() {
+  local backup_dir before after
+  upgrade_preflight
+  backup_dir="$(create_upgrade_backup)"
+  before="${backup_dir}/profiles.before.tsv"
+  after="${backup_dir}/profiles.after.tsv"
+  log "Profile backup created: ${backup_dir}"
+
+  if ! (set -Eeuo pipefail; apply_upgrade_overlay); then
+    die "Upgrade overlay failed. VPN credentials were not intentionally changed; backup retained at ${backup_dir}."
+  fi
+
+  write_upgrade_profile_manifest "${after}"
+  if ! cmp -s "${before}" "${after}"; then
+    warn "Profile manifest changed during upgrade. No VPN service was restarted by the upgrade."
+    diff -u "${before}" "${after}" >"${backup_dir}/profiles.diff" || true
+    chmod 0600 "${backup_dir}/profiles.diff"
+    die "Profile preservation check failed. Inspect ${backup_dir}/profiles.diff and restore from profiles.tar if needed."
+  fi
+
+  printf '%s\n' "${GOLDEN_VPN_VERSION}" >"${INSTALLER_VERSION_FILE}"
+  printf '%s\n' "${SERVER_LOCATION}" >"${STACK_DIR}/server-location.txt"
+  chmod 0600 "${INSTALLER_VERSION_FILE}"
+  chmod 0600 "${STACK_DIR}/server-location.txt"
+  write_upgrade_report "${backup_dir}" "${before}" "${after}"
+  log "Upgrade complete. Existing profiles are byte-for-byte unchanged."
+  log "Upgrade report: ${UPGRADE_REPORT}"
+}
+
+upgrade_check() {
+  local tmp protocol
+  upgrade_preflight
+  protocol="$(detect_installed_xray_protocol)"
+  tmp="$(mktemp)"
+  write_upgrade_profile_manifest "${tmp}"
+  printf 'Golden VPN upgrade check\n'
+  printf 'Version: %s\n' "${GOLDEN_VPN_VERSION}"
+  printf 'Protocol: %s\n' "${protocol}"
+  printf 'Xray clients: %s\n' "$(manifest_record_count "${tmp}" xray_client)"
+  printf 'Hysteria clients: %s\n' "$(manifest_record_count "${tmp}" hysteria_client)"
+  printf 'AWG peers: %s\n' "$(awk -F '\t' '$1 == "awg_peer_count" {print $2}' "${tmp}")"
+  rm -f "${tmp}"
+}
+
 main() {
   progress "Checking input variables and kernel readiness"
   require_root_and_env
+  require_install_storage "${INSTALL_MIN_FREE_MB}" "Full installation"
   install_resume_status_helper
   prompt_advanced_tuning
   check_dkms_kernel_ready
@@ -4969,12 +5903,14 @@ main() {
   final_checks
   progress "Cleaning one-time resume state"
   cleanup_resume_install_state
+  printf '%s\n' "${GOLDEN_VPN_VERSION}" >"${INSTALLER_VERSION_FILE}"
+  chmod 0600 "${INSTALLER_VERSION_FILE}"
   progress "Installation complete"
   log "Golden VPN stack installation complete."
 }
 
 preflight_check() {
-  local failed=0
+  local failed=0 free_mb free_inode_percent
 
   pass() { printf 'PASS %s\n' "$1"; }
   fail() { printf 'FAIL %s\n' "$1"; failed=1; }
@@ -4991,6 +5927,30 @@ preflight_check() {
   if command -v curl >/dev/null 2>&1; then pass "curl is available"; else fail "curl is missing"; fi
   if command -v jq >/dev/null 2>&1; then pass "jq is available"; else warn_check "jq is not installed yet; installer will install it"; fi
   if command -v ss >/dev/null 2>&1; then pass "ss is available"; else warn_check "ss is not installed yet"; fi
+
+  free_mb="$(root_free_mb 2>/dev/null || true)"
+  free_inode_percent="$(root_free_inode_percent 2>/dev/null || true)"
+  if [[ "${free_mb}" =~ ^[0-9]+$ ]]; then
+    if ((free_mb < INSTALL_MIN_FREE_MB)); then
+      fail "root filesystem has ${free_mb} MB free; full install requires at least ${INSTALL_MIN_FREE_MB} MB"
+    elif ((free_mb < 6144)); then
+      warn_check "root filesystem has only ${free_mb} MB free"
+    else
+      pass "root filesystem has ${free_mb} MB free"
+    fi
+  else
+    fail "root filesystem free space could not be determined"
+  fi
+
+  if [[ "${free_inode_percent}" =~ ^[0-9]+$ ]]; then
+    if ((free_inode_percent < MIN_FREE_INODE_PERCENT)); then
+      fail "root filesystem has only ${free_inode_percent}% free inodes"
+    else
+      pass "root filesystem has ${free_inode_percent}% free inodes"
+    fi
+  else
+    fail "root filesystem inode capacity could not be determined"
+  fi
 
   if [[ -n "${DOMAIN:-}" ]] && command -v getent >/dev/null 2>&1; then
     if getent ahostsv4 "${DOMAIN}" >/dev/null 2>&1; then pass "DOMAIN resolves"; else fail "DOMAIN does not resolve"; fi
@@ -5057,16 +6017,46 @@ run_with_install_lock() {
   main "$@"
 }
 
+configure_storage_only() {
+  local free_mb
+  [[ "${EUID}" -eq 0 ]] || die "Run this command as root."
+  free_mb="$(root_free_mb)"
+  if [[ ! "${free_mb}" =~ ^[0-9]+$ ]] || ((free_mb < 16)); then
+    storage_hint /
+    die "Storage repair needs at least 16 MB free on / to write configuration files. Free one large log first, then retry."
+  fi
+
+  if ! command -v logrotate >/dev/null 2>&1; then
+    apt_get update
+    apt_get install -y logrotate
+  fi
+
+  configure_log_limits
+  systemctl daemon-reload
+  systemctl restart systemd-journald || true
+  systemctl enable --now logrotate.timer
+  systemctl enable --now vpn-storage-maintenance.timer
+  systemctl start vpn-storage-maintenance.service
+
+  log "Storage protection configured."
+  df -h /
+  journalctl --disk-usage 2>/dev/null || true
+  systemctl list-timers logrotate.timer vpn-storage-maintenance.timer --no-pager || true
+}
+
 show_installer_usage() {
   cat <<'USAGE'
 Usage:
   ./install-vpn-stack.sh                 Run two-stage bootstrap, schedule stage2, and reboot once
   ./install-vpn-stack.sh bootstrap       Same as default two-stage bootstrap
   ./install-vpn-stack.sh install         Run stage2/full install now
+  ./install-vpn-stack.sh upgrade         Update features without replacing existing client profiles
+  ./install-vpn-stack.sh upgrade-check   Read-only compatibility and profile-count check
   ./install-vpn-stack.sh preflight       Check inputs and host readiness without changing VPN configs
   ./install-vpn-stack.sh validate        Validate installed listeners, services, cert, and decoy
   ./install-vpn-stack.sh verify          Alias for validate
   ./install-vpn-stack.sh report          Write and print install reports
+  ./install-vpn-stack.sh storage-repair  Apply disk/log limits without reinstalling the VPN stack
   ./install-vpn-stack.sh render-decoy [dir]  Render decoy site into dir without touching nginx
 
 During stage2:
@@ -5097,6 +6087,20 @@ dispatch() {
       shift || true
       run_with_install_lock "$@"
       ;;
+    upgrade)
+      shift || true
+      run_with_upgrade_lock() {
+        if command -v flock >/dev/null 2>&1; then
+          exec 200>"${INSTALL_LOCK}"
+          flock -n 200 || die "Another Golden VPN install or upgrade is already running."
+        fi
+        upgrade_existing_stack "$@"
+      }
+      run_with_upgrade_lock "$@"
+      ;;
+    upgrade-check|check-upgrade)
+      upgrade_check
+      ;;
     preflight|preflight-only|--preflight)
       preflight_check
       ;;
@@ -5106,6 +6110,9 @@ dispatch() {
     report)
       generate_install_report
       cat "${INSTALL_REPORT_TXT}"
+      ;;
+    storage-repair|configure-storage|storage)
+      configure_storage_only
       ;;
     render-decoy|--render-only)
       out_dir="${2:-/tmp/golden-vpn-decoy-render}"
@@ -5122,4 +6129,6 @@ dispatch() {
   esac
 }
 
-dispatch "$@"
+if [[ "${GOLDEN_VPN_SOURCE_ONLY:-0}" != "1" ]]; then
+  dispatch "$@"
+fi

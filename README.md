@@ -254,6 +254,65 @@ vpn-sub rotate phone1
 
 Private metadata is stored in `/opt/vpn-stack/subscriptions/<token>/meta.json`; nginx-served files are stored in `/var/www/subscriptions/<token>/`. Install reports mention these paths but never include tokens or client secrets.
 
+## Bot Export And Migration
+
+`vpn-seller-lite` currently imports prepared AmneziaWG `.conf` inventory from SQLite bundles. Golden therefore exports AWG-only bot bundles in v1; Trojan and Hysteria2 stay available through `vpn-sub` subscription URLs.
+
+Create a secret-free server audit on every VPN server:
+
+```bash
+vpn-bot-export audit --out /root/vpn-keys/bot-export/server-audit.json
+```
+
+Create an import bundle for bot stock:
+
+```bash
+vpn-bot-export keys --plan plan_30 --out /root/vpn-keys/bot-export/keys.sqlite
+```
+
+Upload `keys.sqlite` to the bot with `/admin_import`. The bundle contains:
+
+```sql
+CREATE TABLE keys (
+  plan_code TEXT NOT NULL,
+  conf_text TEXT NOT NULL,
+  external_ref TEXT,
+  comment TEXT,
+  expires_at TEXT
+);
+```
+
+Create an emergency replacement bundle from a CSV map:
+
+```bash
+mkdir -p /root/vpn-migration
+cat >/root/vpn-migration/map.csv <<'CSV'
+client_name,old_key_fingerprint,old_conf_path,new_conf_path,plan_code,new_external_ref,new_comment,expires_at
+phone1,,/root/old-keys/AWG-EE-phone1.conf,/root/vpn-keys/awg/AWG-US-phone1.conf,plan_30,,,
+CSV
+
+vpn-bot-export emergency --map /root/vpn-migration/map.csv --out /root/vpn-keys/bot-export/emergency.sqlite
+```
+
+If `old_key_fingerprint` is empty, Golden calculates it from `old_conf_path` using the same normalization rule as the bot. Upload `emergency.sqlite` with `/admin_emergency`.
+
+Useful fingerprint command:
+
+```bash
+vpn-bot-export fingerprint /root/vpn-keys/awg/AWG-US-phone1.conf
+```
+
+Five-to-three-server migration checklist for the audited deployment:
+
+1. Run `vpn-bot-export audit` on all five servers.
+2. Keep the USA server as a required target.
+3. Keep France and Estonia; retire Sweden and Netherlands after their users are confirmed on a target. Netherlands has the joint-lowest profile count and the weakest audited service health.
+4. Run `upgrade-check` and then the profile-preserving `upgrade` on existing Golden servers before generating any replacement credentials.
+5. Generate fresh AWG configs on target servers only for users who are actually being moved; upgrade never replaces existing profiles.
+6. Import available target stock into the bot with `/admin_import`.
+7. Prepare `emergency.sqlite` mappings from old issued fingerprints to new target configs.
+8. Apply the migration or failover through `/admin_emergency`.
+
 Initial client files:
 
 ```text
@@ -350,6 +409,68 @@ Captures are saved under:
 ```
 
 AmneziaWG parameters are randomized from the selected profile. Supported profiles are `dns`, `quic-lite`, `video-call`, `mobile-low-mtu`, `random-balanced`, and `custom`; default is `random-balanced`. The installer writes `/opt/vpn-stack/awg-params.env` and `/opt/vpn-stack/awg-tuning-report.json`. Use `AWG_MTU=auto` for a PMTU probe with safe fallback to `1280`, or set an explicit value from `1200..1420`. Tcpdump is not run automatically during install; use `vpn-awg analyze 20`, `vpn-awg capture 30`, or `vpn-awg analyze-live 20` only when you intentionally want packet-size diagnostics.
+
+## Disk and log protection
+
+Preflight requires at least 5 GB free on `/` and 5% free inodes before a full install; bootstrap requires 1 GB. The full-install reserve accounts for packages, monitoring data, and creation of the 2 GB fallback swap file. The installed limits are:
+
+```text
+journald: 200 MB / 7 days, vacuumed immediately and hourly
+Golden VPN logs: daily, 7 compressed rotations
+rsyslog /var/log/syslog: maxsize 50 MB, checked hourly
+Grafana: 16 MB native rotation, 3-day retention, 20 MB logrotate fallback
+Docker JSON logs, when Docker coexists: 20 MB, 3 compressed rotations
+x-ui logs, when a legacy x-ui installation coexists: 20 MB, 3 compressed rotations
+APT package cache: cleaned hourly
+Prometheus: 7 days / 1 GB
+```
+
+Storage maintenance is provided by:
+
+```bash
+systemctl status logrotate.timer
+systemctl status vpn-storage-maintenance.timer
+systemctl start vpn-storage-maintenance.service
+```
+
+Apply only the storage protections to an existing installation without reinstalling VPN services:
+
+```bash
+./install-vpn-stack.sh storage-repair
+```
+
+The hourly maintenance job performs a bounded journal vacuum, removes Grafana's expired dated rotations, cleans the APT package cache, and forces bounded rotations when `/` reaches 90% usage. It does not delete Docker images, volumes, containerd snapshots, VPN keys, or active configuration files.
+
+## Profile-preserving upgrades
+
+Never run the full `install` mode over a working server. Full install intentionally creates a fresh server identity and fresh initial clients. Use the dedicated upgrade flow instead:
+
+```bash
+chmod +x install-vpn-stack.sh
+./install-vpn-stack.sh upgrade-check
+./install-vpn-stack.sh upgrade
+```
+
+If an older installation does not yet contain `/opt/vpn-stack/server-location.txt`, provide the location explicitly so newly created labels remain correct:
+
+```bash
+SERVER_LOCATION=FR ./install-vpn-stack.sh upgrade-check
+SERVER_LOCATION=FR ./install-vpn-stack.sh upgrade
+```
+
+`upgrade-check` is read-only. It detects the installed Xray protocol and reports Xray, Hysteria, and AWG profile counts without printing credentials.
+
+`upgrade` updates only the feature overlay: compatible helper commands, subscription/export tooling, monitoring, timers, and storage protection. It does not call the Xray, Hysteria, AWG, nginx, certificate, firewall, or clean-install configuration functions and does not restart VPN protocol services.
+
+Before changing the overlay, it creates a root-only backup under:
+
+```text
+/root/vpn-keys/upgrade-backups/<UTC timestamp>.<unique suffix>/
+```
+
+The backup contains the current protocol registries, server configs, client files, and subscription bundles. A secret-free structural/hash manifest is written before and after the upgrade. Success is reported only if the protected profile set is byte-for-byte unchanged. The result is stored in `/root/vpn-keys/upgrade-report.json` and the installed script version in `/opt/vpn-stack/installer-version.txt`.
+
+Legacy VLESS XHTTP installations are detected automatically. Their VLESS service, config, helper, and users are preserved; the upgrade deliberately does not install Trojan/subscription helpers over that server. Migrating VLESS users to Trojan remains a separate, parallel credential migration with a grace period.
 
 ## Troubleshooting
 
