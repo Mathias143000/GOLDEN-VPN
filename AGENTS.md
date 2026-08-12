@@ -31,7 +31,9 @@ Default install flow: two-stage bootstrap -> reboot -> one-shot install
 Installer status: vpn-install-status watch
 Subscription helper: vpn-sub create/list/show/revoke/rotate
 Subscription URL shape: https://DOMAIN/s/<token>
-Bot export helper: vpn-bot-export audit/keys/emergency/fingerprint
+Bot export helper: vpn-bot-export audit/keys/inventory/batch/send/emergency/fingerprint
+Typed bot bundles: AWG/Trojan/Hysteria with available or issued status
+TLS notifications: vpn-cert-notify plus daily systemd timer and acme.sh renewal hook
 Upgrade invariant: existing Xray clients, Hysteria users, AWG peers, client files, and subscription bundles remain byte-for-byte unchanged
 ```
 
@@ -127,13 +129,16 @@ rotate revokes old files/credentials and creates a fresh token plus fresh protoc
 
 ### 0.0.3 Bot export and migration readiness
 
-`vpn-seller-lite` is the current bot integration target. Its v1 import/emergency flows are AWG-only, so Golden VPN must export AmneziaWG `.conf` inventory for the bot and keep Trojan/Hysteria2 in Golden subscription bundles.
+`vpn-seller` is the current bot integration target. Legacy v1 import/emergency flows remain supported. Typed bundles add AWG, Trojan, and Hysteria2 keys with explicit `available` or `issued` state.
 
 Required helper:
 
 ```text
 vpn-bot-export audit --out /root/vpn-keys/bot-export/server-audit.json
 vpn-bot-export keys --plan plan_30 --out /root/vpn-keys/bot-export/keys.sqlite
+vpn-bot-export inventory --type all --plan plan_30 --out /root/vpn-keys/bot-export/active-keys.sqlite --send
+vpn-bot-export batch --type awg --count 20 --prefix stock --plan plan_30 --send
+vpn-bot-export send /root/vpn-keys/bot-export/active-keys.sqlite
 vpn-bot-export emergency --map /root/vpn-migration/map.csv --out /root/vpn-keys/bot-export/emergency.sqlite
 vpn-bot-export fingerprint /root/vpn-keys/awg/AWG-US-phone1.conf
 ```
@@ -148,6 +153,35 @@ CREATE TABLE keys (
   comment TEXT,
   expires_at TEXT
 );
+```
+
+Typed bundle schema:
+
+```sql
+CREATE TABLE typed_keys (
+  key_type TEXT NOT NULL,
+  label TEXT NOT NULL,
+  key_status TEXT NOT NULL,
+  config_text TEXT NOT NULL,
+  plan_code TEXT,
+  external_ref TEXT,
+  comment TEXT,
+  expires_at TEXT
+);
+```
+
+Telegram and certificate notification rules:
+
+```text
+/etc/golden-vpn-installer/issuer-bot.env is root-only and contains the dedicated Golden issuer bot token plus admin chat ID
+the Golden issuer bot only creates/exports keys and reports TLS state; it never contacts customers or assigns replacements
+vpn-seller owns customer mapping, incident decisions, customer notifications, and replacement delivery
+--send uploads the bundle as a document to the configured administrative chat
+inventory --send must contain all active key types in one typed bundle; partial per-type Telegram delivery is rejected
+vpn-cert-notify.timer checks the domain certificate daily
+expiry alerts are deduplicated at 30/14/7/3/1/0 days
+the acme.sh reload hook calls vpn-cert-notify renewed after replacement
+tokens and key bodies must never appear in logs, audit JSON, or notification text
 ```
 
 Bot emergency bundle schema:

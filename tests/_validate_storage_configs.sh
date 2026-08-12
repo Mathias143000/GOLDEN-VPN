@@ -37,6 +37,17 @@ systemd-analyze verify \
   "${tmp_dir}/vpn-storage-maintenance.service" \
   "${tmp_dir}/vpn-storage-maintenance.timer"
 
+for unit in vpn-cert-notify.service vpn-cert-notify.timer; do
+  extract_single_quoted_heredoc "/etc/systemd/system/${unit}" >"${tmp_dir}/${unit}"
+done
+extract_single_quoted_heredoc /usr/local/bin/vpn-cert-notify >"${tmp_dir}/vpn-cert-notify"
+chmod 0755 "${tmp_dir}/vpn-cert-notify"
+sed -i "s#/usr/local/bin/vpn-cert-notify#${tmp_dir}/vpn-cert-notify#" \
+  "${tmp_dir}/vpn-cert-notify.service"
+systemd-analyze verify \
+  "${tmp_dir}/vpn-cert-notify.service" \
+  "${tmp_dir}/vpn-cert-notify.timer"
+
 eval "$(awk '
   /^set_ini_section_value\(\)/ {show=1}
   /^configure_log_limits\(\)/ {exit}

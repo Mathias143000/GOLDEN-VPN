@@ -256,7 +256,56 @@ Private metadata is stored in `/opt/vpn-stack/subscriptions/<token>/meta.json`; 
 
 ## Bot Export And Migration
 
-`vpn-seller-lite` currently imports prepared AmneziaWG `.conf` inventory from SQLite bundles. Golden therefore exports AWG-only bot bundles in v1; Trojan and Hysteria2 stay available through `vpn-sub` subscription URLs.
+Golden exports typed AmneziaWG, Trojan, and Hysteria2 SQLite bundles. `vpn-seller` preserves the key type and imports generated stock as `available`; an inventory of already configured keys is imported as `issued` and cannot be sold again.
+
+Configure the dedicated Golden issuer bot on the VPN server. Do not reuse the `vpn-seller` token:
+
+```bash
+install -d -m 0700 /etc/golden-vpn-installer
+install -m 0600 /dev/null /etc/golden-vpn-installer/issuer-bot.env
+nano /etc/golden-vpn-installer/issuer-bot.env
+```
+
+```bash
+GOLDEN_ISSUER_BOT_TOKEN='123456:ISSUER_BOT_TOKEN'
+GOLDEN_ISSUER_CHAT_ID='-1001234567890'
+```
+
+Export all non-revoked client files with explicit types and send the bundle to the administrative chat:
+
+```bash
+vpn-bot-export inventory --type all --plan plan_30 \
+  --out /root/vpn-keys/bot-export/active-keys.sqlite --send
+```
+
+Telegram inventory delivery is always one complete bundle. `--send` is accepted only with `--type all`; type filters are reserved for local diagnostics and are not sent separately.
+
+Create a new stock batch of one selected type and send it:
+
+```bash
+vpn-bot-export batch --type awg --count 20 --prefix stock --plan plan_30 --send
+vpn-bot-export batch --type trojan --count 20 --prefix stock --plan plan_30 --send
+vpn-bot-export batch --type hysteria --count 20 --prefix stock --plan plan_30 --send
+```
+
+`--send` attaches the root-only SQLite file to a message from the bot in the configured admin chat. Telegram does not deliver a bot's own message back to its update handler, so upload or forward that attachment to `/admin_import` to place it in bot inventory. The preview shows counts by type and status before confirmation.
+
+Certificate notifications use the same Telegram settings. A daily timer sends deduplicated warnings at 30, 14, 7, 3, 1, and 0 days before expiry. Successful acme.sh replacement sends a renewal notification.
+
+```bash
+vpn-cert-notify test
+vpn-cert-notify check --dry-run
+systemctl status vpn-cert-notify.timer
+```
+
+Responsibility boundary:
+
+```text
+Golden issuer bot: create keys, export existing/new keys, report TLS expiry/replacement
+vpn-seller: customer identity and key mapping, incident decisions, customer notifications, replacement delivery
+```
+
+Golden never contacts customers, assigns replacements to customers, or revokes their old key automatically. The `emergency` command only prepares a root-only mapping bundle that `vpn-seller` applies through `/admin_emergency`.
 
 Create a secret-free server audit on every VPN server:
 

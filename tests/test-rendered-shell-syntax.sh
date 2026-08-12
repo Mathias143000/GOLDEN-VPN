@@ -25,6 +25,7 @@ extract_heredoc 'cat >/usr/local/bin/vpn-hysteria <<'"'"'EOF'"'"'' "${tmp_dir}/v
 extract_heredoc 'cat >/usr/local/bin/vpn-awg <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-awg"
 extract_heredoc 'cat >/usr/local/bin/vpn-sub <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-sub"
 extract_heredoc 'cat >/usr/local/bin/vpn-bot-export <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-bot-export"
+extract_heredoc 'cat >/usr/local/bin/vpn-cert-notify <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-cert-notify"
 extract_heredoc 'cat >/usr/local/bin/vpn-help <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-help"
 extract_heredoc 'cat >/usr/local/sbin/vpn-storage-maintenance.sh <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-storage-maintenance"
 extract_heredoc 'cat >/usr/local/sbin/vpn-soft-reboot.sh <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-soft-reboot"

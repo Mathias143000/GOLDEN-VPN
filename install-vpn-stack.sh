@@ -8,7 +8,7 @@ export APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND:-none}"
 
 : "${APT_LOCK_TIMEOUT:=1800}"
 
-GOLDEN_VPN_VERSION="2026.08.11"
+GOLDEN_VPN_VERSION="2026.08.12"
 
 STACK_DIR="/opt/vpn-stack"
 KEY_DIR="/root/vpn-keys"
@@ -1300,7 +1300,7 @@ install_acme_certificate() {
   "${acme[@]}" --install-cert -d "${DOMAIN}" --ecc \
     --fullchain-file "${CERT_DIR}/fullchain.pem" \
     --key-file "${CERT_DIR}/privkey.pem" \
-    --reloadcmd "systemctl reload nginx >/dev/null 2>&1 || true; systemctl restart hysteria2 >/dev/null 2>&1 || true"
+    --reloadcmd "systemctl reload nginx >/dev/null 2>&1 || true; systemctl restart hysteria2 >/dev/null 2>&1 || true; /usr/local/bin/vpn-cert-notify renewed >/dev/null 2>&1 || true"
 
   openssl x509 -noout -subject -issuer -dates -in "${CERT_DIR}/fullchain.pem"
   openssl pkey -check -noout -in "${CERT_DIR}/privkey.pem"
@@ -3915,11 +3915,24 @@ set -Eeuo pipefail
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+TELEGRAM_ENV="${GOLDEN_ISSUER_BOT_ENV:-/etc/golden-vpn-installer/issuer-bot.env}"
+if [[ -r "${TELEGRAM_ENV}" ]]; then
+  telegram_env_mode="$(stat -c '%a' "${TELEGRAM_ENV}")"
+  (( (8#${telegram_env_mode} & 077) == 0 )) || die "${TELEGRAM_ENV} must not be accessible by group or others"
+  set -a
+  # shellcheck disable=SC1090
+  source "${TELEGRAM_ENV}"
+  set +a
+fi
+
 usage() {
   cat <<'USAGE'
 Usage:
   vpn-bot-export audit --out /root/vpn-keys/bot-export/server-audit.json
   vpn-bot-export keys --plan plan_30 --out /root/vpn-keys/bot-export/keys.sqlite
+  vpn-bot-export inventory --type all --plan plan_30 --out /root/vpn-keys/bot-export/active-keys.sqlite [--send]
+  vpn-bot-export batch --type awg --count 20 --prefix stock --plan plan_30 [--send]
+  vpn-bot-export send /root/vpn-keys/bot-export/active-keys.sqlite [--caption TEXT]
   vpn-bot-export emergency --map /root/vpn-migration/map.csv --out /root/vpn-keys/bot-export/emergency.sqlite
   vpn-bot-export fingerprint /root/vpn-keys/awg/AWG-US-phone1.conf
 
@@ -3930,6 +3943,16 @@ Options:
   --map FILE         CSV map for emergency export
   --expires-at ISO   Optional expires_at value for keys export
   --comment TEXT     Optional comment for keys export
+  --type TYPE        awg, trojan, hysteria, or all for inventory; one type for batch
+  --count NUMBER     Number of new keys for batch (1..500)
+  --prefix NAME      Batch client-name prefix; generated names end in -0001, -0002, ...
+  --send             Send the generated SQLite file to the configured Telegram bot/chat
+  --caption TEXT     Optional Telegram document caption
+
+Golden issuer bot configuration (root-only 0600):
+  /etc/golden-vpn-installer/issuer-bot.env
+  GOLDEN_ISSUER_BOT_TOKEN=123456:token
+  GOLDEN_ISSUER_CHAT_ID=-1001234567890
 
 Emergency CSV columns:
   client_name,old_key_fingerprint,old_conf_path,new_conf_path,plan_code,new_external_ref,new_comment,expires_at
@@ -3957,16 +3980,28 @@ import csv
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-STACK_DIR = Path("/opt/vpn-stack")
-KEY_ROOT = Path("/root/vpn-keys")
+STACK_DIR = Path(os.environ.get("VPN_BOT_STACK_DIR", "/opt/vpn-stack"))
+KEY_ROOT = Path(os.environ.get("VPN_BOT_KEY_ROOT", "/root/vpn-keys"))
 AWG_DIR = KEY_ROOT / "awg"
 EXPORT_DIR = KEY_ROOT / "bot-export"
+TYPE_DIRS = {
+    "awg": KEY_ROOT / "awg",
+    "trojan": KEY_ROOT / "trojan",
+    "hysteria": KEY_ROOT / "hysteria",
+}
+TYPE_SUFFIXES = {"awg": ".conf", "trojan": ".txt", "hysteria": ".txt"}
+TYPE_HELPERS = {"awg": "vpn-awg", "trojan": "vpn-trojan", "hysteria": "vpn-hysteria"}
 
 
 def fail(message: str) -> None:
@@ -4174,6 +4209,227 @@ def command_audit(args: argparse.Namespace) -> None:
     print(f"AWG key count: {len(keys)}")
 
 
+def validate_key_type(value: str, allow_all: bool = False) -> str:
+    allowed = set(TYPE_DIRS)
+    if allow_all:
+        allowed.add("all")
+    if value not in allowed:
+        fail(f"Unsupported key type: {value}; expected {', '.join(sorted(allowed))}")
+    return value
+
+
+def typed_key_files(key_type: str) -> list[tuple[str, Path]]:
+    selected = sorted(TYPE_DIRS) if key_type == "all" else [validate_key_type(key_type)]
+    result: list[tuple[str, Path]] = []
+    for current_type in selected:
+        directory = TYPE_DIRS[current_type]
+        suffix = TYPE_SUFFIXES[current_type]
+        if not directory.is_dir():
+            continue
+        result.extend(
+            (current_type, path)
+            for path in sorted(directory.iterdir())
+            if path.is_file() and path.suffix == suffix
+        )
+    return result
+
+
+def typed_rows(
+    files: list[tuple[str, Path]],
+    plan: str | None,
+    expires_at: str | None,
+    comment: str | None,
+    key_status: str,
+) -> list[tuple[str, str, str, str, str | None, str, str | None, str | None]]:
+    rows = []
+    for key_type, path in files:
+        config_text = read_conf(path)
+        label = path.stem
+        rows.append(
+            (
+                key_type,
+                label,
+                key_status,
+                config_text,
+                plan,
+                default_external_ref(label),
+                comment or f"Golden VPN {key_type.upper()} {label}",
+                expires_at,
+            )
+        )
+    return rows
+
+
+def write_typed_bundle(
+    out: Path,
+    rows: list[tuple[str, str, str, str, str | None, str, str | None, str | None]],
+    source: str,
+) -> None:
+    if not rows:
+        fail("No active key files matched the requested type")
+    connection, tmp = connect_sqlite_out(out)
+    try:
+        connection.execute(
+            "CREATE TABLE export_meta (format_version TEXT NOT NULL, exported_at TEXT NOT NULL, source TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO export_meta(format_version, exported_at, source) VALUES (?, ?, ?)",
+            ("golden-vpn.typed-keys.v1", now_iso(), source),
+        )
+        connection.execute(
+            """
+            CREATE TABLE typed_keys (
+              key_type TEXT NOT NULL,
+              label TEXT NOT NULL,
+              key_status TEXT NOT NULL,
+              config_text TEXT NOT NULL,
+              plan_code TEXT,
+              external_ref TEXT,
+              comment TEXT,
+              expires_at TEXT
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO typed_keys(
+              key_type, label, key_status, config_text, plan_code, external_ref, comment, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        connection.execute("CREATE INDEX typed_keys_type_label ON typed_keys(key_type, label)")
+        finish_sqlite(connection, tmp, out)
+    except Exception:
+        connection.close()
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
+def telegram_credentials() -> tuple[str, str]:
+    token = os.environ.get("GOLDEN_ISSUER_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("GOLDEN_ISSUER_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        fail("Issuer bot is not configured; set GOLDEN_ISSUER_BOT_TOKEN and GOLDEN_ISSUER_CHAT_ID in the root-only issuer-bot.env")
+    return token, chat_id
+
+
+def telegram_send_document(path: Path, caption: str | None = None) -> None:
+    if not path.is_file():
+        fail(f"Telegram document not found: {path}")
+    token, chat_id = telegram_credentials()
+    boundary = f"----golden-vpn-{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+
+    def field(name: str, value: str) -> None:
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                value.encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+
+    field("chat_id", chat_id)
+    if caption:
+        field("caption", caption[:1024])
+    chunks.extend(
+        [
+            f"--{boundary}\r\n".encode(),
+            f'Content-Disposition: form-data; name="document"; filename="{path.name}"\r\n'.encode(),
+            b"Content-Type: application/vnd.sqlite3\r\n\r\n",
+            path.read_bytes(),
+            b"\r\n",
+            f"--{boundary}--\r\n".encode(),
+        ]
+    )
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendDocument",
+        data=b"".join(chunks),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        fail(f"Telegram sendDocument failed: {type(exc).__name__}")
+    if not payload.get("ok"):
+        fail("Telegram sendDocument returned ok=false")
+    print(f"Sent to Telegram: {path.name}")
+
+
+def command_inventory(args: argparse.Namespace) -> None:
+    key_type = validate_key_type(args.type, allow_all=True)
+    if args.send and key_type != "all":
+        fail("Telegram inventory delivery must use --type all so every active key type is included in one bundle")
+    out = Path(args.out or EXPORT_DIR / f"active-{key_type}-keys.sqlite")
+    rows = typed_rows(typed_key_files(key_type), args.plan, args.expires_at, args.comment, "issued")
+    write_typed_bundle(out, rows, "golden-vpn-active-inventory")
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row[0]] = counts.get(row[0], 0) + 1
+    print(f"Exported {len(rows)} active keys: {out}")
+    print("Types: " + ", ".join(f"{name}={count}" for name, count in sorted(counts.items())))
+    if args.send:
+        telegram_send_document(out, args.caption or f"Golden VPN active keys ({key_type})")
+
+
+def validate_batch_name(prefix: str) -> str:
+    if not prefix or len(prefix) > 48 or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for ch in prefix):
+        fail("--prefix must be 1..48 characters from [A-Za-z0-9._-]")
+    return prefix
+
+
+def expected_key_path(key_type: str, name: str) -> Path:
+    label = f"{key_type.upper()}-{server_location()}-{name}"
+    return TYPE_DIRS[key_type] / f"{label}{TYPE_SUFFIXES[key_type]}"
+
+
+def command_batch(args: argparse.Namespace) -> None:
+    key_type = validate_key_type(args.type)
+    count = args.count
+    if count < 1 or count > 500:
+        fail("--count must be between 1 and 500")
+    prefix = validate_batch_name(args.prefix)
+    helper = TYPE_HELPERS[key_type]
+    if not shutil.which(helper):
+        fail(f"Required helper is missing: {helper}")
+
+    names = [f"{prefix}-{index:04d}" for index in range(1, count + 1)]
+    paths = [expected_key_path(key_type, name) for name in names]
+    collisions = [path for path in paths if path.exists()]
+    if collisions:
+        fail(f"Batch would overwrite an existing key: {collisions[0]}")
+
+    created: list[tuple[str, Path]] = []
+    for index, (name, path) in enumerate(zip(names, paths), start=1):
+        result = subprocess.run(
+            [helper, name],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0 or not path.is_file():
+            fail(f"Batch stopped at {index}/{count}; {len(created)} keys were created and were not removed")
+        created.append((key_type, path))
+
+    out = Path(args.out or EXPORT_DIR / f"batch-{key_type}-{prefix}-{int(time.time())}.sqlite")
+    rows = typed_rows(created, args.plan, args.expires_at, args.comment, "available")
+    write_typed_bundle(out, rows, "golden-vpn-generated-batch")
+    print(f"Created and exported {len(rows)} {key_type} keys: {out}")
+    if args.send:
+        telegram_send_document(out, args.caption or f"Golden VPN batch: {key_type}, {len(rows)} keys")
+
+
+def command_send(args: argparse.Namespace) -> None:
+    telegram_send_document(Path(args.file), args.caption)
+
+
 def require_csv_columns(fieldnames: list[str] | None, required: set[str], source: Path) -> None:
     if not fieldnames:
         fail(f"CSV has no header: {source}")
@@ -4253,7 +4509,7 @@ def command_emergency(args: argparse.Namespace) -> None:
             tmp.unlink()
         raise
     print(f"Exported {len(rows)} emergency replacements: {out}")
-    print("Apply in vpn-seller-lite with /admin_emergency.")
+    print("Apply in vpn-seller with /admin_emergency; Golden does not notify customers or assign replacements.")
 
 
 def command_fingerprint(args: argparse.Namespace) -> None:
@@ -4277,7 +4533,34 @@ def build_parser() -> argparse.ArgumentParser:
     keys.add_argument("--comment")
     keys.set_defaults(func=command_keys)
 
-    emergency = sub.add_parser("emergency", help="export vpn-seller-lite emergency replacement bundle")
+    inventory = sub.add_parser("inventory", help="export active AWG/Trojan/Hysteria keys with explicit types")
+    inventory.add_argument("--type", default="all", choices=["all", "awg", "trojan", "hysteria"])
+    inventory.add_argument("--plan", required=True)
+    inventory.add_argument("--out")
+    inventory.add_argument("--expires-at")
+    inventory.add_argument("--comment")
+    inventory.add_argument("--send", action="store_true")
+    inventory.add_argument("--caption")
+    inventory.set_defaults(func=command_inventory)
+
+    batch = sub.add_parser("batch", help="create a typed key batch and export it as SQLite")
+    batch.add_argument("--type", required=True, choices=["awg", "trojan", "hysteria"])
+    batch.add_argument("--count", required=True, type=int)
+    batch.add_argument("--prefix", required=True)
+    batch.add_argument("--plan", required=True)
+    batch.add_argument("--out")
+    batch.add_argument("--expires-at")
+    batch.add_argument("--comment")
+    batch.add_argument("--send", action="store_true")
+    batch.add_argument("--caption")
+    batch.set_defaults(func=command_batch)
+
+    send = sub.add_parser("send", help="send an existing export file to Telegram")
+    send.add_argument("file")
+    send.add_argument("--caption")
+    send.set_defaults(func=command_send)
+
+    emergency = sub.add_parser("emergency", help="prepare a replacement mapping bundle for vpn-seller")
     emergency.add_argument("--map", required=True)
     emergency.add_argument("--plan")
     emergency.add_argument("--out", default=str(EXPORT_DIR / "emergency.sqlite"))
@@ -4300,6 +4583,212 @@ if __name__ == "__main__":
 PY
 EOF
   chmod 0755 /usr/local/bin/vpn-bot-export
+}
+
+install_helper_cert_notify() {
+  cat >/usr/local/bin/vpn-cert-notify <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+TELEGRAM_ENV="${GOLDEN_ISSUER_BOT_ENV:-/etc/golden-vpn-installer/issuer-bot.env}"
+if [[ -r "${TELEGRAM_ENV}" ]]; then
+  telegram_env_mode="$(stat -c '%a' "${TELEGRAM_ENV}")"
+  (( (8#${telegram_env_mode} & 077) == 0 )) || die "${TELEGRAM_ENV} must not be accessible by group or others"
+  set -a
+  # shellcheck disable=SC1090
+  source "${TELEGRAM_ENV}"
+  set +a
+fi
+
+python3 - "$@" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import socket
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+STACK_DIR = Path(os.environ.get("VPN_CERT_STACK_DIR", "/opt/vpn-stack"))
+CERT_ROOT = Path(os.environ.get("VPN_CERT_ROOT", "/etc/letsencrypt/live"))
+STATE_DIR = Path(os.environ.get("VPN_CERT_STATE_DIR", "/var/lib/golden-vpn"))
+STATE_PATH = STATE_DIR / "cert-notify-state.json"
+THRESHOLDS = (30, 14, 7, 3, 1, 0)
+
+
+def fail(message: str) -> None:
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read_text(path: Path, default: str = "") -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return default
+
+
+def load_state() -> dict:
+    try:
+        value = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(value: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    tmp = STATE_PATH.with_name(f".{STATE_PATH.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_PATH)
+    os.chmod(STATE_PATH, 0o600)
+
+
+def cert_details() -> dict:
+    domain = read_text(STACK_DIR / "domain.txt")
+    if not domain:
+        fail("Golden VPN domain is unknown")
+    cert_path = CERT_ROOT / domain / "fullchain.pem"
+    if not cert_path.is_file():
+        fail(f"Certificate not found: {cert_path}")
+    pem = cert_path.read_text(encoding="ascii")
+    end_marker = "-----END CERTIFICATE-----"
+    marker_index = pem.find(end_marker)
+    if marker_index < 0:
+        fail(f"Certificate PEM is invalid: {cert_path}")
+    leaf_pem = pem[: marker_index + len(end_marker)] + "\n"
+    der = ssl.PEM_cert_to_DER_cert(leaf_pem)
+    decoded = ssl._ssl._test_decode_cert(str(cert_path))
+    expires = datetime.strptime(decoded["notAfter"], "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+    now = datetime.now(tz=timezone.utc)
+    seconds = (expires - now).total_seconds()
+    days = max(-1, int(seconds // 86400))
+    return {
+        "domain": domain,
+        "path": str(cert_path),
+        "fingerprint": hashlib.sha256(der).hexdigest(),
+        "expires_at": expires.isoformat(),
+        "days_remaining": days,
+        "hostname": socket.gethostname(),
+    }
+
+
+def telegram_send(message: str, dry_run: bool = False) -> None:
+    if dry_run:
+        print(message)
+        return
+    token = os.environ.get("GOLDEN_ISSUER_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("GOLDEN_ISSUER_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        fail("Golden issuer bot is not configured in the root-only issuer-bot.env")
+    body = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode()
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage", data=body, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        fail(f"Telegram sendMessage failed: {type(exc).__name__}")
+    if not payload.get("ok"):
+        fail("Telegram sendMessage returned ok=false")
+
+
+def threshold_for(days: int) -> int | None:
+    for threshold in reversed(THRESHOLDS):
+        if days <= threshold:
+            return threshold
+    return None
+
+
+def command_check(dry_run: bool) -> None:
+    details = cert_details()
+    state = load_state()
+    fingerprint = details["fingerprint"]
+    previous = state.get("fingerprint")
+    if previous and previous != fingerprint:
+        telegram_send(
+            f"Golden VPN TLS certificate replaced\n"
+            f"Server: {details['hostname']}\nDomain: {details['domain']}\n"
+            f"Valid until: {details['expires_at']}",
+            dry_run,
+        )
+        state["last_replacement_fingerprint"] = fingerprint
+
+    threshold = threshold_for(details["days_remaining"])
+    warning_key = f"{fingerprint}:{threshold}" if threshold is not None else None
+    if warning_key and state.get("last_warning") != warning_key:
+        telegram_send(
+            f"Golden VPN TLS certificate expires soon\n"
+            f"Server: {details['hostname']}\nDomain: {details['domain']}\n"
+            f"Days remaining: {details['days_remaining']}\nValid until: {details['expires_at']}",
+            dry_run,
+        )
+        state["last_warning"] = warning_key
+
+    state.update({"fingerprint": fingerprint, "last_check": datetime.now(tz=timezone.utc).isoformat(), **details})
+    if not dry_run:
+        save_state(state)
+    print(f"Certificate OK: {details['domain']}, {details['days_remaining']} days remaining")
+
+
+def command_renewed(dry_run: bool) -> None:
+    details = cert_details()
+    state = load_state()
+    if state.get("last_replacement_fingerprint") != details["fingerprint"]:
+        telegram_send(
+            f"Golden VPN TLS certificate renewed\n"
+            f"Server: {details['hostname']}\nDomain: {details['domain']}\n"
+            f"Valid until: {details['expires_at']}",
+            dry_run,
+        )
+    state.update(
+        {
+            "fingerprint": details["fingerprint"],
+            "last_replacement_fingerprint": details["fingerprint"],
+            "last_warning": None,
+            "last_renewal_notification": datetime.now(tz=timezone.utc).isoformat(),
+            **details,
+        }
+    )
+    if not dry_run:
+        save_state(state)
+    print(f"Renewal recorded: {details['domain']}")
+
+
+def main(argv: list[str]) -> None:
+    command = argv[0] if argv else "check"
+    dry_run = "--dry-run" in argv[1:]
+    if command == "check":
+        command_check(dry_run)
+    elif command == "renewed":
+        command_renewed(dry_run)
+    elif command == "test":
+        details = cert_details()
+        telegram_send(
+            f"Golden VPN Telegram test\nServer: {details['hostname']}\nDomain: {details['domain']}",
+            dry_run,
+        )
+        print("Telegram test sent" if not dry_run else "Telegram test dry-run")
+    else:
+        fail("Usage: vpn-cert-notify [check|renewed|test] [--dry-run]")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+PY
+EOF
+  chmod 0755 /usr/local/bin/vpn-cert-notify
 }
 
 install_helper_help() {
@@ -4394,7 +4883,7 @@ print_menu() {
   menu_item 8 "Service health" "systemd checks"
   menu_item 9 "Grafana access" "SSH tunnel and dashboard 1860"
   menu_item 10 "Decoy and public URLs" "site and subscription URL shapes"
-  menu_item 11 "Bot export" "AWG SQLite bundles for vpn-seller-lite"
+  menu_item 11 "Bot export" "typed SQLite bundles and Telegram delivery"
   printf '\n%sNo prompt is shown on login; this menu is printed and your shell stays usable.%s\n' "${yellow}" "${reset}"
 }
 
@@ -4607,21 +5096,32 @@ topic_bot_export() {
   cat <<'HELP'
 11. Bot export
 
-Export AWG configs into vpn-seller-lite SQLite bundles.
+Export typed AWG, Trojan, and Hysteria keys into vpn-seller SQLite bundles.
+
+Golden issuer bot credentials (file mode 0600):
+  /etc/golden-vpn-installer/issuer-bot.env
 
 Secret-free server audit:
   vpn-bot-export audit --out /root/vpn-keys/bot-export/server-audit.json
 
-Importable stock bundle:
-  vpn-bot-export keys --plan plan_30 --out /root/vpn-keys/bot-export/keys.sqlite
+Active key inventory (imported as issued):
+  vpn-bot-export inventory --type all --plan plan_30 --out /root/vpn-keys/bot-export/active.sqlite --send
+
+Create bot stock (imported as available):
+  vpn-bot-export batch --type awg --count 20 --prefix stock --plan plan_30 --send
+
+Supported batch types: awg, trojan, hysteria.
 
 Emergency replacement bundle:
   vpn-bot-export emergency --map /root/vpn-migration/map.csv --out /root/vpn-keys/bot-export/emergency.sqlite
 
+This helper only creates replacement credentials/bundles. vpn-seller owns customer
+notifications, client-to-key mapping, incident decisions, and replacement delivery.
+
 Config fingerprint:
   vpn-bot-export fingerprint /root/vpn-keys/awg/AWG-US-phone1.conf
 
-The bot v1 import format is AWG-only. Trojan and Hysteria remain in Golden subscription bundles.
+Upload or forward a typed SQLite bundle to vpn-seller with /admin_import.
 HELP
 }
 
@@ -4688,6 +5188,7 @@ install_helpers() {
   install_helper_awg
   install_helper_subscriptions
   install_helper_bot_export
+  install_helper_cert_notify
   install_helper_help
   install_shell_startup_hook
 }
@@ -5061,6 +5562,33 @@ Unit=vpn-stack-healthcheck.service
 WantedBy=timers.target
 EOF
   chmod 0644 /etc/systemd/system/vpn-stack-healthcheck.timer
+
+  cat >/etc/systemd/system/vpn-cert-notify.service <<'EOF'
+[Unit]
+Description=Golden VPN TLS certificate expiry notification
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vpn-cert-notify check
+EOF
+  chmod 0644 /etc/systemd/system/vpn-cert-notify.service
+
+  cat >/etc/systemd/system/vpn-cert-notify.timer <<'EOF'
+[Unit]
+Description=Check Golden VPN TLS certificate daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30m
+Persistent=true
+Unit=vpn-cert-notify.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 0644 /etc/systemd/system/vpn-cert-notify.timer
 }
 
 enable_and_start_services() {
@@ -5079,6 +5607,7 @@ enable_and_start_services() {
   systemctl enable vpn-storage-maintenance.timer
   systemctl enable vpn-soft-reboot.timer
   systemctl enable vpn-stack-healthcheck.timer
+  systemctl enable vpn-cert-notify.timer
 
   systemctl restart systemd-journald || true
   systemctl restart xray-trojan-xhttp-tls
@@ -5093,6 +5622,7 @@ enable_and_start_services() {
   systemctl restart vpn-storage-maintenance.timer
   systemctl restart vpn-soft-reboot.timer
   systemctl restart vpn-stack-healthcheck.timer
+  systemctl restart vpn-cert-notify.timer
 }
 
 load_installed_context() {
@@ -5315,10 +5845,12 @@ Subscription bundles:
   Metadata root: ${SUBSCRIPTION_DIR}
   Public root: ${SUBSCRIPTION_WEB_DIR}
 
-Bot export for vpn-seller-lite:
+Bot export for vpn-seller:
   Audit: vpn-bot-export audit --out ${KEY_DIR}/bot-export/server-audit.json
-  Stock: vpn-bot-export keys --plan plan_30 --out ${KEY_DIR}/bot-export/keys.sqlite
+  Active typed keys: vpn-bot-export inventory --type all --plan plan_30 --out ${KEY_DIR}/bot-export/active-keys.sqlite --send
+  Typed stock: vpn-bot-export batch --type awg --count 20 --prefix stock --plan plan_30 --send
   Emergency: vpn-bot-export emergency --map /root/vpn-migration/map.csv --out ${KEY_DIR}/bot-export/emergency.sqlite
+  TLS notifications: vpn-cert-notify.timer
   Output root: ${KEY_DIR}/bot-export
 
   vpn-help
@@ -5424,7 +5956,7 @@ generate_install_report() {
     "stock_bundle": $(json_escape "${KEY_DIR}/bot-export/keys.sqlite"),
     "emergency_bundle": $(json_escape "${KEY_DIR}/bot-export/emergency.sqlite"),
     "audit_json": $(json_escape "${KEY_DIR}/bot-export/server-audit.json"),
-    "bot_contract": "vpn-seller-lite AWG-only SQLite v1; reports never include client config bodies"
+    "bot_contract": "vpn-seller typed AWG/Trojan/Hysteria SQLite v1; reports never include client config bodies"
   }
 }
 EOF
@@ -5735,6 +6267,7 @@ install_upgrade_helpers() {
     install_helper_hysteria
   fi
   install_helper_bot_export
+  install_helper_cert_notify
 
   if [[ "${protocol}" == "trojan" ]]; then
     install_helper_trojan
@@ -5763,6 +6296,7 @@ apply_upgrade_overlay() {
   systemctl restart systemd-journald || true
   systemctl enable --now logrotate.timer vpn-storage-maintenance.timer
   systemctl enable vpn-soft-reboot.timer vpn-stack-healthcheck.timer
+  systemctl enable --now vpn-cert-notify.timer
 
   if systemctl cat prometheus.service >/dev/null 2>&1; then
     systemctl enable prometheus.service
