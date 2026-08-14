@@ -29,6 +29,7 @@ export STACK_DIR KEY_DIR XRAY_DIR HYSTERIA_DIR SUBSCRIPTION_DIR SUBSCRIPTION_WEB
 export UPGRADE_BACKUP_ROOT VLESS_TROJAN_MIGRATION_ROOT VLESS_TROJAN_MIGRATION_REPORT
 export TROJAN_XHTTP_SOCKET VLESS_MIGRATION_NGINX_SITE VLESS_XRAY_SERVICE XRAY_BIN
 export TROJAN_HELPER_PATH
+export SERVER_LOCATION=FR
 
 mkdir -p \
   "${XRAY_DIR}" "${HYSTERIA_DIR}" "$(dirname "${AWG_CONFIG}")" \
@@ -62,7 +63,6 @@ cat >"${XRAY_DIR}/config.json" <<JSON
 JSON
 chmod 0600 "${XRAY_DIR}/config.json"
 printf 'example.test\n' >"${STACK_DIR}/domain.txt"
-printf 'FR\n' >"${STACK_DIR}/server-location.txt"
 printf '{"alpha":"hy-secret"}\n' >"${STACK_DIR}/hysteria-clients.json"
 printf 'hysteria config\n' >"${HYSTERIA_DIR}/config.yaml"
 printf 'hysteria client\n' >"${KEY_DIR}/hysteria/alpha.txt"

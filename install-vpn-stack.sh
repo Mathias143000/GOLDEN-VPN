@@ -6526,6 +6526,7 @@ vless_migration_service() {
 vless_migration_preflight() {
   local nginx_site service path
   [[ "${EUID}" -eq 0 ]] || die "Run VLESS migration as root."
+  load_installed_context
   need_command jq
   need_command python3
   need_command openssl
@@ -6557,7 +6558,8 @@ vless_migration_preflight() {
     || die "Every legacy VLESS client must have a unique safe email label before migration."
   [[ -x /usr/local/bin/xray || -x "${XRAY_BIN:-}" ]] || die "Xray binary is missing."
   [[ -s "${STACK_DIR}/domain.txt" ]] || die "Installed domain metadata is missing."
-  [[ -s "${STACK_DIR}/server-location.txt" ]] || die "Installed server-location metadata is missing."
+  valid_server_location "${SERVER_LOCATION:-}" \
+    || die "SERVER_LOCATION is missing. Export the two-letter location, for example SERVER_LOCATION=FR."
   nginx_site="$(vless_migration_nginx_site)"
   grep -Fq 'location / {' "${nginx_site}" \
     || die "Could not find the decoy catch-all location in ${nginx_site}."
