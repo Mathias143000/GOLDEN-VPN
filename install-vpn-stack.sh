@@ -8,7 +8,7 @@ export APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND:-none}"
 
 : "${APT_LOCK_TIMEOUT:=1800}"
 
-GOLDEN_VPN_VERSION="2026.08.12"
+GOLDEN_VPN_VERSION="2026.08.14"
 
 STACK_DIR="/opt/vpn-stack"
 KEY_DIR="/root/vpn-keys"
@@ -19,6 +19,7 @@ CERT_DIR="/etc/letsencrypt/live/${DOMAIN:-}"
 SUBSCRIPTION_DIR="${STACK_DIR}/subscriptions"
 SUBSCRIPTION_WEB_DIR="/var/www/subscriptions"
 TROJAN_XHTTP_SOCKET="/dev/shm/xray-trojan-xhttp.sock"
+TROJAN_HELPER_PATH="/usr/local/bin/vpn-trojan"
 RESUME_INSTALL_DIR="/root/vpn-stack-resume"
 RESUME_INSTALL_SCRIPT="${RESUME_INSTALL_DIR}/install-vpn-stack.sh"
 RESUME_INSTALL_ENV_DIR="/etc/golden-vpn-installer"
@@ -39,6 +40,10 @@ INSTALL_REPORT_TXT="${KEY_DIR}/install-report.txt"
 INSTALL_REPORT_JSON="${KEY_DIR}/install-report.json"
 UPGRADE_BACKUP_ROOT="${KEY_DIR}/upgrade-backups"
 UPGRADE_REPORT="${KEY_DIR}/upgrade-report.json"
+VLESS_TROJAN_MIGRATION_ROOT="/root/vpn-migration/vless-to-trojan"
+VLESS_TROJAN_MIGRATION_REPORT="${KEY_DIR}/vless-to-trojan-report.json"
+AWG_MTU_MIGRATION_ROOT="/root/vpn-migration/awg-mtu"
+AWG_MTU_MIGRATION_REPORT="${KEY_DIR}/awg-mtu-migration-report.json"
 INSTALLER_VERSION_FILE="${STACK_DIR}/installer-version.txt"
 DECOY_MANIFEST="${STACK_DIR}/decoy-manifest.json"
 AWG_TUNING_REPORT="${STACK_DIR}/awg-tuning-report.json"
@@ -1727,6 +1732,7 @@ configure_xray() {
   printf '%s\n' "${password}" >"${STACK_DIR}/trojan-xhttp-password.txt"
   printf '%s\n' "${path}" >"${STACK_DIR}/trojan-xhttp-path.txt"
   printf '%s\n' "${TROJAN_XHTTP_SOCKET}" >"${STACK_DIR}/trojan-xhttp-socket.txt"
+  printf '%s\n' "xray-trojan-xhttp-tls.service" >"${STACK_DIR}/trojan-xhttp-service.txt"
   chmod 0600 "${STACK_DIR}"/trojan-xhttp-*.txt
   rm -f "${TROJAN_XHTTP_SOCKET}" /dev/shm/xray-vless-xhttp.sock
   rm -f "${STACK_DIR}"/vless-xhttp-*.txt "${STACK_DIR}"/vless-reality-*.txt
@@ -2659,14 +2665,15 @@ configure_firewall() {
 }
 
 install_helper_trojan() {
-  cat >/usr/local/bin/vpn-trojan <<'EOF'
+  install -d -m 0755 "$(dirname "${TROJAN_HELPER_PATH}")"
+  cat >"${TROJAN_HELPER_PATH}" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 CONFIG="/opt/vpn-stack/xray/config.json"
 STACK_DIR="/opt/vpn-stack"
 KEY_DIR="/root/vpn-keys/trojan"
-SERVICE="xray-trojan-xhttp-tls.service"
+SERVICE="$(cat "${STACK_DIR}/trojan-xhttp-service.txt" 2>/dev/null || printf 'xray-trojan-xhttp-tls.service')"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 uri_encode() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
@@ -2762,7 +2769,7 @@ print_qr "${link}"
 printf 'Link:\n%s\n' "${link}"
 printf 'Saved: %s\n' "${KEY_DIR}/${label}.txt"
 EOF
-  chmod 0755 /usr/local/bin/vpn-trojan
+  chmod 0755 "${TROJAN_HELPER_PATH}"
 }
 
 install_helper_hysteria() {
@@ -3457,7 +3464,7 @@ SUB_DIR="${STACK_DIR}/subscriptions"
 WEB_ROOT="/var/www/subscriptions"
 KEY_ROOT="/root/vpn-keys"
 XRAY_CONFIG="${STACK_DIR}/xray/config.json"
-XRAY_SERVICE="xray-trojan-xhttp-tls.service"
+XRAY_SERVICE="$(cat "${STACK_DIR}/trojan-xhttp-service.txt" 2>/dev/null || printf 'xray-trojan-xhttp-tls.service')"
 HYSTERIA_CONFIG="${STACK_DIR}/hysteria/config.yaml"
 HYSTERIA_CLIENTS="${STACK_DIR}/hysteria-clients.json"
 HYSTERIA_SERVICE="hysteria2.service"
@@ -5655,6 +5662,13 @@ service_summary() {
   printf '%s/%s' "${active}" "${enabled}"
 }
 
+installed_trojan_xray_service() {
+  local service
+  service="$(cat "${STACK_DIR}/trojan-xhttp-service.txt" 2>/dev/null || true)"
+  [[ -n "${service}" ]] || service="xray-trojan-xhttp-tls.service"
+  printf '%s\n' "${service}"
+}
+
 listen_any_port() {
   local proto="$1"
   local port="$2"
@@ -5743,8 +5757,9 @@ wait_for_expected_listeners() {
 }
 
 print_install_summary() {
-  local dashboard_status awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_result
+  local dashboard_status awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_result xray_service
   load_installed_context
+  xray_service="$(installed_trojan_xray_service)"
   awg_port="$(current_awg_port)"
   swap_result="$(swap_report_label)"
   if [[ -s /var/lib/grafana/dashboards/node-exporter-full-1860.json ]]; then
@@ -5771,7 +5786,7 @@ Server location: ${SERVER_LOCATION}
 External interface: ${EXT_IFACE}
 
 Contours:
-  Trojan XHTTP TLS   : service $(service_summary xray-trojan-xhttp-tls); external 443/tcp via nginx $(listen_label any tcp 443); backend ${TROJAN_XHTTP_SOCKET} $(socket_label "${TROJAN_XHTTP_SOCKET}")
+  Trojan XHTTP TLS   : service $(service_summary "${xray_service}"); external 443/tcp via nginx $(listen_label any tcp 443); backend ${TROJAN_XHTTP_SOCKET} $(socket_label "${TROJAN_XHTTP_SOCKET}")
   Hysteria2 Salamander: service $(service_summary hysteria2); external 8443/udp $(listen_label any udp 8443)
   AmneziaWG 2.0       : service $(service_summary awg-quick@awg0); external ${awg_port}/udp $(listen_label any udp "${awg_port}"); interface awg0
   Decoy HTTPS site    : nginx $(service_summary nginx); https://${DOMAIN}/; randomized static site on 443/tcp
@@ -5863,8 +5878,9 @@ EOF
 }
 
 generate_install_report() {
-  local awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_active dashboard_status swap_result
+  local awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_active dashboard_status swap_result xray_service
   load_installed_context
+  xray_service="$(installed_trojan_xray_service)"
   awg_port="$(current_awg_port)"
   swap_result="$(swap_report_label)"
   awg_profile="$(grep -E '^AWG_OBFS_PROFILE=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')"
@@ -5899,7 +5915,7 @@ generate_install_report() {
   "contours": {
     "trojan_xhttp_tls": {
       "external": "443/tcp",
-      "service": $(json_escape "$(service_summary xray-trojan-xhttp-tls)"),
+      "service": $(json_escape "$(service_summary "${xray_service}")"),
       "backend_socket": $(json_escape "${TROJAN_XHTTP_SOCKET}")
     },
     "hysteria2_salamander": {
@@ -5965,9 +5981,10 @@ EOF
 }
 
 validate_stack() {
-  local failed=0 awg_port
+  local failed=0 awg_port xray_service
   load_installed_context
   awg_port="$(current_awg_port)"
+  xray_service="$(installed_trojan_xray_service)"
 
   check_pass() {
     local label="$1"
@@ -6003,7 +6020,7 @@ validate_stack() {
   check_absent "Prometheus not public" listen_nonlocal_port tcp 9090
   check_absent "Node Exporter not public" listen_nonlocal_port tcp 9100
   check_pass "nginx active" systemctl is-active --quiet nginx
-  check_pass "xray-trojan-xhttp-tls active" systemctl is-active --quiet xray-trojan-xhttp-tls
+  check_pass "Trojan-capable Xray active (${xray_service})" systemctl is-active --quiet "${xray_service}"
   check_pass "hysteria2 active" systemctl is-active --quiet hysteria2
   check_pass "awg-quick@awg0 active" systemctl is-active --quiet awg-quick@awg0
   check_pass "prometheus active" systemctl is-active --quiet prometheus
@@ -6031,15 +6048,16 @@ validate_stack() {
 }
 
 final_checks() {
-  local awg_port
+  local awg_port xray_service
   awg_port="$(current_awg_port)"
+  xray_service="$(installed_trojan_xray_service)"
   log "Final listening socket check."
   set +e
   ss -lntup | grep -E ":443|:8443|:${awg_port}|:3000|:9090|:9100"
   ls -l "${TROJAN_XHTTP_SOCKET}"
 
   systemctl status nginx --no-pager
-  systemctl status xray-trojan-xhttp-tls --no-pager
+  systemctl status "${xray_service}" --no-pager
   systemctl status hysteria2 --no-pager
   systemctl status awg-quick@awg0 --no-pager -l
   systemctl status prometheus --no-pager
@@ -6118,6 +6136,8 @@ upgrade_profile_roots() {
     "${XRAY_DIR}"
     "${STACK_DIR}/trojan-xhttp-password.txt"
     "${STACK_DIR}/trojan-xhttp-path.txt"
+    "${STACK_DIR}/trojan-xhttp-socket.txt"
+    "${STACK_DIR}/trojan-xhttp-service.txt"
     "${STACK_DIR}/vless-xhttp-uuid.txt"
     "${STACK_DIR}/vless-xhttp-path.txt"
     "${STACK_DIR}/vless-reality-uuid.txt"
@@ -6364,6 +6384,770 @@ upgrade_existing_stack() {
   log "Upgrade report: ${UPGRADE_REPORT}"
 }
 
+upgrade_root_is_allowed() {
+  local root="/${1#/}"
+  case "${root}" in
+    "${XRAY_DIR}"|\
+    "${STACK_DIR}/trojan-xhttp-password.txt"|\
+    "${STACK_DIR}/trojan-xhttp-path.txt"|\
+    "${STACK_DIR}/trojan-xhttp-socket.txt"|\
+    "${STACK_DIR}/trojan-xhttp-service.txt"|\
+    "${STACK_DIR}/vless-xhttp-uuid.txt"|\
+    "${STACK_DIR}/vless-xhttp-path.txt"|\
+    "${STACK_DIR}/vless-reality-uuid.txt"|\
+    "${STACK_DIR}/vless-reality-path.txt"|\
+    "${HYSTERIA_DIR}"|\
+    "${STACK_DIR}/hysteria-clients.json"|\
+    "${STACK_DIR}/hysteria-auth.txt"|\
+    "${STACK_DIR}/hysteria-obfs.txt"|\
+    "${AWG_CONFIG}"|\
+    "${KEY_DIR}/trojan"|\
+    "${KEY_DIR}/vless"|\
+    "${KEY_DIR}/vless-xhttp"|\
+    "${KEY_DIR}/vless-reality"|\
+    "${KEY_DIR}/hysteria"|\
+    "${KEY_DIR}/awg"|\
+    "${SUBSCRIPTION_DIR}"|\
+    "${SUBSCRIPTION_WEB_DIR}")
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+validate_upgrade_rollback_archive() {
+  local backup_dir="$1"
+  local roots_file="${backup_dir}/profile-roots.txt" archive="${backup_dir}/profiles.tar"
+  local root member matched
+  local -a roots=()
+
+  [[ -s "${roots_file}" ]] || die "Rollback root list is missing: ${roots_file}"
+  [[ -s "${archive}" ]] || die "Rollback archive is missing: ${archive}"
+  [[ -s "${archive}.sha256" ]] || die "Rollback checksum is missing: ${archive}.sha256"
+  sha256sum -c "${archive}.sha256" >/dev/null \
+    || die "Rollback archive checksum verification failed."
+
+  while IFS= read -r root; do
+    [[ -n "${root}" && "${root}" != /* \
+      && "${root}" != ".." && "${root}" != ../* \
+      && "${root}" != */../* && "${root}" != */.. ]] \
+      || die "Unsafe rollback root: ${root:-empty}"
+    upgrade_root_is_allowed "${root}" || die "Rollback root is outside the protected profile set: /${root}"
+    roots+=("${root%/}")
+  done <"${roots_file}"
+  ((${#roots[@]} > 0)) || die "Rollback root list is empty."
+
+  while IFS= read -r member; do
+    member="${member#./}"
+    member="${member%/}"
+    [[ -n "${member}" && "${member}" != /* \
+      && "${member}" != ".." && "${member}" != ../* \
+      && "${member}" != */../* && "${member}" != */.. ]] \
+      || die "Unsafe path in rollback archive: ${member:-empty}"
+    matched=0
+    for root in "${roots[@]}"; do
+      if [[ "${member}" == "${root}" || "${member}" == "${root}/"* ]]; then
+        matched=1
+        break
+      fi
+    done
+    ((matched == 1)) || die "Archive member is outside the recorded profile roots: ${member}"
+  done < <(tar -tf "${archive}")
+}
+
+upgrade_rollback() {
+  local requested_backup="${1:-}" confirmation="${2:-}"
+  local backup_root backup_dir roots_file before after root target
+
+  [[ "${EUID}" -eq 0 ]] || die "Run rollback as root."
+  [[ -n "${requested_backup}" ]] \
+    || die "Usage: ./install-vpn-stack.sh upgrade-rollback BACKUP_DIR --confirm-profile-restore"
+  [[ "${confirmation}" == "--confirm-profile-restore" ]] \
+    || die "Rollback replaces the protected profile state. Re-run with --confirm-profile-restore after checking the backup path."
+  need_command realpath
+  need_command tar
+  need_command sha256sum
+  need_command cmp
+
+  backup_root="$(realpath -e -- "${UPGRADE_BACKUP_ROOT}")" \
+    || die "Upgrade backup root does not exist: ${UPGRADE_BACKUP_ROOT}"
+  backup_dir="$(realpath -e -- "${requested_backup}")" \
+    || die "Rollback backup directory does not exist: ${requested_backup}"
+  [[ -d "${backup_dir}" && "${backup_dir}" == "${backup_root}/"* ]] \
+    || die "Rollback backup must be a directory below ${backup_root}."
+
+  roots_file="${backup_dir}/profile-roots.txt"
+  before="${backup_dir}/profiles.before.tsv"
+  after="${backup_dir}/profiles.rollback.tsv"
+  [[ -s "${before}" ]] || die "Pre-upgrade manifest is missing: ${before}"
+  validate_upgrade_rollback_archive "${backup_dir}"
+
+  warn "Restoring the protected VPN profile state from ${backup_dir}."
+  warn "VPN services will not be restarted automatically."
+  while IFS= read -r root; do
+    upgrade_root_is_allowed "${root}" || die "Unsafe rollback root: /${root}"
+    target="/${root}"
+    rm -rf -- "${target:?}"
+  done <"${roots_file}"
+  tar -C / -xpf "${backup_dir}/profiles.tar"
+
+  write_upgrade_profile_manifest "${after}"
+  if ! cmp -s "${before}" "${after}"; then
+    diff -u "${before}" "${after}" >"${backup_dir}/profiles.rollback.diff" || true
+    chmod 0600 "${backup_dir}/profiles.rollback.diff"
+    die "Rollback extraction finished, but the manifest differs. Inspect ${backup_dir}/profiles.rollback.diff before restarting VPN services."
+  fi
+
+  log "Protected VPN profile state restored byte-for-byte from ${backup_dir}."
+  log "No VPN service was restarted. Validate configs, then restart only the affected service if required."
+}
+
+vless_migration_nginx_site() {
+  local site="${VLESS_MIGRATION_NGINX_SITE:-/etc/nginx/sites-enabled/decoy-443.conf}"
+  [[ -e "${site}" || -L "${site}" ]] || die "Legacy nginx site was not found: ${site}"
+  realpath -e -- "${site}"
+}
+
+vless_migration_service() {
+  local service
+  if [[ -n "${VLESS_XRAY_SERVICE:-}" ]]; then
+    printf '%s\n' "${VLESS_XRAY_SERVICE}"
+    return 0
+  fi
+  for service in xray-vless-xhttp-tls.service xray-vless-reality-xhttp.service; do
+    if systemctl cat "${service}" >/dev/null 2>&1; then
+      printf '%s\n' "${service}"
+      return 0
+    fi
+  done
+  die "Legacy VLESS systemd service was not found."
+}
+
+vless_migration_preflight() {
+  local nginx_site service path
+  [[ "${EUID}" -eq 0 ]] || die "Run VLESS migration as root."
+  need_command jq
+  need_command python3
+  need_command openssl
+  need_command sha256sum
+  need_command realpath
+  [[ -s "${XRAY_DIR}/config.json" ]] || die "Missing Xray config: ${XRAY_DIR}/config.json"
+  jq -e . "${XRAY_DIR}/config.json" >/dev/null || die "Existing Xray config is not valid JSON."
+  [[ "$(detect_installed_xray_protocol)" == "vless" ]] \
+    || die "This command requires a legacy VLESS-only Golden Xray config."
+  jq -e '[.inbounds[]? | select(.protocol == "trojan")] | length == 0' "${XRAY_DIR}/config.json" >/dev/null \
+    || die "A Trojan inbound already exists; refusing to create a duplicate migration."
+  for path in \
+    "${STACK_DIR}/trojan-xhttp-password.txt" \
+    "${STACK_DIR}/trojan-xhttp-path.txt" \
+    "${STACK_DIR}/trojan-xhttp-socket.txt" \
+    "${STACK_DIR}/trojan-xhttp-service.txt" \
+    "${TROJAN_HELPER_PATH}"; do
+    [[ ! -e "${path}" ]] || die "Stale Trojan migration artifact already exists: ${path}"
+  done
+  if [[ -d "${KEY_DIR}/trojan" ]] && find "${KEY_DIR}/trojan" -mindepth 1 -print -quit | grep -q .; then
+    die "Trojan client directory is not empty: ${KEY_DIR}/trojan"
+  fi
+  jq -e '
+    [.inbounds[]? | select(.protocol == "vless") | .settings.clients[]?]
+    | length > 0
+    and all(.email | type == "string" and test("^[A-Za-z0-9._-]+$"))
+    and ([.[].email] | length == (unique | length))
+  ' "${XRAY_DIR}/config.json" >/dev/null \
+    || die "Every legacy VLESS client must have a unique safe email label before migration."
+  [[ -x /usr/local/bin/xray || -x "${XRAY_BIN:-}" ]] || die "Xray binary is missing."
+  [[ -s "${STACK_DIR}/domain.txt" ]] || die "Installed domain metadata is missing."
+  [[ -s "${STACK_DIR}/server-location.txt" ]] || die "Installed server-location metadata is missing."
+  nginx_site="$(vless_migration_nginx_site)"
+  grep -Fq 'location / {' "${nginx_site}" \
+    || die "Could not find the decoy catch-all location in ${nginx_site}."
+  ! grep -Fq 'GOLDEN PARALLEL TROJAN BEGIN' "${nginx_site}" \
+    || die "The parallel Trojan nginx block already exists."
+  service="$(vless_migration_service)"
+  systemctl is-active --quiet "${service}" \
+    || die "Legacy VLESS service is not active: ${service}"
+}
+
+write_vless_migration_preserved_manifest() {
+  local output="$1" raw xray_config_rel trojan_key_rel
+  raw="$(mktemp "${output}.raw.XXXXXX")"
+  write_upgrade_profile_manifest "${raw}"
+  xray_config_rel="${XRAY_DIR#/}/config.json"
+  trojan_key_rel="${KEY_DIR#/}/trojan/"
+  {
+    jq -Sc '[.inbounds[]? | select(.protocol == "vless")]' "${XRAY_DIR}/config.json" \
+      | sha256sum | awk '{print "vless_inbounds\t" $1}'
+    awk -F '\t' -v xray_config="${xray_config_rel}" -v trojan_keys="${trojan_key_rel}" '
+      $1 == "xray_client" && $2 == "vless" { print; next }
+      $1 == "hysteria_client" || $1 == "awg_peer_count" { print; next }
+      $1 == "file" {
+        path = $2
+        if (path == xray_config) next
+        if (index(path, trojan_keys) == 1) next
+        if (path ~ /\/trojan-xhttp-(password|path|socket|service)\.txt$/) next
+        print
+      }
+    ' "${raw}"
+  } | LC_ALL=C sort >"${output}"
+  chmod 0600 "${output}"
+  rm -f "${raw}"
+}
+
+render_parallel_trojan_nginx_candidate() {
+  local source="$1" output="$2" path="$3" socket="$4"
+  python3 - "${source}" "${output}" "${path}" "${socket}" <<'PY'
+import pathlib
+import sys
+
+source, output, path, socket = sys.argv[1:]
+text = pathlib.Path(source).read_text(encoding="utf-8")
+marker = "    location / {"
+if text.count(marker) != 1:
+    raise SystemExit("expected exactly one decoy catch-all location")
+if "GOLDEN PARALLEL TROJAN BEGIN" in text:
+    raise SystemExit("parallel Trojan block already exists")
+block = f'''    # GOLDEN PARALLEL TROJAN BEGIN
+    location ^~ {path} {{
+        client_max_body_size 0;
+        client_body_timeout 5m;
+        grpc_read_timeout 315s;
+        grpc_send_timeout 5m;
+        grpc_set_header Host $host;
+        grpc_set_header X-Real-IP $remote_addr;
+        grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        grpc_pass unix:{socket};
+    }}
+    # GOLDEN PARALLEL TROJAN END
+
+'''
+pathlib.Path(output).write_text(text.replace(marker, block + marker, 1), encoding="utf-8")
+PY
+  chmod 0600 "${output}"
+}
+
+prepare_vless_to_trojan_migration() {
+  local stamp bundle nginx_site service path password name clients_json tmp_credentials checksum_tmp
+  local xray_bin="${XRAY_BIN:-/usr/local/bin/xray}" label encoded_path fragment domain
+  local first_password=""
+  vless_migration_preflight
+  install -d -m 0700 "${VLESS_TROJAN_MIGRATION_ROOT}"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  bundle="$(mktemp -d "${VLESS_TROJAN_MIGRATION_ROOT}/${stamp}.XXXXXX")"
+  chmod 0700 "${bundle}"
+  install -d -m 0700 "${bundle}/links"
+  nginx_site="$(vless_migration_nginx_site)"
+  service="$(vless_migration_service)"
+  path="/$(rand_hex 8)/$(rand_hex 8)/"
+  domain="$(<"${STACK_DIR}/domain.txt")"
+
+  install -m 0600 "${XRAY_DIR}/config.json" "${bundle}/xray.before.json"
+  install -m 0600 "${nginx_site}" "${bundle}/nginx.before.conf"
+  printf '%s\n' "${nginx_site}" >"${bundle}/nginx-site.txt"
+  printf '%s\n' "${service}" >"${bundle}/xray-service.txt"
+  printf '%s\n' "${path}" >"${bundle}/trojan-path.txt"
+  printf '%s\n' "${TROJAN_XHTTP_SOCKET}" >"${bundle}/trojan-socket.txt"
+  tmp_credentials="${bundle}/credentials.tsv"
+  : >"${tmp_credentials}"
+  clients_json='[]'
+  while IFS= read -r name; do
+    password="$(rand_hex 24)"
+    [[ -n "${first_password}" ]] || first_password="${password}"
+    printf '%s\t%s\n' "${name}" "${password}" >>"${tmp_credentials}"
+    clients_json="$(jq -c --arg password "${password}" --arg email "${name}" '. + [{password:$password,email:$email}]' <<<"${clients_json}")"
+  done < <(jq -r '.inbounds[] | select(.protocol == "vless") | .settings.clients[].email' "${XRAY_DIR}/config.json")
+
+  jq --argjson clients "${clients_json}" --arg path "${path}" --arg listen "${TROJAN_XHTTP_SOCKET},0666" '
+    .inbounds += [{
+      tag: "trojan-xhttp-tls",
+      listen: $listen,
+      protocol: "trojan",
+      settings: {clients: $clients},
+      streamSettings: {network: "xhttp", xhttpSettings: {path: $path, mode: "stream-one"}},
+      sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]}
+    }]
+  ' "${XRAY_DIR}/config.json" >"${bundle}/xray.candidate.json"
+  chmod 0600 "${bundle}/xray.candidate.json" "${tmp_credentials}"
+  "${xray_bin}" run -test -config "${bundle}/xray.candidate.json" >/dev/null
+
+  render_parallel_trojan_nginx_candidate "${nginx_site}" "${bundle}/nginx.candidate.conf" "${path}" "${TROJAN_XHTTP_SOCKET}"
+  : >"${bundle}/client-map.tsv"
+  while IFS=$'\t' read -r name password; do
+    label="$(label_name "TROJAN" "${name}")"
+    encoded_path="$(uri_encode "${path}")"
+    fragment="$(uri_encode "${label}")"
+    printf 'trojan://%s@%s:443?security=tls&type=xhttp&path=%s&mode=stream-one&sni=%s&host=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1#%s\n' \
+      "${password}" "${domain}" "${encoded_path}" "${domain}" "${domain}" "${fragment}" \
+      >"${bundle}/links/${label}.txt"
+    chmod 0600 "${bundle}/links/${label}.txt"
+    printf '%s\t%s\t%s\n' "${name}" "${label}" "links/${label}.txt" >>"${bundle}/client-map.tsv"
+  done <"${tmp_credentials}"
+  chmod 0600 "${bundle}/client-map.tsv"
+  printf '%s\n' "${first_password}" >"${bundle}/trojan-primary-password.txt"
+  chmod 0600 "${bundle}/trojan-primary-password.txt"
+  write_vless_migration_preserved_manifest "${bundle}/preserved.before.tsv"
+
+  checksum_tmp="$(mktemp)"
+  (
+    cd "${bundle}"
+    find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum
+  ) >"${checksum_tmp}"
+  install -m 0600 "${checksum_tmp}" "${bundle}/bundle.sha256"
+  rm -f "${checksum_tmp}"
+  chmod 0600 "${bundle}/bundle.sha256"
+  log "VLESS to Trojan migration bundle prepared: ${bundle}"
+  log "No live Xray or nginx configuration was changed."
+  printf '%s\n' "${bundle}"
+}
+
+resolve_vless_migration_bundle() {
+  local requested="$1" root bundle
+  root="$(realpath -e -- "${VLESS_TROJAN_MIGRATION_ROOT}")" \
+    || die "Migration root does not exist: ${VLESS_TROJAN_MIGRATION_ROOT}"
+  bundle="$(realpath -e -- "${requested}")" \
+    || die "Migration bundle does not exist: ${requested}"
+  [[ -d "${bundle}" && "${bundle}" == "${root}/"* ]] \
+    || die "Migration bundle must be below ${root}."
+  printf '%s\n' "${bundle}"
+}
+
+restore_vless_migration_preimage() {
+  local bundle="$1" nginx_site="$2" service="$3" xray_bin="${XRAY_BIN:-/usr/local/bin/xray}"
+  warn "Restoring pre-migration VLESS configuration."
+  install -m 0600 "${bundle}/xray.before.json" "${XRAY_DIR}/config.json"
+  install -m 0644 "${bundle}/nginx.before.conf" "${nginx_site}"
+  rm -f "${TROJAN_XHTTP_SOCKET}"
+  "${xray_bin}" run -test -config "${XRAY_DIR}/config.json" >/dev/null || true
+  nginx -t >/dev/null 2>&1 || true
+  systemctl restart "${service}" || true
+  systemctl reload nginx || true
+}
+
+apply_vless_to_trojan_migration() {
+  local requested="${1:-}" confirmation="${2:-}" bundle nginx_site service backup_dir
+  local xray_bin="${XRAY_BIN:-/usr/local/bin/xray}" preserved_after link target socket
+  local -a expected_sockets=()
+  [[ -n "${requested}" ]] \
+    || die "Usage: ./install-vpn-stack.sh migrate-vless-to-trojan-apply BUNDLE --confirm-parallel-trojan"
+  [[ "${confirmation}" == "--confirm-parallel-trojan" ]] \
+    || die "Re-run with --confirm-parallel-trojan after reviewing the migration bundle."
+  vless_migration_preflight
+  bundle="$(resolve_vless_migration_bundle "${requested}")"
+  (
+    cd "${bundle}"
+    sha256sum -c bundle.sha256 >/dev/null
+  ) || die "Migration bundle checksum verification failed."
+  nginx_site="$(vless_migration_nginx_site)"
+  service="$(vless_migration_service)"
+  [[ "$(<"${bundle}/nginx-site.txt")" == "${nginx_site}" ]] || die "nginx site changed since bundle preparation."
+  [[ "$(<"${bundle}/xray-service.txt")" == "${service}" ]] || die "Xray service changed since bundle preparation."
+  cmp -s "${bundle}/xray.before.json" "${XRAY_DIR}/config.json" || die "Xray config changed since bundle preparation. Prepare a fresh bundle."
+  cmp -s "${bundle}/nginx.before.conf" "${nginx_site}" || die "nginx config changed since bundle preparation. Prepare a fresh bundle."
+  preserved_after="${bundle}/preserved.preapply.tsv"
+  write_vless_migration_preserved_manifest "${preserved_after}"
+  cmp -s "${bundle}/preserved.before.tsv" "${preserved_after}" \
+    || die "Protected VLESS/Hysteria/AWG state changed since bundle preparation."
+  while IFS=$'\t' read -r name label link; do
+    [[ "${name}" =~ ^[A-Za-z0-9._-]+$ && "${label}" =~ ^TROJAN-[A-Z]{2}-[A-Za-z0-9._-]+$ ]] \
+      || die "Unsafe client mapping in ${bundle}/client-map.tsv"
+    [[ "${link}" == "links/${label}.txt" ]] || die "Unexpected client link path in migration bundle: ${link}"
+    target="${KEY_DIR}/trojan/$(basename "${link}")"
+    [[ ! -e "${target}" ]] || die "Trojan client file already exists: ${target}"
+  done <"${bundle}/client-map.tsv"
+
+  backup_dir="$(create_upgrade_backup)"
+  log "Pre-migration profile backup created: ${backup_dir}"
+  install -m 0600 "${bundle}/xray.candidate.json" "${XRAY_DIR}/config.json"
+  install -m 0644 "${bundle}/nginx.candidate.conf" "${nginx_site}"
+  if ! "${xray_bin}" run -test -config "${XRAY_DIR}/config.json" >/dev/null || ! nginx -t >/dev/null; then
+    restore_vless_migration_preimage "${bundle}" "${nginx_site}" "${service}"
+    die "Candidate config validation failed; legacy VLESS configuration was restored."
+  fi
+
+  rm -f "${TROJAN_XHTTP_SOCKET}"
+  if ! systemctl restart "${service}" || ! systemctl reload nginx; then
+    restore_vless_migration_preimage "${bundle}" "${nginx_site}" "${service}"
+    die "Service activation failed; legacy VLESS configuration was restored."
+  fi
+  mapfile -t expected_sockets < <(
+    jq -r '.inbounds[]?.listen // empty | split(",")[0] | select(startswith("/"))' "${XRAY_DIR}/config.json"
+  )
+  ((${#expected_sockets[@]} >= 2)) || {
+    restore_vless_migration_preimage "${bundle}" "${nginx_site}" "${service}"
+    die "Expected both legacy VLESS and parallel Trojan unix sockets."
+  }
+  local socket_ready=0 attempt all_ready
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    all_ready=1
+    for socket in "${expected_sockets[@]}"; do
+      [[ -S "${socket}" ]] || { all_ready=0; break; }
+    done
+    if ((all_ready == 1)); then socket_ready=1; break; fi
+    sleep 0.25
+  done
+  if ((socket_ready == 0)); then
+    restore_vless_migration_preimage "${bundle}" "${nginx_site}" "${service}"
+    die "Not all VLESS/Trojan unix sockets appeared; legacy VLESS configuration was restored."
+  fi
+
+  write_vless_migration_preserved_manifest "${bundle}/preserved.after.tsv"
+  if ! cmp -s "${bundle}/preserved.before.tsv" "${bundle}/preserved.after.tsv"; then
+    restore_vless_migration_preimage "${bundle}" "${nginx_site}" "${service}"
+    die "A protected legacy profile changed; legacy VLESS configuration was restored."
+  fi
+
+  if ! (
+    set -Eeuo pipefail
+    install -d -m 0700 "${KEY_DIR}/trojan"
+    while IFS=$'\t' read -r _ _ link; do
+      target="${KEY_DIR}/trojan/$(basename "${link}")"
+      install -m 0600 "${bundle}/${link}" "${target}"
+    done <"${bundle}/client-map.tsv"
+    install -m 0600 "${bundle}/trojan-path.txt" "${STACK_DIR}/trojan-xhttp-path.txt"
+    install -m 0600 "${bundle}/trojan-socket.txt" "${STACK_DIR}/trojan-xhttp-socket.txt"
+    install -m 0600 "${bundle}/trojan-primary-password.txt" "${STACK_DIR}/trojan-xhttp-password.txt"
+    printf '%s\n' "${service}" >"${STACK_DIR}/trojan-xhttp-service.txt"
+    chmod 0600 "${STACK_DIR}/trojan-xhttp-service.txt"
+    install_helper_trojan
+  ); then
+    while IFS=$'\t' read -r _ _ link; do
+      rm -f -- "${KEY_DIR}/trojan/$(basename "${link}")"
+    done <"${bundle}/client-map.tsv"
+    rmdir "${KEY_DIR}/trojan" 2>/dev/null || true
+    rm -f "${STACK_DIR}"/trojan-xhttp-{password,path,socket,service}.txt "${TROJAN_HELPER_PATH}"
+    restore_vless_migration_preimage "${bundle}" "${nginx_site}" "${service}"
+    die "Could not install Trojan migration artifacts; legacy VLESS configuration was restored."
+  fi
+  cat >"${VLESS_TROJAN_MIGRATION_REPORT}" <<EOF
+{
+  "version": $(json_escape "${GOLDEN_VPN_VERSION}"),
+  "applied_at": $(json_escape "$(date -Is)"),
+  "bundle": $(json_escape "${bundle}"),
+  "backup_dir": $(json_escape "${backup_dir}"),
+  "legacy_vless_preserved": true,
+  "trojan_clients_created": $(wc -l <"${bundle}/client-map.tsv"),
+  "xray_service": $(json_escape "${service}"),
+  "vpn_services_restarted": [$(json_escape "${service}")],
+  "nginx_reloaded": true
+}
+EOF
+  chmod 0600 "${VLESS_TROJAN_MIGRATION_REPORT}"
+  log "Parallel Trojan activated. Legacy VLESS clients and Hysteria/AWG state are unchanged."
+  log "Migration report: ${VLESS_TROJAN_MIGRATION_REPORT}"
+}
+
+awg_mtu_required_keys_json() {
+  local config="$1" mtu="$2"
+  python3 - "${config}" "${mtu}" <<'PY'
+import json
+import re
+import sys
+
+config, mtu = sys.argv[1:]
+required = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"]
+values = {}
+section = None
+with open(config, encoding="utf-8") as handle:
+    for raw in handle:
+        line = raw.strip()
+        match = re.fullmatch(r"\[([^]]+)\]", line)
+        if match:
+            section = match.group(1).lower()
+            continue
+        if section != "interface" or not line or line.startswith(("#", ";")) or "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        for canonical in required:
+            if key.lower() == canonical.lower():
+                values[canonical] = value
+                break
+missing = [key for key in required if not values.get(key)]
+if missing:
+    raise SystemExit("missing full AWG 2.0 tuning fields: " + ", ".join(missing))
+values = {"MTU": mtu, **{key: values[key] for key in required}}
+print(json.dumps(values, ensure_ascii=False, separators=(",", ":")))
+PY
+}
+
+render_awg_tuning_candidate() {
+  local source="$1" output="$2" values_json="$3"
+  python3 - "${source}" "${output}" "${values_json}" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+source, output, values_raw = sys.argv[1:]
+values = json.loads(values_raw)
+standard_order = ["MTU", "Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"]
+order = [key for key in standard_order if key in values]
+lookup = {key.lower(): key for key in order}
+lines = pathlib.Path(source).read_text(encoding="utf-8").splitlines(keepends=True)
+if "MTU" in values:
+    lines = [f"# MTU = {values['MTU']}\n" if re.fullmatch(r"\s*#\s*MTU\s*=.*", line.rstrip("\r\n"), re.IGNORECASE) else line for line in lines]
+starts = [index for index, line in enumerate(lines) if line.strip().lower() == "[interface]"]
+if len(starts) != 1:
+    raise SystemExit("expected exactly one [Interface] section")
+start = starts[0]
+end = next((index for index in range(start + 1, len(lines)) if re.fullmatch(r"\s*\[[^]]+\]\s*", lines[index])), len(lines))
+seen = set()
+rendered = lines[: start + 1]
+for line in lines[start + 1 : end]:
+    stripped = line.strip()
+    comment = re.fullmatch(r"#\s*MTU\s*=.*", stripped, re.IGNORECASE)
+    if comment:
+        rendered.append(f"# MTU = {values['MTU']}\n")
+        continue
+    if "=" in line and not stripped.startswith(("#", ";")):
+        key = line.split("=", 1)[0].strip()
+        canonical = lookup.get(key.lower())
+        if canonical:
+            if canonical not in seen:
+                rendered.append(f"{canonical} = {values[canonical]}\n")
+                seen.add(canonical)
+            continue
+    rendered.append(line)
+for key in order:
+    if key not in seen:
+        rendered.append(f"{key} = {values[key]}\n")
+if rendered and not rendered[-1].endswith("\n"):
+    rendered[-1] += "\n"
+rendered.extend(lines[end:])
+pathlib.Path(output).write_text("".join(rendered), encoding="utf-8")
+PY
+  chmod 0600 "${output}"
+}
+
+write_awg_non_tuning_manifest() {
+  local config="$1" client_dir="$2" output="$3"
+  python3 - "${config}" "${client_dir}" >"${output}" <<'PY'
+import hashlib
+import pathlib
+import re
+import sys
+
+config = pathlib.Path(sys.argv[1])
+client_dir = pathlib.Path(sys.argv[2])
+tuning = {key.lower() for key in ["MTU", "Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"]}
+
+def normalized(path):
+    result = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        stripped = raw.strip()
+        if re.fullmatch(r"#\s*(MTU|ObfuscationProfile|EffectiveProfile)\s*=.*", stripped, re.IGNORECASE):
+            continue
+        if "=" in raw and not stripped.startswith(("#", ";")):
+            key = raw.split("=", 1)[0].strip().lower()
+            if key in tuning:
+                continue
+        result.append(raw)
+    return ("\n".join(result) + "\n").encode()
+
+paths = [("server", config)]
+paths.extend((f"client/{path.name}", path) for path in sorted(client_dir.glob("*.conf")))
+for label, path in paths:
+    print(f"{label}\t{hashlib.sha256(normalized(path)).hexdigest()}")
+PY
+  chmod 0600 "${output}"
+}
+
+write_awg_params_candidate() {
+  local output="$1" values_json="$2" mtu="$3" first_client="$4"
+  local key value listen_port dns allowed keepalive endpoint endpoint_port
+  listen_port="$(awk -F= 'tolower($1) ~ /^[[:space:]]*listenport[[:space:]]*$/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "${AWG_CONFIG}")"
+  dns="$(awk -F= 'tolower($1) ~ /^[[:space:]]*dns[[:space:]]*$/ {sub(/^[^=]*=[[:space:]]*/,""); print; exit}' "${first_client}")"
+  allowed="$(awk -F= 'tolower($1) ~ /^[[:space:]]*allowedips[[:space:]]*$/ {sub(/^[^=]*=[[:space:]]*/,""); print; exit}' "${first_client}")"
+  keepalive="$(awk -F= 'tolower($1) ~ /^[[:space:]]*persistentkeepalive[[:space:]]*$/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "${first_client}")"
+  endpoint="$(awk -F= 'tolower($1) ~ /^[[:space:]]*endpoint[[:space:]]*$/ {sub(/^[^=]*=[[:space:]]*/,""); print; exit}' "${first_client}")"
+  endpoint_port="${endpoint##*:}"
+  [[ "${listen_port}" =~ ^[0-9]+$ ]] || listen_port="${AWG_DEFAULT_PORT}"
+  [[ "${endpoint_port}" =~ ^[0-9]+$ ]] || endpoint_port="${listen_port}"
+  [[ -n "${dns}" ]] || dns="1.1.1.1, 8.8.8.8"
+  [[ -n "${allowed}" ]] || allowed="0.0.0.0/0, ::/0"
+  [[ "${keepalive}" =~ ^[0-9]+$ ]] || keepalive="25"
+  {
+    printf 'AWG_OBFS_PROFILE=%q\n' "custom"
+    printf 'AWG_EFFECTIVE_PROFILE=%q\n' "custom"
+    printf 'AWG_TUNING_SOURCE=%q\n' "migration-preserved-server-obfuscation"
+    printf 'AWG_MTU=%q\n' "${mtu}"
+    printf 'AWG_MTU_SOURCE=%q\n' "migration-tested-baseline"
+    printf 'AWG_ENDPOINT_PORT=%q\n' "${endpoint_port}"
+    printf 'AWG_DNS=%q\n' "${dns}"
+    printf 'AWG_ALLOWED_IPS=%q\n' "${allowed}"
+    printf 'AWG_KEEPALIVE=%q\n' "${keepalive}"
+    for key in Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5; do
+      value="$(jq -r --arg key "${key}" '.[$key]' <<<"${values_json}")"
+      printf 'AWG_%s=%q\n' "$(printf '%s' "${key}" | tr '[:lower:]' '[:upper:]')" "${value}"
+    done
+  } >"${output}"
+  chmod 0600 "${output}"
+}
+
+awg_mtu_migration_preflight() {
+  local mtu="$1" client_count
+  [[ "${EUID}" -eq 0 ]] || die "Run AWG MTU migration as root."
+  validate_int_range AWG_MTU "${mtu}" 1200 1420
+  need_command jq
+  need_command python3
+  need_command sha256sum
+  [[ -s "${AWG_CONFIG}" ]] || die "Missing AWG server config: ${AWG_CONFIG}"
+  [[ -d "${KEY_DIR}/awg" ]] || die "Missing AWG client directory: ${KEY_DIR}/awg"
+  client_count="$(find "${KEY_DIR}/awg" -maxdepth 1 -type f -name '*.conf' | wc -l)"
+  ((client_count > 0)) || die "No AWG client configs were found."
+  awg_mtu_required_keys_json "${AWG_CONFIG}" "${mtu}" >/dev/null
+  systemctl is-active --quiet awg-quick@awg0.service || die "awg-quick@awg0.service is not active."
+}
+
+prepare_awg_mtu_migration() {
+  local mtu="${1:-1320}" stamp bundle values_json client candidate checksum_tmp first_client
+  awg_mtu_migration_preflight "${mtu}"
+  values_json="$(awg_mtu_required_keys_json "${AWG_CONFIG}" "${mtu}")"
+  install -d -m 0700 "${AWG_MTU_MIGRATION_ROOT}"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  bundle="$(mktemp -d "${AWG_MTU_MIGRATION_ROOT}/${stamp}.XXXXXX")"
+  chmod 0700 "${bundle}"
+  install -d -m 0700 "${bundle}/clients.before" "${bundle}/clients.candidate"
+  install -m 0600 "${AWG_CONFIG}" "${bundle}/awg0.before.conf"
+  render_awg_tuning_candidate "${AWG_CONFIG}" "${bundle}/awg0.candidate.conf" "$(jq -c '{MTU}' <<<"${values_json}")"
+
+  while IFS= read -r client; do
+    candidate="${bundle}/clients.candidate/$(basename "${client}")"
+    install -m 0600 "${client}" "${bundle}/clients.before/$(basename "${client}")"
+    render_awg_tuning_candidate "${client}" "${candidate}" "${values_json}"
+  done < <(find "${KEY_DIR}/awg" -maxdepth 1 -type f -name '*.conf' | LC_ALL=C sort)
+  write_awg_non_tuning_manifest "${AWG_CONFIG}" "${KEY_DIR}/awg" "${bundle}/identity.before.tsv"
+  write_awg_non_tuning_manifest "${bundle}/awg0.candidate.conf" "${bundle}/clients.candidate" "${bundle}/identity.candidate.tsv"
+  cmp -s "${bundle}/identity.before.tsv" "${bundle}/identity.candidate.tsv" \
+    || die "AWG candidate changed key/address/peer material outside tuning fields."
+  first_client="$(find "${KEY_DIR}/awg" -maxdepth 1 -type f -name '*.conf' | LC_ALL=C sort | sed -n '1p')"
+  write_awg_params_candidate "${bundle}/awg-params.candidate.env" "${values_json}" "${mtu}" "${first_client}"
+  if [[ -s "${STACK_DIR}/awg-params.env" ]]; then
+    install -m 0600 "${STACK_DIR}/awg-params.env" "${bundle}/awg-params.before.env"
+    printf 'present\n' >"${bundle}/awg-params.before.state"
+  else
+    : >"${bundle}/awg-params.before.env"
+    printf 'absent\n' >"${bundle}/awg-params.before.state"
+  fi
+  printf '%s\n' "${mtu}" >"${bundle}/target-mtu.txt"
+  printf '%s\n' "$(find "${bundle}/clients.candidate" -type f -name '*.conf' | wc -l)" >"${bundle}/client-count.txt"
+  chmod 0600 "${bundle}"/*.txt "${bundle}/awg-params.before.env" "${bundle}/awg-params.before.state"
+  checksum_tmp="$(mktemp)"
+  (
+    cd "${bundle}"
+    find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum
+  ) >"${checksum_tmp}"
+  install -m 0600 "${checksum_tmp}" "${bundle}/bundle.sha256"
+  rm -f "${checksum_tmp}"
+  log "AWG MTU/tuning migration bundle prepared: ${bundle}"
+  log "Target MTU: ${mtu}; keys and peer material are unchanged; live AWG was not modified."
+  printf '%s\n' "${bundle}"
+}
+
+resolve_awg_mtu_bundle() {
+  local requested="$1" root bundle
+  root="$(realpath -e -- "${AWG_MTU_MIGRATION_ROOT}")" || die "AWG MTU migration root does not exist."
+  bundle="$(realpath -e -- "${requested}")" || die "AWG MTU bundle does not exist: ${requested}"
+  [[ -d "${bundle}" && "${bundle}" == "${root}/"* ]] || die "AWG MTU bundle must be below ${root}."
+  printf '%s\n' "${bundle}"
+}
+
+restore_awg_mtu_preimage() {
+  local bundle="$1" client
+  warn "Restoring pre-migration AWG configuration and saved client files."
+  install -m 0600 "${bundle}/awg0.before.conf" "${AWG_CONFIG}"
+  find "${KEY_DIR}/awg" -maxdepth 1 -type f -name '*.conf' -delete
+  while IFS= read -r client; do
+    install -m 0600 "${client}" "${KEY_DIR}/awg/$(basename "${client}")"
+  done < <(find "${bundle}/clients.before" -maxdepth 1 -type f -name '*.conf' | LC_ALL=C sort)
+  if [[ "$(<"${bundle}/awg-params.before.state")" == "present" ]]; then
+    install -m 0600 "${bundle}/awg-params.before.env" "${STACK_DIR}/awg-params.env"
+  else
+    rm -f "${STACK_DIR}/awg-params.env"
+  fi
+  systemctl restart awg-quick@awg0.service || true
+}
+
+apply_awg_mtu_migration() {
+  local requested="${1:-}" confirmation="${2:-}" bundle mtu backup_dir client expected current
+  local identity_current identity_after awg_quick_bin="${AWG_QUICK_BIN:-awg-quick}"
+  [[ -n "${requested}" ]] || die "Usage: ./install-vpn-stack.sh migrate-awg-mtu-apply BUNDLE --confirm-awg-mtu"
+  [[ "${confirmation}" == "--confirm-awg-mtu" ]] \
+    || die "Re-run with --confirm-awg-mtu after reviewing the bundle and creating a provider snapshot."
+  bundle="$(resolve_awg_mtu_bundle "${requested}")"
+  mtu="$(<"${bundle}/target-mtu.txt")"
+  awg_mtu_migration_preflight "${mtu}"
+  (
+    cd "${bundle}"
+    sha256sum -c bundle.sha256 >/dev/null
+  ) || die "AWG MTU migration bundle checksum verification failed."
+  cmp -s "${bundle}/awg0.before.conf" "${AWG_CONFIG}" || die "AWG server config changed since bundle preparation."
+  if [[ "$(<"${bundle}/awg-params.before.state")" == "present" ]]; then
+    cmp -s "${bundle}/awg-params.before.env" "${STACK_DIR}/awg-params.env" \
+      || die "AWG parameter metadata changed since bundle preparation."
+  else
+    [[ ! -e "${STACK_DIR}/awg-params.env" ]] || die "AWG parameter metadata appeared since bundle preparation."
+  fi
+  expected="$(find "${bundle}/clients.before" -maxdepth 1 -type f -name '*.conf' -printf '%f\n' | LC_ALL=C sort)"
+  current="$(find "${KEY_DIR}/awg" -maxdepth 1 -type f -name '*.conf' -printf '%f\n' | LC_ALL=C sort)"
+  [[ "${expected}" == "${current}" ]] || die "AWG client file set changed since bundle preparation."
+  while IFS= read -r client; do
+    cmp -s "${client}" "${KEY_DIR}/awg/$(basename "${client}")" \
+      || die "AWG client changed since bundle preparation: $(basename "${client}")"
+  done < <(find "${bundle}/clients.before" -maxdepth 1 -type f -name '*.conf' | LC_ALL=C sort)
+  identity_current="${bundle}/identity.preapply.tsv"
+  write_awg_non_tuning_manifest "${AWG_CONFIG}" "${KEY_DIR}/awg" "${identity_current}"
+  cmp -s "${bundle}/identity.before.tsv" "${identity_current}" || die "AWG identity material changed since preparation."
+  "${awg_quick_bin}" strip "${bundle}/awg0.candidate.conf" >/dev/null \
+    || die "Candidate AWG server config validation failed."
+
+  backup_dir="$(create_upgrade_backup)"
+  log "Pre-MTU profile backup created: ${backup_dir}"
+  install -m 0600 "${bundle}/awg0.candidate.conf" "${AWG_CONFIG}"
+  while IFS= read -r client; do
+    install -m 0600 "${client}" "${KEY_DIR}/awg/$(basename "${client}")"
+  done < <(find "${bundle}/clients.candidate" -maxdepth 1 -type f -name '*.conf' | LC_ALL=C sort)
+  install -m 0600 "${bundle}/awg-params.candidate.env" "${STACK_DIR}/awg-params.env"
+
+  if ! systemctl restart awg-quick@awg0.service \
+    || ! awg show awg0 >/dev/null 2>&1 \
+    || ! ip -o link show dev awg0 | grep -Eq "[[:space:]]mtu[[:space:]]+${mtu}([[:space:]]|$)"; then
+    restore_awg_mtu_preimage "${bundle}"
+    die "AWG activation with MTU ${mtu} failed; previous server and client configs were restored."
+  fi
+  identity_after="${bundle}/identity.after.tsv"
+  write_awg_non_tuning_manifest "${AWG_CONFIG}" "${KEY_DIR}/awg" "${identity_after}"
+  if ! cmp -s "${bundle}/identity.before.tsv" "${identity_after}"; then
+    restore_awg_mtu_preimage "${bundle}"
+    die "AWG keys/address/peer material changed; previous state was restored."
+  fi
+  cat >"${AWG_TUNING_REPORT}" <<EOF
+{
+  "generated_at": $(json_escape "$(date -Is)"),
+  "requested_profile": "custom",
+  "effective_profile": "custom",
+  "mtu": ${mtu},
+  "mtu_source": "migration-tested-baseline",
+  "params_path": $(json_escape "${STACK_DIR}/awg-params.env"),
+  "note": "Existing server obfuscation J/S/H/I1-I5 was preserved and synchronized into saved client configs; credentials were not rotated."
+}
+EOF
+  chmod 0600 "${AWG_TUNING_REPORT}"
+  cat >"${AWG_MTU_MIGRATION_REPORT}" <<EOF
+{
+  "version": $(json_escape "${GOLDEN_VPN_VERSION}"),
+  "applied_at": $(json_escape "$(date -Is)"),
+  "bundle": $(json_escape "${bundle}"),
+  "backup_dir": $(json_escape "${backup_dir}"),
+  "mtu": ${mtu},
+  "client_files_updated": $(<"${bundle}/client-count.txt"),
+  "credentials_preserved": true,
+  "full_awg2_tuning": true
+}
+EOF
+  chmod 0600 "${AWG_MTU_MIGRATION_REPORT}"
+  log "AWG MTU ${mtu} activated; full J/S/H/I1-I5 tuning and all credentials were preserved."
+  log "Saved client configs were updated in place and must be re-imported to change MTU on client devices."
+}
+
 upgrade_check() {
   local tmp protocol
   upgrade_preflight
@@ -6586,6 +7370,16 @@ Usage:
   ./install-vpn-stack.sh install         Run stage2/full install now
   ./install-vpn-stack.sh upgrade         Update features without replacing existing client profiles
   ./install-vpn-stack.sh upgrade-check   Read-only compatibility and profile-count check
+  ./install-vpn-stack.sh upgrade-rollback BACKUP_DIR --confirm-profile-restore
+                                          Restore protected profiles from an upgrade backup
+  ./install-vpn-stack.sh migrate-vless-to-trojan-prepare
+                                          Build a reviewed parallel-Trojan bundle without live changes
+  ./install-vpn-stack.sh migrate-vless-to-trojan-apply BUNDLE --confirm-parallel-trojan
+                                          Apply a prepared bundle while preserving legacy VLESS
+  ./install-vpn-stack.sh migrate-awg-mtu-prepare [MTU]
+                                          Prepare same-key AWG tuning configs, default MTU 1320
+  ./install-vpn-stack.sh migrate-awg-mtu-apply BUNDLE --confirm-awg-mtu
+                                          Apply prepared MTU/full-obfuscation configs transactionally
   ./install-vpn-stack.sh preflight       Check inputs and host readiness without changing VPN configs
   ./install-vpn-stack.sh validate        Validate installed listeners, services, cert, and decoy
   ./install-vpn-stack.sh verify          Alias for validate
@@ -6634,6 +7428,25 @@ dispatch() {
       ;;
     upgrade-check|check-upgrade)
       upgrade_check
+      ;;
+    upgrade-rollback|rollback-upgrade)
+      shift || true
+      upgrade_rollback "$@"
+      ;;
+    migrate-vless-to-trojan-prepare|prepare-vless-to-trojan)
+      prepare_vless_to_trojan_migration
+      ;;
+    migrate-vless-to-trojan-apply|apply-vless-to-trojan)
+      shift || true
+      apply_vless_to_trojan_migration "$@"
+      ;;
+    migrate-awg-mtu-prepare|prepare-awg-mtu)
+      shift || true
+      prepare_awg_mtu_migration "$@"
+      ;;
+    migrate-awg-mtu-apply|apply-awg-mtu)
+      shift || true
+      apply_awg_mtu_migration "$@"
       ;;
     preflight|preflight-only|--preflight)
       preflight_check

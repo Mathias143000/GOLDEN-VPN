@@ -521,6 +521,67 @@ The backup contains the current protocol registries, server configs, client file
 
 Legacy VLESS XHTTP installations are detected automatically. Their VLESS service, config, helper, and users are preserved; the upgrade deliberately does not install Trojan/subscription helpers over that server. Migrating VLESS users to Trojan remains a separate, parallel credential migration with a grace period.
 
+To restore the protected profile state from a specific upgrade backup, first verify the archive path and checksum, then run the explicit rollback command:
+
+```bash
+sha256sum -c /root/vpn-keys/upgrade-backups/<backup>/profiles.tar.sha256
+./install-vpn-stack.sh upgrade-rollback \
+  /root/vpn-keys/upgrade-backups/<backup> \
+  --confirm-profile-restore
+```
+
+Rollback replaces only the protected Xray, Hysteria, AWG, client-file, and subscription roots recorded in that backup. It verifies the archive paths and the restored byte-for-byte manifest. It deliberately does not restart VPN services; validate the restored configs before restarting only the affected service.
+
+## Parallel legacy VLESS to Trojan migration
+
+Legacy VLESS XHTTP TLS users require new Trojan credentials, but they do not need to be disconnected during preparation. Build a root-only migration bundle first:
+
+```bash
+./install-vpn-stack.sh migrate-vless-to-trojan-prepare
+```
+
+Preparation does not change live Xray/nginx files or restart services. The bundle contains candidate configs, checksums, a protected before-state, one mapped Trojan credential per existing labelled VLESS client, and the corresponding client links.
+
+After reviewing the bundle, creating a provider snapshot, and arranging a maintenance window, apply that exact bundle explicitly:
+
+```bash
+./install-vpn-stack.sh migrate-vless-to-trojan-apply \
+  /root/vpn-migration/vless-to-trojan/<bundle> \
+  --confirm-parallel-trojan
+```
+
+Apply refuses stale or modified bundles, verifies that live Xray/nginx and protected VLESS/Hysteria/AWG state still match the prepared preimage, and creates a fresh upgrade backup. It adds a second Trojan inbound and nginx secret path while preserving the existing VLESS inbound. It tests both configs, restarts the existing Xray service once, reloads nginx, and requires both VLESS and Trojan unix sockets. A validation or activation failure automatically restores the exact VLESS preimage. Hysteria and AWG are not restarted.
+
+Successful migration records its result in:
+
+```text
+/root/vpn-keys/vless-to-trojan-report.json
+```
+
+Keep VLESS active through the migration grace period. Removing the legacy inbound remains a separate confirmed operation after all required users have successfully moved.
+
+## Same-key AWG MTU and full-tuning migration
+
+To normalize an existing Golden AWG contour without rotating any key, first prepare a root-only candidate bundle. The tested mobile baseline is `1320`:
+
+```bash
+./install-vpn-stack.sh migrate-awg-mtu-prepare 1320
+```
+
+Preparation leaves live AWG untouched. It copies the exact preimage, reads the server's existing `Jc/Jmin/Jmax`, `S1-S4`, `H1-H4`, and `I1-I5`, writes MTU `1320` into candidate server/client configs, and synchronizes any missing full AWG 2.0 tuning fields into saved client configs. A normalized identity manifest proves that private keys, public keys, preshared keys, addresses, peers, endpoints, allowed IPs, and other non-tuning material did not change.
+
+After provider snapshot and bundle review:
+
+```bash
+./install-vpn-stack.sh migrate-awg-mtu-apply \
+  /root/vpn-migration/awg-mtu/<bundle> \
+  --confirm-awg-mtu
+```
+
+Apply rejects stale source files, validates the candidate through `awg-quick strip`, creates a fresh profile backup, restarts only `awg-quick@awg0`, verifies runtime MTU and AWG status, and restores the exact server/client preimage if activation or identity verification fails. It also reconstructs `/opt/vpn-stack/awg-params.env` from the preserved server tuning so future clients inherit the same full obfuscation and MTU.
+
+No credential is reissued. Existing imported clients continue using their local MTU until the updated same-key `.conf` is re-imported. The result is recorded in `/root/vpn-keys/awg-mtu-migration-report.json`.
+
 ## Troubleshooting
 
 If `vpn-awg <name>` reports `printf: write error: No space left on device` while `/` is not full, check `/tmp`, `/run`, and inode usage. Older helpers wrote the AWG preshared key through a `mktemp` file, so a full tmpfs or exhausted inode table could break client creation even with free root-disk space. Current helpers avoid that temp file and `vpn-awg analyze` prints storage diagnostics.

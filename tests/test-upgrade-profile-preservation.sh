@@ -119,6 +119,26 @@ if cmp -s "${before}" "${changed}"; then
   exit 1
 fi
 
+# An explicit rollback restores all protected roots exactly and does not need
+# protocol-service restarts to validate the on-disk state.
+printf 'unexpected extra profile\n' >"${KEY_DIR}/awg/unexpected.conf"
+upgrade_rollback "${backup_dir}" --confirm-profile-restore
+write_upgrade_profile_manifest "${tmp_dir}/rolled-back.tsv"
+cmp -s "${before}" "${tmp_dir}/rolled-back.tsv"
+[[ ! -e "${KEY_DIR}/awg/unexpected.conf" ]]
+grep -F 'PublicKey = delta-public' "${AWG_CONFIG}" >/dev/null
+
+# Confirmation and backup-root confinement are mandatory.
+if (upgrade_rollback "${backup_dir}" >/dev/null 2>&1); then
+  printf 'rollback accepted a missing confirmation flag\n' >&2
+  exit 1
+fi
+mkdir -p "${tmp_dir}/outside-backup"
+if (upgrade_rollback "${tmp_dir}/outside-backup" --confirm-profile-restore >/dev/null 2>&1); then
+  printf 'rollback accepted a backup outside UPGRADE_BACKUP_ROOT\n' >&2
+  exit 1
+fi
+
 # The upgrade implementation must never call destructive protocol installers.
 upgrade_code="$({
   awk '/^install_upgrade_helpers\(\)/,/^}/' "${installer}"

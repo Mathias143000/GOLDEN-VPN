@@ -20,7 +20,8 @@ extract_heredoc() {
 # shellcheck disable=SC2016
 extract_heredoc 'cat >"${INSTALL_STATUS_HELPER}" <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-install-status"
 extract_heredoc 'cat >/usr/local/sbin/amneziawg-ensure-module.sh <<'"'"'EOF'"'"'' "${tmp_dir}/amneziawg-ensure-module"
-extract_heredoc 'cat >/usr/local/bin/vpn-trojan <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-trojan"
+# shellcheck disable=SC2016
+extract_heredoc 'cat >"${TROJAN_HELPER_PATH}" <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-trojan"
 extract_heredoc 'cat >/usr/local/bin/vpn-hysteria <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-hysteria"
 extract_heredoc 'cat >/usr/local/bin/vpn-awg <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-awg"
 extract_heredoc 'cat >/usr/local/bin/vpn-sub <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-sub"
