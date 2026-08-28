@@ -2,6 +2,8 @@
 
 > Актуальное изменение от 2026-06-19: основной TCP/443 контур заменен на Trojan XHTTP TLS.
 > Старые упоминания VLESS/REALITY ниже считаются устаревшими, если они противоречат `install-vpn-stack.sh` и `README.md`.
+>
+> Актуальное изменение от 2026-08-28: приоритет контуров — AmneziaWG 3.1 (№1), Hysteria2 (№2), Trojan XHTTP TLS (TCP fallback). XHTTP использует `mode=auto`. Чистая установка не создаёт AWG 2.0 и не включает ежедневную перезагрузку. Старые требования ниже про AWG 2.0, `stream-one`, VLESS/REALITY и `vpn-soft-reboot.timer` являются legacy и не переопределяют этот раздел.
 
 ## 0. Аудит текущего скрипта и roadmap улучшений
 
@@ -19,6 +21,7 @@ Safe existing-stack modes: upgrade-check, upgrade
 Reports: /root/vpn-keys/install-report.txt and /root/vpn-keys/install-report.json
 AWG report: /opt/vpn-stack/awg-tuning-report.json
 Decoy manifest: /opt/vpn-stack/decoy-manifest.json
+AWG 3.1: header protection, content padding, timing ranges, random trailers, full J/S/H/I1-I5
 AWG profiles: dns, quic-lite, video-call, mobile-low-mtu, random-balanced, custom
 AWG_MTU=auto with PMTU probe and 1280 fallback
 AWG overrides: AWG_JC/JMIN/JMAX/S1-S4/H1-H4/I1-I5/MTU/DNS/ALLOWED_IPS/KEEPALIVE/ENDPOINT_PORT
@@ -34,6 +37,8 @@ Subscription URL shape: https://DOMAIN/s/<token>
 Bot export helper: vpn-bot-export audit/keys/inventory/batch/send/emergency/fingerprint
 Typed bot bundles: AWG/Trojan/Hysteria with available or issued status
 TLS notifications: vpn-cert-notify plus daily systemd timer and acme.sh renewal hook
+Engine updates: rollback-protected daily stable checks for AWG, Xray, and Hysteria
+Stability: no scheduled daily server reboot; boot healthcheck remains enabled
 Upgrade invariant: existing Xray clients, Hysteria users, AWG peers, client files, and subscription bundles remain byte-for-byte unchanged
 ```
 
@@ -214,9 +219,9 @@ current audited migration keeps USA, France, and Estonia; Sweden and Netherlands
 Фактическая архитектура скрипта:
 
 ```text
-Trojan XHTTP TLS → 443/tcp через nginx HTTPS location + Xray unix socket
-Hysteria2 Salamander → 8443/udp
-AmneziaWG 2.0 → 51820/udp
+AmneziaWG 3.1 (№1) → 51820/udp
+Hysteria2 Salamander (№2) → 8443/udp
+Trojan XHTTP TLS fallback → 443/tcp через nginx HTTPS location + Xray unix socket, XHTTP mode auto
 Decoy HTTPS site → встроенный статический генератор HTML/CSS
 Grafana + Prometheus + Node Exporter → localhost-only
 Client labels → <PROTOCOL>-<LOCATION>-<NAME>

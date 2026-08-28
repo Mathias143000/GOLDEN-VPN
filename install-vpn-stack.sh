@@ -8,7 +8,7 @@ export APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND:-none}"
 
 : "${APT_LOCK_TIMEOUT:=1800}"
 
-GOLDEN_VPN_VERSION="2026.08.14"
+GOLDEN_VPN_VERSION="2026.08.28-awg31"
 
 STACK_DIR="/opt/vpn-stack"
 KEY_DIR="/root/vpn-keys"
@@ -49,6 +49,8 @@ DECOY_MANIFEST="${STACK_DIR}/decoy-manifest.json"
 AWG_TUNING_REPORT="${STACK_DIR}/awg-tuning-report.json"
 AWG_CONFIG="/etc/amnezia/amneziawg/awg0.conf"
 AWG_DEFAULT_PORT=51820
+AWG_PROTOCOL_VERSION="3.1"
+AWG_TOOLS_SOURCE_TAG="v3.1.20260812"
 BOOTSTRAP_MIN_FREE_MB=1024
 INSTALL_MIN_FREE_MB=5120
 UPGRADE_MIN_FREE_MB=256
@@ -77,6 +79,7 @@ BASE_PACKAGES=(
   iptables
   iproute2
   iputils-ping
+  util-linux
   tcpdump
   python3
   build-essential
@@ -419,7 +422,7 @@ prompt_advanced_tuning() {
   prompt_yes_no_default_no "Advanced tuning?" || return 0
 
   prompt_optional_var AWG_OBFS_PROFILE "AWG_OBFS_PROFILE" "${AWG_OBFS_PROFILE:-random-balanced}"
-  prompt_optional_var AWG_MTU "AWG_MTU" "${AWG_MTU:-auto}"
+  prompt_optional_var AWG_MTU "AWG_MTU" "${AWG_MTU:-1320}"
   prompt_optional_var DECOY_PROFILE "DECOY_PROFILE" "${DECOY_PROFILE:-random}"
   prompt_optional_var DECOY_SEED "DECOY_SEED" "${DECOY_SEED:-}"
 }
@@ -476,7 +479,9 @@ write_resume_env() {
     for opt in \
       AWG_OBFS_PROFILE AWG_MTU AWG_DNS AWG_ALLOWED_IPS AWG_KEEPALIVE AWG_ENDPOINT_PORT \
       AWG_JC AWG_JMIN AWG_JMAX AWG_S1 AWG_S2 AWG_S3 AWG_S4 AWG_H1 AWG_H2 AWG_H3 AWG_H4 \
-      AWG_I1 AWG_I2 AWG_I3 AWG_I4 AWG_I5 \
+      AWG_I1 AWG_I2 AWG_I3 AWG_I4 AWG_I5 AWG_HEADER_PROTECTION_KEY \
+      AWG_CONTENT_PADDING_ADDITION AWG_REKEY_AFTER_TIME AWG_REKEY_TIMEOUT AWG_REJECT_AFTER_TIME \
+      AWG_KEEPALIVE_TIMEOUT AWG_MAX_HANDSHAKE_ATTEMPTS AWG_RANDOM_TRAILERS AWG_DISABLE_COOKIES \
       DECOY_PROFILE DECOY_SEED DECOY_BRAND DECOY_REGION; do
       [[ -n "${!opt:-}" ]] && printf '%s=%q\n' "${opt}" "${!opt}"
     done
@@ -1467,7 +1472,7 @@ write_trojan_link() {
   label="$(label_name "TROJAN" "${name}")"
   encoded_path="$(uri_encode "${path}")"
   fragment="$(uri_encode "${label}")"
-  link="trojan://${password}@${domain}:443?security=tls&type=xhttp&path=${encoded_path}&mode=stream-one&sni=${domain}&host=${domain}&fp=chrome&alpn=h2%2Chttp%2F1.1#${fragment}"
+  link="trojan://${password}@${domain}:443?security=tls&type=xhttp&path=${encoded_path}&mode=auto&sni=${domain}&host=${domain}&alpn=h2#${fragment}"
   install -d -m 0700 "${KEY_DIR}/trojan"
   printf '%s\n' "${link}" >"${KEY_DIR}/trojan/${label}.txt"
   chmod 0600 "${KEY_DIR}/trojan/${label}.txt"
@@ -1588,6 +1593,13 @@ h1 { margin: 14px 0 18px; font-size: clamp(36px, 7vw, 62px); line-height: 1.02; 
 }
 EOF
 
+  cat >"${target_dir}/assets/favicon.svg" <<EOF
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="${brand}">
+  <rect width="64" height="64" rx="14" fill="${primary}"/>
+  <path d="M14 39h8l6-17 8 27 6-16h8" fill="none" stroke="${surface}" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+EOF
+
   cat >"${target_dir}/index.html" <<EOF
 <!doctype html>
 <html lang="en">
@@ -1596,6 +1608,7 @@ EOF
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${brand} - Availability Monitoring</title>
   <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
 </head>
 <body>
   <header class="site-header">
@@ -1674,7 +1687,7 @@ User-agent: *
 Allow: /
 Disallow: /assets/
 EOF
-  chmod 0644 "${target_dir}/assets/style.css" "${target_dir}/index.html" "${target_dir}/status.html" "${target_dir}/docs.html" "${target_dir}/privacy.html" "${target_dir}/404.html" "${target_dir}/robots.txt"
+  chmod 0644 "${target_dir}/assets/style.css" "${target_dir}/assets/favicon.svg" "${target_dir}/index.html" "${target_dir}/status.html" "${target_dir}/docs.html" "${target_dir}/privacy.html" "${target_dir}/404.html" "${target_dir}/robots.txt"
   scan_decoy_tree "${target_dir}"
 
   if [[ -n "${manifest_path}" ]]; then
@@ -1702,7 +1715,8 @@ EOF
     "privacy.html",
     "404.html",
     "robots.txt",
-    "assets/style.css"
+    "assets/style.css",
+    "assets/favicon.svg"
   ]
 }
 EOF
@@ -1765,7 +1779,7 @@ configure_xray() {
             network: "xhttp",
             xhttpSettings: {
               path: $path,
-              mode: "stream-one"
+              mode: "auto"
             }
           },
           sniffing: {
@@ -1874,6 +1888,13 @@ h1 { margin: 14px 0 18px; font-size: clamp(36px, 7vw, 62px); line-height: 1.02; 
 }
 EOF
 
+  cat >/var/www/decoy/assets/favicon.svg <<EOF
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="${brand}">
+  <rect width="64" height="64" rx="14" fill="${primary}"/>
+  <path d="M14 39h8l6-17 8 27 6-16h8" fill="none" stroke="${surface}" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+EOF
+
   cat >/var/www/decoy/index.html <<EOF
 <!doctype html>
 <html lang="en">
@@ -1882,6 +1903,7 @@ EOF
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${brand} - Availability Monitoring</title>
   <link rel="stylesheet" href="/assets/style.css">
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
 </head>
 <body>
   <header class="site-header">
@@ -1960,7 +1982,7 @@ User-agent: *
 Allow: /
 Disallow: /assets/
 EOF
-  chmod 0644 /var/www/decoy/assets/style.css /var/www/decoy/index.html /var/www/decoy/status.html /var/www/decoy/docs.html /var/www/decoy/privacy.html /var/www/decoy/404.html /var/www/decoy/robots.txt
+  chmod 0644 /var/www/decoy/assets/style.css /var/www/decoy/assets/favicon.svg /var/www/decoy/index.html /var/www/decoy/status.html /var/www/decoy/docs.html /var/www/decoy/privacy.html /var/www/decoy/404.html /var/www/decoy/robots.txt
 
   render_decoy_site "/var/www/decoy" "${DECOY_MANIFEST}"
 
@@ -2114,7 +2136,7 @@ EOF
 }
 
 install_amneziawg() {
-  log "Installing AmneziaWG."
+  log "Installing AmneziaWG ${AWG_PROTOCOL_VERSION}."
   check_dkms_kernel_ready no-prompt
   apt_get update
   if ! apt_get install -y amneziawg; then
@@ -2130,12 +2152,14 @@ install_amneziawg() {
     fi
   fi
 
-  if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1; then
-    warn "awg or awg-quick was not found after package install; building amneziawg-tools from source."
+  if ! command -v awg >/dev/null 2>&1 || ! command -v awg-quick >/dev/null 2>&1 \
+    || ! awg --version 2>/dev/null | grep -Eq 'v3\.1\.'; then
+    warn "AWG 3.1 tools were not found after package install; building the pinned official tools release ${AWG_TOOLS_SOURCE_TAG}."
     apt_get install -y git make golang-go
     local build_dir
     build_dir="$(mktemp -d)"
-    git clone --depth=1 https://github.com/amnezia-vpn/amneziawg-tools "${build_dir}/amneziawg-tools"
+    git clone --depth=1 --branch "${AWG_TOOLS_SOURCE_TAG}" \
+      https://github.com/amnezia-vpn/amneziawg-tools "${build_dir}/amneziawg-tools"
     make -C "${build_dir}/amneziawg-tools/src"
     make -C "${build_dir}/amneziawg-tools/src" install
     rm -rf "${build_dir}"
@@ -2143,6 +2167,61 @@ install_amneziawg() {
 
   need_command awg
   need_command awg-quick
+  awg --version 2>/dev/null | grep -Eq 'v3\.1\.' \
+    || die "AmneziaWG 3.1 tools are required; installed version: $(awg --version 2>/dev/null || printf unknown)."
+  verify_awg31_runtime_support
+}
+
+verify_awg31_runtime_support() {
+  local check_iface="awgv31check" check_dir check_private header_key
+  check_dir="$(mktemp -d)"
+  check_private="$(awg genkey)"
+  header_key="$(awg genkey)"
+
+  modprobe amneziawg || {
+    rm -rf "${check_dir}"
+    die "The installed AmneziaWG kernel module cannot be loaded. Reboot into the current kernel and rerun install."
+  }
+  ip link del "${check_iface}" >/dev/null 2>&1 || true
+  ip link add "${check_iface}" type amneziawg || {
+    rm -rf "${check_dir}"
+    die "The installed kernel module cannot create an AmneziaWG interface."
+  }
+
+  cat >"${check_dir}/awg31.conf" <<EOF
+[Interface]
+PrivateKey = ${check_private}
+ListenPort = 0
+Jc = 4
+Jmin = 32
+Jmax = 96
+S1 = 32
+S2 = 48
+S3 = 64
+S4 = 80
+H1 = 100000001-100000101
+H2 = 600000001-600000101
+H3 = 1100000001-1100000101
+H4 = 1600000001-1600000101
+HeaderProtectionKey = ${header_key}
+ContentPaddingAddition = 16-64
+RekeyAfterTime = 110-130
+RekeyTimeout = 4-7
+RejectAfterTime = 170-190
+KeepaliveTimeout = 8-12
+MaxHandshakeAttempts = 15-20
+RandomTrailers = on
+DisableCookies = off
+EOF
+  chmod 0600 "${check_dir}/awg31.conf"
+
+  if ! awg setconf "${check_iface}" "${check_dir}/awg31.conf"; then
+    ip link del "${check_iface}" >/dev/null 2>&1 || true
+    rm -rf "${check_dir}"
+    die "The installed AmneziaWG kernel module rejected AWG 3.1 parameters. Update the official Amnezia PPA packages and rerun install."
+  fi
+  ip link del "${check_iface}" >/dev/null 2>&1 || true
+  rm -rf "${check_dir}"
 }
 
 rand_u32() {
@@ -2199,6 +2278,26 @@ validate_int_range() {
   [[ "${value}" -ge "${min}" && "${value}" -le "${max}" ]] || die "${name} must be from ${min} to ${max}."
 }
 
+validate_u16_range() {
+  local name="$1" value="$2" minimum="$3" maximum="$4" left right
+  if [[ "${value}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+    left="${BASH_REMATCH[1]}"
+    right="${BASH_REMATCH[2]}"
+  elif [[ "${value}" =~ ^[0-9]+$ ]]; then
+    left="${value}"
+    right="${value}"
+  else
+    die "${name} must be an integer or an ascending integer range (for example 16-64)."
+  fi
+  ((left >= minimum && right <= maximum && left <= right)) \
+    || die "${name} must be within ${minimum}..${maximum} and must be ascending."
+}
+
+validate_on_off() {
+  local name="$1" value="$2"
+  [[ "${value}" == "on" || "${value}" == "off" ]] || die "${name} must be on or off."
+}
+
 detect_awg_auto_mtu() {
   local target payload best=0 path_mtu awg_mtu
   local -a targets=(1.1.1.1 8.8.8.8)
@@ -2233,6 +2332,8 @@ detect_awg_auto_mtu() {
 generate_awg_tuning() {
   local requested_profile effective_profile awg_mtu awg_mtu_requested awg_port awg_dns awg_allowed_ips awg_keepalive
   local jc jmin jmax s1 s2 s3 s4 h1 h2 h3 h4 i1 i2 i3 i4 i5 source_note mtu_source
+  local header_protection_key content_padding rekey_after rekey_timeout reject_after keepalive_timeout
+  local max_handshake_attempts random_trailers disable_cookies
 
   requested_profile="$(printf '%s' "${AWG_OBFS_PROFILE:-random-balanced}" | tr '[:upper:]' '[:lower:]')"
   case "${requested_profile}" in
@@ -2284,7 +2385,7 @@ generate_awg_tuning() {
     video-call)
       jc="$(rand_between 7 12)"
       jmin="$(rand_between 120 220)"
-      jmax="$(rand_between 820 1320)"
+      jmax="$(rand_between 820 1180)"
       s1="$(rand_between 112 220)"
       s2="$(rand_between 96 180)"
       s3="$(rand_between 80 160)"
@@ -2340,10 +2441,30 @@ generate_awg_tuning() {
   validate_int_range AWG_JMIN "${jmin}" 1 4096
   validate_int_range AWG_JMAX "${jmax}" 1 4096
   ((jmin <= jmax)) || die "AWG_JMIN must be less than or equal to AWG_JMAX."
-  validate_int_range AWG_S1 "${s1}" 1 4096
-  validate_int_range AWG_S2 "${s2}" 1 4096
-  validate_int_range AWG_S3 "${s3}" 1 4096
-  validate_int_range AWG_S4 "${s4}" 1 4096
+  validate_int_range AWG_S1 "${s1}" 12 4096
+  validate_int_range AWG_S2 "${s2}" 12 4096
+  validate_int_range AWG_S3 "${s3}" 12 4096
+  validate_int_range AWG_S4 "${s4}" 12 4096
+
+  header_protection_key="${AWG_HEADER_PROTECTION_KEY:-$(awg genkey)}"
+  printf '%s\n' "${header_protection_key}" | awg pubkey >/dev/null 2>&1 \
+    || die "AWG_HEADER_PROTECTION_KEY is not a valid 32-byte AmneziaWG key."
+  content_padding="${AWG_CONTENT_PADDING_ADDITION:-16-96}"
+  rekey_after="${AWG_REKEY_AFTER_TIME:-110-130}"
+  rekey_timeout="${AWG_REKEY_TIMEOUT:-4-7}"
+  reject_after="${AWG_REJECT_AFTER_TIME:-170-190}"
+  keepalive_timeout="${AWG_KEEPALIVE_TIMEOUT:-8-12}"
+  max_handshake_attempts="${AWG_MAX_HANDSHAKE_ATTEMPTS:-15-20}"
+  random_trailers="${AWG_RANDOM_TRAILERS:-on}"
+  disable_cookies="${AWG_DISABLE_COOKIES:-off}"
+  validate_u16_range AWG_CONTENT_PADDING_ADDITION "${content_padding}" 0 1280
+  validate_u16_range AWG_REKEY_AFTER_TIME "${rekey_after}" 1 65535
+  validate_u16_range AWG_REKEY_TIMEOUT "${rekey_timeout}" 1 65535
+  validate_u16_range AWG_REJECT_AFTER_TIME "${reject_after}" 1 65535
+  validate_u16_range AWG_KEEPALIVE_TIMEOUT "${keepalive_timeout}" 1 65535
+  validate_u16_range AWG_MAX_HANDSHAKE_ATTEMPTS "${max_handshake_attempts}" 1 65535
+  validate_on_off AWG_RANDOM_TRAILERS "${random_trailers}"
+  validate_on_off AWG_DISABLE_COOKIES "${disable_cookies}"
 
   awg_mtu_requested="${AWG_MTU:-}"
   if [[ -z "${awg_mtu_requested}" ]]; then
@@ -2351,8 +2472,8 @@ generate_awg_tuning() {
       awg_mtu="1240"
       mtu_source="profile"
     else
-      awg_mtu="1280"
-      mtu_source="default"
+      awg_mtu="1320"
+      mtu_source="tested-baseline"
     fi
   elif [[ "${awg_mtu_requested}" == "auto" ]]; then
     awg_mtu="$(detect_awg_auto_mtu)"
@@ -2362,6 +2483,9 @@ generate_awg_tuning() {
     mtu_source="user"
   fi
   validate_int_range AWG_MTU "${awg_mtu}" 1200 1420
+  ((jmax < awg_mtu)) || die "AWG_JMAX must be lower than AWG_MTU to avoid fragmented junk packets."
+  ((s1 <= awg_mtu - 148)) || die "AWG_S1 must not exceed AWG_MTU - 148."
+  ((s2 <= awg_mtu - 92)) || die "AWG_S2 must not exceed AWG_MTU - 92."
 
   awg_port="${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}"
   validate_int_range AWG_ENDPOINT_PORT "${awg_port}" 1 65535
@@ -2373,6 +2497,7 @@ generate_awg_tuning() {
   source_note="profile=${requested_profile}; effective=${effective_profile}; overrides are applied from AWG_* env when present"
 
   {
+    printf 'AWG_PROTOCOL_VERSION=%q\n' "${AWG_PROTOCOL_VERSION}"
     printf 'AWG_OBFS_PROFILE=%q\n' "${requested_profile}"
     printf 'AWG_EFFECTIVE_PROFILE=%q\n' "${effective_profile}"
     printf 'AWG_TUNING_SOURCE=%q\n' "${source_note}"
@@ -2398,12 +2523,22 @@ generate_awg_tuning() {
     printf 'AWG_I3=%q\n' "${i3}"
     printf 'AWG_I4=%q\n' "${i4}"
     printf 'AWG_I5=%q\n' "${i5}"
+    printf 'AWG_HEADER_PROTECTION_KEY=%q\n' "${header_protection_key}"
+    printf 'AWG_CONTENT_PADDING_ADDITION=%q\n' "${content_padding}"
+    printf 'AWG_REKEY_AFTER_TIME=%q\n' "${rekey_after}"
+    printf 'AWG_REKEY_TIMEOUT=%q\n' "${rekey_timeout}"
+    printf 'AWG_REJECT_AFTER_TIME=%q\n' "${reject_after}"
+    printf 'AWG_KEEPALIVE_TIMEOUT=%q\n' "${keepalive_timeout}"
+    printf 'AWG_MAX_HANDSHAKE_ATTEMPTS=%q\n' "${max_handshake_attempts}"
+    printf 'AWG_RANDOM_TRAILERS=%q\n' "${random_trailers}"
+    printf 'AWG_DISABLE_COOKIES=%q\n' "${disable_cookies}"
   } >"${STACK_DIR}/awg-params.env"
   chmod 0600 "${STACK_DIR}/awg-params.env"
 
   cat >"${AWG_TUNING_REPORT}" <<EOF
 {
   "generated_at": $(json_escape "$(date -Is)"),
+  "protocol_version": $(json_escape "${AWG_PROTOCOL_VERSION}"),
   "requested_profile": $(json_escape "${requested_profile}"),
   "effective_profile": $(json_escape "${effective_profile}"),
   "mtu": ${awg_mtu},
@@ -2413,7 +2548,11 @@ generate_awg_tuning() {
   "allowed_ips": $(json_escape "${awg_allowed_ips}"),
   "keepalive": ${awg_keepalive},
   "params_path": $(json_escape "${STACK_DIR}/awg-params.env"),
-  "note": $(json_escape "Values are randomized per install unless overridden through AWG_* environment variables. Tcpdump is never started automatically.")
+  "header_protection": true,
+  "content_padding": $(json_escape "${content_padding}"),
+  "random_trailers": $(json_escape "${random_trailers}"),
+  "cookies_disabled": $(json_escape "${disable_cookies}"),
+  "note": $(json_escape "AWG 3.1 header protection, content padding, randomized timings and random trailers are enabled. Cookie replies remain enabled by default for DoS resistance. Tcpdump is never started automatically.")
 }
 EOF
   chmod 0600 "${AWG_TUNING_REPORT}"
@@ -2435,14 +2574,15 @@ write_awg_client_config() {
   cat >"${out_file}" <<EOF
 # ${label}
 # GeneratedAt = $(date -Is)
+# Protocol = AmneziaWG ${AWG_PROTOCOL_VERSION:-3.1}
 # ObfuscationProfile = ${AWG_OBFS_PROFILE:-unknown}
 # EffectiveProfile = ${AWG_EFFECTIVE_PROFILE:-unknown}
-# MTU = ${AWG_MTU:-1280}
+# MTU = ${AWG_MTU:-1320}
 [Interface]
 PrivateKey = ${client_private}
 Address = ${client_ip}/32
 DNS = ${AWG_DNS:-1.1.1.1, 8.8.8.8}
-MTU = ${AWG_MTU:-1280}
+MTU = ${AWG_MTU:-1320}
 Jc = ${AWG_JC}
 Jmin = ${AWG_JMIN}
 Jmax = ${AWG_JMAX}
@@ -2459,6 +2599,15 @@ I2 = ${AWG_I2}
 I3 = ${AWG_I3}
 I4 = ${AWG_I4}
 I5 = ${AWG_I5}
+HeaderProtectionKey = ${AWG_HEADER_PROTECTION_KEY}
+ContentPaddingAddition = ${AWG_CONTENT_PADDING_ADDITION}
+RekeyAfterTime = ${AWG_REKEY_AFTER_TIME}
+RekeyTimeout = ${AWG_REKEY_TIMEOUT}
+RejectAfterTime = ${AWG_REJECT_AFTER_TIME}
+KeepaliveTimeout = ${AWG_KEEPALIVE_TIMEOUT}
+MaxHandshakeAttempts = ${AWG_MAX_HANDSHAKE_ATTEMPTS}
+RandomTrailers = ${AWG_RANDOM_TRAILERS}
+DisableCookies = ${AWG_DISABLE_COOKIES}
 
 [Peer]
 PublicKey = ${server_public}
@@ -2472,7 +2621,7 @@ EOF
 }
 
 configure_amneziawg() {
-  log "Configuring AmneziaWG 2.0."
+  log "Configuring AmneziaWG ${AWG_PROTOCOL_VERSION} as the primary VPN contour."
   install -d -m 0700 /etc/amnezia/amneziawg "${KEY_DIR}/awg"
 
   cat >/etc/sysctl.d/98-vpn-forward.conf <<'EOF'
@@ -2540,6 +2689,15 @@ I2 = ${i2}
 I3 = ${i3}
 I4 = ${i4}
 I5 = ${i5}
+HeaderProtectionKey = ${AWG_HEADER_PROTECTION_KEY}
+ContentPaddingAddition = ${AWG_CONTENT_PADDING_ADDITION}
+RekeyAfterTime = ${AWG_REKEY_AFTER_TIME}
+RekeyTimeout = ${AWG_REKEY_TIMEOUT}
+RejectAfterTime = ${AWG_REJECT_AFTER_TIME}
+KeepaliveTimeout = ${AWG_KEEPALIVE_TIMEOUT}
+MaxHandshakeAttempts = ${AWG_MAX_HANDSHAKE_ATTEMPTS}
+RandomTrailers = ${AWG_RANDOM_TRAILERS}
+DisableCookies = ${AWG_DISABLE_COOKIES}
 PostUp = iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o ${EXT_IFACE} -j MASQUERADE
 PostUp = iptables -A FORWARD -i awg0 -j ACCEPT
 PostUp = iptables -A FORWARD -o awg0 -j ACCEPT
@@ -2759,7 +2917,7 @@ domain="$(<"${STACK_DIR}/domain.txt")"
 path="$(<"${STACK_DIR}/trojan-xhttp-path.txt")"
 encoded_path="$(uri_encode "${path}")"
 fragment="$(uri_encode "${label}")"
-link="trojan://${password}@${domain}:443?security=tls&type=xhttp&path=${encoded_path}&mode=stream-one&sni=${domain}&host=${domain}&fp=chrome&alpn=h2%2Chttp%2F1.1#${fragment}"
+link="trojan://${password}@${domain}:443?security=tls&type=xhttp&path=${encoded_path}&mode=auto&sni=${domain}&host=${domain}&alpn=h2#${fragment}"
 
 install -d -m 0700 "${KEY_DIR}"
 printf '%s\n' "${link}" >"${KEY_DIR}/${label}.txt"
@@ -3026,7 +3184,7 @@ load_params() {
 show_usage() {
   cat <<'USAGE'
 Usage:
-  vpn-awg <name>          Create a new AmneziaWG client
+  vpn-awg <name>          Create a new AmneziaWG 3.1 client
   vpn-awg list            List saved AmneziaWG client configs
   vpn-awg show <name>     Print saved client config and QR
   vpn-awg revoke <name>   Remove a client peer and archive its config
@@ -3124,7 +3282,7 @@ analyze_awg() {
   load_params
   port="${AWG_ENDPOINT_PORT:-${DEFAULT_PORT}}"
   iface="$(cat "${STACK_DIR}/external-interface.txt" 2>/dev/null || true)"
-  echo "AmneziaWG diagnostics"
+  echo "AmneziaWG 3.1 diagnostics"
   echo
   echo "Services:"
   systemctl is-active awg-quick@awg0.service 2>/dev/null | sed 's/^/  awg-quick@awg0 active: /' || true
@@ -3154,7 +3312,7 @@ analyze_awg() {
   echo
   echo "AWG obfuscation profile:"
   if [[ -f "${PARAMS}" ]]; then
-    grep -E '^AWG_(OBFS_PROFILE|EFFECTIVE_PROFILE|TUNING_SOURCE|MTU|MTU_SOURCE|ENDPOINT_PORT|DNS|ALLOWED_IPS|KEEPALIVE|JC|JMIN|JMAX|S[1-4]|H[1-4]|I[1-5])=' "${PARAMS}" | sed 's/^/  /'
+    grep -E '^AWG_(PROTOCOL_VERSION|OBFS_PROFILE|EFFECTIVE_PROFILE|TUNING_SOURCE|MTU|MTU_SOURCE|ENDPOINT_PORT|DNS|ALLOWED_IPS|KEEPALIVE|JC|JMIN|JMAX|S[1-4]|H[1-4]|I[1-5]|CONTENT_PADDING_ADDITION|REKEY_AFTER_TIME|REKEY_TIMEOUT|REJECT_AFTER_TIME|KEEPALIVE_TIMEOUT|MAX_HANDSHAKE_ATTEMPTS|RANDOM_TRAILERS|DISABLE_COOKIES)=' "${PARAMS}" | sed 's/^/  /'
   else
     echo "  missing ${PARAMS}"
   fi
@@ -3266,9 +3424,9 @@ revoke_client() {
 
 profile_report() {
   load_params
-  echo "AmneziaWG profile"
+  echo "AmneziaWG 3.1 profile"
   echo
-  grep -E '^AWG_(OBFS_PROFILE|EFFECTIVE_PROFILE|TUNING_SOURCE|MTU|MTU_SOURCE|ENDPOINT_PORT|DNS|ALLOWED_IPS|KEEPALIVE|JC|JMIN|JMAX|S[1-4]|H[1-4]|I[1-5])=' "${PARAMS}" | sed 's/^/  /'
+  grep -E '^AWG_(PROTOCOL_VERSION|OBFS_PROFILE|EFFECTIVE_PROFILE|TUNING_SOURCE|MTU|MTU_SOURCE|ENDPOINT_PORT|DNS|ALLOWED_IPS|KEEPALIVE|JC|JMIN|JMAX|S[1-4]|H[1-4]|I[1-5]|CONTENT_PADDING_ADDITION|REKEY_AFTER_TIME|REKEY_TIMEOUT|REJECT_AFTER_TIME|KEEPALIVE_TIMEOUT|MAX_HANDSHAKE_ATTEMPTS|RANDOM_TRAILERS|DISABLE_COOKIES)=' "${PARAMS}" | sed 's/^/  /'
   echo
   if [[ -f "${STACK_DIR}/awg-tuning-report.json" ]]; then
     echo "Report: ${STACK_DIR}/awg-tuning-report.json"
@@ -3282,15 +3440,17 @@ profile_report() {
 
 show_sanitized_config() {
   [[ -f "${CONFIG}" ]] || die "Missing ${CONFIG}"
-  sed -E 's/^(PrivateKey|PresharedKey)[[:space:]]*=.*/\1 = [hidden]/' "${CONFIG}"
+  sed -E 's/^(PrivateKey|PresharedKey|HeaderProtectionKey)[[:space:]]*=.*/\1 = [hidden]/' "${CONFIG}"
 }
 
 explain_tuning() {
   cat <<'EXPLAIN'
-AmneziaWG tuning notes
+AmneziaWG 3.1 tuning notes
 
 Values are generated at install time from AWG_OBFS_PROFILE and saved in /opt/vpn-stack/awg-params.env.
 Supported profiles: dns, quic-lite, video-call, mobile-low-mtu, random-balanced, custom.
+AWG 3.1 header protection, content padding, timing ranges, and random trailers are enabled by default.
+Cookie replies stay enabled by default for denial-of-service resistance.
 Use AWG_MTU=auto to run a PMTU probe; if ICMP is blocked, the fallback is 1280.
 Use AWG_* environment variables before install to override generated values.
 
@@ -3406,14 +3566,15 @@ fi
 if ! cat >"${out}" <<EOF_CLIENT
 # ${label}
 # GeneratedAt = $(date -Is)
+# Protocol = AmneziaWG ${AWG_PROTOCOL_VERSION:-3.1}
 # ObfuscationProfile = ${AWG_OBFS_PROFILE:-unknown}
 # EffectiveProfile = ${AWG_EFFECTIVE_PROFILE:-unknown}
-# MTU = ${AWG_MTU:-1280}
+# MTU = ${AWG_MTU:-1320}
 [Interface]
 PrivateKey = ${client_private}
 Address = ${client_ip}/32
 DNS = ${AWG_DNS:-1.1.1.1, 8.8.8.8}
-MTU = ${AWG_MTU:-1280}
+MTU = ${AWG_MTU:-1320}
 Jc = ${AWG_JC}
 Jmin = ${AWG_JMIN}
 Jmax = ${AWG_JMAX}
@@ -3430,6 +3591,15 @@ I2 = ${AWG_I2}
 I3 = ${AWG_I3}
 I4 = ${AWG_I4}
 I5 = ${AWG_I5}
+HeaderProtectionKey = ${AWG_HEADER_PROTECTION_KEY}
+ContentPaddingAddition = ${AWG_CONTENT_PADDING_ADDITION}
+RekeyAfterTime = ${AWG_REKEY_AFTER_TIME}
+RekeyTimeout = ${AWG_REKEY_TIMEOUT}
+RejectAfterTime = ${AWG_REJECT_AFTER_TIME}
+KeepaliveTimeout = ${AWG_KEEPALIVE_TIMEOUT}
+MaxHandshakeAttempts = ${AWG_MAX_HANDSHAKE_ATTEMPTS}
+RandomTrailers = ${AWG_RANDOM_TRAILERS}
+DisableCookies = ${AWG_DISABLE_COOKIES}
 
 [Peer]
 PublicKey = ${server_public}
@@ -4202,6 +4372,7 @@ def command_audit(args: argparse.Namespace) -> None:
         "server_location": location,
         "awg": {
             "source_dir": str(source),
+            "protocol_version": params.get("AWG_PROTOCOL_VERSION", "unknown"),
             "endpoint_port": params.get("AWG_ENDPOINT_PORT", "51820"),
             "profile": params.get("AWG_OBFS_PROFILE", "unknown"),
             "mtu": params.get("AWG_MTU", "unknown"),
@@ -5481,39 +5652,276 @@ EOF
 }
 
 configure_timers() {
-  log "Configuring soft reboot and boot healthcheck timers."
+  log "Configuring boot healthcheck timers; scheduled reboots remain disabled."
+  systemctl disable --now vpn-soft-reboot.timer >/dev/null 2>&1 || true
+  rm -f \
+    /etc/systemd/system/vpn-soft-reboot.timer \
+    /etc/systemd/system/vpn-soft-reboot.service \
+    /usr/local/sbin/vpn-soft-reboot.sh
 
-  cat >/usr/local/sbin/vpn-soft-reboot.sh <<'EOF'
+  cat >/usr/local/sbin/vpn-awg-auto-update.sh <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
-printf '%s soft reboot requested\n' "$(date -Is)" >>/var/log/vpn-soft-reboot.log
-systemctl reboot
-EOF
-  chmod 0755 /usr/local/sbin/vpn-soft-reboot.sh
+set -Eeuo pipefail
 
-  cat >/etc/systemd/system/vpn-soft-reboot.service <<'EOF'
+lock_file="/run/vpn-engine-update.lock"
+backup_root="/root/vpn-keys/awg-update-backups"
+log_tag="vpn-awg-auto-update"
+packages=(amneziawg amneziawg-dkms amneziawg-tools)
+
+exec 9>"${lock_file}"
+flock -n 9 || exit 0
+install -d -m 0700 "${backup_root}"
+
+log() {
+  logger -t "${log_tag}" -- "$*"
+  printf '[%s] %s\n' "${log_tag}" "$*"
+}
+
+prune_backups() {
+  local old target
+  while IFS= read -r old; do
+    [[ "${old}" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || continue
+    target="${backup_root}/${old}"
+    [[ -d "${target}" && "${target}" == "${backup_root}/"* ]] || continue
+    rm -rf -- "${target}"
+  done < <(find "${backup_root}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort -r | tail -n +6)
+}
+
+installed_version() {
+  dpkg-query -W -f='${Status} ${Version}\n' "$1" 2>/dev/null \
+    | awk '$1 == "install" && $2 == "ok" && $3 == "installed" {print $4}'
+}
+
+candidate_version() {
+  apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}'
+}
+
+reload_awg() {
+  systemctl stop awg-quick@awg0.service >/dev/null 2>&1 || true
+  modprobe -r amneziawg >/dev/null 2>&1 || true
+  modprobe amneziawg
+  systemctl start awg-quick@awg0.service
+}
+
+validate_awg() {
+  awg --version 2>/dev/null | grep -Eq 'v3\.1\.' \
+    && systemctl is-active --quiet awg-quick@awg0.service \
+    && awg show awg0 >/dev/null 2>&1 \
+    && grep -Eq '^HeaderProtectionKey[[:space:]]*=' /etc/amnezia/amneziawg/awg0.conf \
+    && grep -Eq '^RandomTrailers[[:space:]]*=[[:space:]]*on$' /etc/amnezia/amneziawg/awg0.conf
+}
+
+apt-get -o DPkg::Lock::Timeout=1800 update >/dev/null
+update_needed=0
+for package in "${packages[@]}"; do
+  installed="$(installed_version "${package}")"
+  candidate="$(candidate_version "${package}")"
+  [[ -n "${installed}" && -n "${candidate}" && "${candidate}" != "(none)" ]] || continue
+  if dpkg --compare-versions "${candidate}" gt "${installed}"; then
+    update_needed=1
+  fi
+done
+((update_needed == 1)) || exit 0
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+backup_dir="${backup_root}/${stamp}"
+install -d -m 0700 "${backup_dir}/debs"
+tar -C / -czf "${backup_dir}/profiles.tar.gz" \
+  etc/amnezia/amneziawg/awg0.conf \
+  opt/vpn-stack/awg-params.env \
+  opt/vpn-stack/awg-tuning-report.json \
+  root/vpn-keys/awg
+chmod 0600 "${backup_dir}/profiles.tar.gz"
+
+for package in "${packages[@]}"; do
+  installed="$(installed_version "${package}")"
+  [[ -n "${installed}" ]] || continue
+  if ! (cd "${backup_dir}/debs" && apt-get download "${package}=${installed}" >/dev/null); then
+    log "Update skipped: exact rollback package is unavailable for ${package}=${installed}."
+    exit 1
+  fi
+done
+find "${backup_dir}/debs" -maxdepth 1 -type f -name '*.deb' -exec chmod 0600 {} +
+[[ "$(find "${backup_dir}/debs" -maxdepth 1 -type f -name '*.deb' | wc -l)" -ge 2 ]] \
+  || { log "Update skipped: exact rollback packages could not be saved."; exit 1; }
+
+rollback() {
+  trap - ERR
+  log "AWG update failed; restoring previous packages."
+  systemctl stop awg-quick@awg0.service >/dev/null 2>&1 || true
+  apt-get -o DPkg::Lock::Timeout=1800 install -y --allow-downgrades \
+    "${backup_dir}"/debs/*.deb >/dev/null 2>&1 || true
+  reload_awg || true
+}
+trap rollback ERR
+
+log "Installing an available official AWG 3.1 package update. Backup: ${backup_dir}"
+apt-get -o DPkg::Lock::Timeout=1800 install -y --only-upgrade "${packages[@]}"
+reload_awg
+validate_awg
+trap - ERR
+log "AWG 3.1 package update completed successfully."
+prune_backups
+EOF
+  chmod 0755 /usr/local/sbin/vpn-awg-auto-update.sh
+
+  cat >/etc/systemd/system/vpn-awg-auto-update.service <<'EOF'
 [Unit]
-Description=Daily soft reboot for VPN stack
+Description=Safely update official AmneziaWG 3.1 packages
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/vpn-soft-reboot.sh
+ExecStart=/usr/local/sbin/vpn-awg-auto-update.sh
 EOF
-  chmod 0644 /etc/systemd/system/vpn-soft-reboot.service
+  chmod 0644 /etc/systemd/system/vpn-awg-auto-update.service
 
-  cat >/etc/systemd/system/vpn-soft-reboot.timer <<'EOF'
+  cat >/etc/systemd/system/vpn-awg-auto-update.timer <<'EOF'
 [Unit]
-Description=Run VPN soft reboot daily at 04:00 Europe/Moscow
+Description=Check daily for official AmneziaWG 3.1 patch updates
 
 [Timer]
-OnCalendar=*-*-* 04:00:00 Europe/Moscow
-Persistent=false
-Unit=vpn-soft-reboot.service
+OnCalendar=*-*-* 02:00:00 UTC
+RandomizedDelaySec=30m
+Persistent=true
+Unit=vpn-awg-auto-update.service
 
 [Install]
 WantedBy=timers.target
 EOF
-  chmod 0644 /etc/systemd/system/vpn-soft-reboot.timer
+  chmod 0644 /etc/systemd/system/vpn-awg-auto-update.timer
+
+  cat >/usr/local/sbin/vpn-core-auto-update.sh <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+lock_file="/run/vpn-engine-update.lock"
+backup_root="/root/vpn-keys/core-update-backups"
+stack_dir="/opt/vpn-stack"
+xray_config="${stack_dir}/xray/config.json"
+xray_service="$(cat "${stack_dir}/trojan-xhttp-service.txt" 2>/dev/null || printf 'xray-trojan-xhttp-tls.service')"
+log_tag="vpn-core-auto-update"
+
+exec 9>"${lock_file}"
+flock -n 9 || exit 0
+install -d -m 0700 "${backup_root}"
+
+log() {
+  logger -t "${log_tag}" -- "$*"
+  printf '[%s] %s\n' "${log_tag}" "$*"
+}
+
+prune_backups() {
+  local old target
+  while IFS= read -r old; do
+    [[ "${old}" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || continue
+    target="${backup_root}/${old}"
+    [[ -d "${target}" && "${target}" == "${backup_root}/"* ]] || continue
+    rm -rf -- "${target}"
+  done < <(find "${backup_root}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort -r | tail -n +6)
+}
+
+xray_bin="$(command -v xray)"
+hysteria_bin="$(command -v hysteria)"
+[[ -x "${xray_bin}" && -x "${hysteria_bin}" ]] || { log "Xray or Hysteria binary is missing."; exit 1; }
+"${xray_bin}" run -test -config "${xray_config}" >/dev/null
+
+xray_current="v$("${xray_bin}" version 2>/dev/null | sed -n '1{s/^[^0-9]*\([0-9][0-9.]*\).*/\1/p}')"
+hysteria_current="$("${hysteria_bin}" version 2>/dev/null | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | sed -n '1p')"
+[[ "${hysteria_current}" == v* ]] || hysteria_current="v${hysteria_current}"
+[[ "${xray_current}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "${hysteria_current}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || { log "Could not parse installed Xray/Hysteria versions."; exit 1; }
+xray_latest="$(curl -fsSL -H 'Accept: application/vnd.github+json' -H 'User-Agent: Golden-VPN-updater' \
+  https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name // empty')"
+hysteria_latest="$(curl -fsSL -H 'Accept: application/vnd.github+json' -H 'User-Agent: Golden-VPN-updater' \
+  https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r '.tag_name // empty' | sed 's#^app/##')"
+[[ -n "${xray_latest}" && -n "${hysteria_latest}" ]] \
+  || { log "Could not determine current stable Xray/Hysteria releases."; exit 1; }
+if [[ "${xray_current}" == "${xray_latest}" && "${hysteria_current}" == "${hysteria_latest}" ]]; then
+  exit 0
+fi
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+backup_dir="${backup_root}/${stamp}"
+install -d -m 0700 "${backup_dir}"
+install -m 0755 "${xray_bin}" "${backup_dir}/xray"
+install -m 0755 "${hysteria_bin}" "${backup_dir}/hysteria"
+printf '%s\n' "${xray_bin}" >"${backup_dir}/xray-path.txt"
+printf '%s\n' "${hysteria_bin}" >"${backup_dir}/hysteria-path.txt"
+"${xray_bin}" version 2>/dev/null | sed -n '1p' >"${backup_dir}/xray-version.before.txt" || true
+"${hysteria_bin}" version 2>/dev/null | sed -n '1p' >"${backup_dir}/hysteria-version.before.txt" || true
+chmod 0600 "${backup_dir}"/*.txt
+
+rollback() {
+  trap - ERR
+  log "Core update failed; restoring previous Xray and Hysteria binaries."
+  install -m 0755 "${backup_dir}/xray" "${xray_bin}" || true
+  install -m 0755 "${backup_dir}/hysteria" "${hysteria_bin}" || true
+  systemctl restart "${xray_service}" >/dev/null 2>&1 || true
+  systemctl restart hysteria2.service >/dev/null 2>&1 || true
+  for service in hysteria-server.service hysteria.service hysteria@server.service; do
+    systemctl disable --now "${service}" >/dev/null 2>&1 || true
+  done
+}
+trap rollback ERR
+
+update_dir="$(mktemp -d)"
+trap 'rm -rf "${update_dir}"' EXIT
+curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "${update_dir}/xray-install.sh"
+curl -fsSL https://get.hy2.sh/ -o "${update_dir}/hysteria-install.sh"
+chmod 0700 "${update_dir}"/*.sh
+
+# Both official installers select their latest non-prerelease channel by default.
+bash "${update_dir}/xray-install.sh" install -u root
+bash "${update_dir}/hysteria-install.sh"
+for service in hysteria-server.service hysteria.service hysteria@server.service; do
+  systemctl disable --now "${service}" >/dev/null 2>&1 || true
+done
+
+"${xray_bin}" run -test -config "${xray_config}" >/dev/null
+systemctl restart "${xray_service}"
+systemctl restart hysteria2.service
+systemctl is-active --quiet "${xray_service}"
+systemctl is-active --quiet hysteria2.service
+test -S /dev/shm/xray-trojan-xhttp.sock
+ss -H -lun | awk '$5 ~ /:8443$/ {found=1} END {exit found ? 0 : 1}'
+
+trap - ERR
+"${xray_bin}" version 2>/dev/null | sed -n '1p' >"${backup_dir}/xray-version.after.txt" || true
+"${hysteria_bin}" version 2>/dev/null | sed -n '1p' >"${backup_dir}/hysteria-version.after.txt" || true
+chmod 0600 "${backup_dir}"/*.txt
+log "Stable Xray and Hysteria update check completed successfully. Backup: ${backup_dir}"
+prune_backups
+EOF
+  chmod 0755 /usr/local/sbin/vpn-core-auto-update.sh
+
+  cat >/etc/systemd/system/vpn-core-auto-update.service <<'EOF'
+[Unit]
+Description=Safely update stable Xray and Hysteria releases
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpn-core-auto-update.sh
+EOF
+  chmod 0644 /etc/systemd/system/vpn-core-auto-update.service
+
+  cat >/etc/systemd/system/vpn-core-auto-update.timer <<'EOF'
+[Unit]
+Description=Check daily for stable Xray and Hysteria updates
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+RandomizedDelaySec=45m
+Persistent=true
+Unit=vpn-core-auto-update.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 0644 /etc/systemd/system/vpn-core-auto-update.timer
 
   cat >/usr/local/sbin/vpn-stack-healthcheck.sh <<'EOF'
 #!/usr/bin/env bash
@@ -5612,7 +6020,8 @@ enable_and_start_services() {
   systemctl enable grafana-server
   systemctl enable logrotate.timer
   systemctl enable vpn-storage-maintenance.timer
-  systemctl enable vpn-soft-reboot.timer
+  systemctl enable vpn-awg-auto-update.timer
+  systemctl enable vpn-core-auto-update.timer
   systemctl enable vpn-stack-healthcheck.timer
   systemctl enable vpn-cert-notify.timer
 
@@ -5627,7 +6036,8 @@ enable_and_start_services() {
   systemctl restart grafana-server
   systemctl restart logrotate.timer
   systemctl restart vpn-storage-maintenance.timer
-  systemctl restart vpn-soft-reboot.timer
+  systemctl restart vpn-awg-auto-update.timer
+  systemctl restart vpn-core-auto-update.timer
   systemctl restart vpn-stack-healthcheck.timer
   systemctl restart vpn-cert-notify.timer
 }
@@ -5786,9 +6196,9 @@ Server location: ${SERVER_LOCATION}
 External interface: ${EXT_IFACE}
 
 Contours:
-  Trojan XHTTP TLS   : service $(service_summary "${xray_service}"); external 443/tcp via nginx $(listen_label any tcp 443); backend ${TROJAN_XHTTP_SOCKET} $(socket_label "${TROJAN_XHTTP_SOCKET}")
-  Hysteria2 Salamander: service $(service_summary hysteria2); external 8443/udp $(listen_label any udp 8443)
-  AmneziaWG 2.0       : service $(service_summary awg-quick@awg0); external ${awg_port}/udp $(listen_label any udp "${awg_port}"); interface awg0
+  AmneziaWG 3.1 (№1)  : service $(service_summary awg-quick@awg0); external ${awg_port}/udp $(listen_label any udp "${awg_port}"); interface awg0
+  Hysteria2 (№2)      : service $(service_summary hysteria2); external 8443/udp $(listen_label any udp 8443); Salamander
+  Trojan TLS fallback : service $(service_summary "${xray_service}"); external 443/tcp via nginx $(listen_label any tcp 443); backend ${TROJAN_XHTTP_SOCKET} $(socket_label "${TROJAN_XHTTP_SOCKET}")
   Decoy HTTPS site    : nginx $(service_summary nginx); https://${DOMAIN}/; randomized static site on 443/tcp
 
 TLS certificate:
@@ -5814,6 +6224,11 @@ AmneziaWG diagnostics:
   Full status: vpn-awg analyze
   Status + explicit short capture: vpn-awg analyze 20
   Save pcap: vpn-awg capture 30
+
+Engine updates:
+  AWG 3.1 stable patches: vpn-awg-auto-update.timer (daily, rollback protected)
+  Xray/Hysteria stable: vpn-core-auto-update.timer (daily, binary rollback protected)
+  Scheduled server reboot: disabled
 
 Decoy:
   Profile: ${decoy_profile}
@@ -5914,15 +6329,19 @@ generate_install_report() {
   "external_interface": $(json_escape "${EXT_IFACE:-unknown}"),
   "contours": {
     "trojan_xhttp_tls": {
+      "priority": 3,
       "external": "443/tcp",
       "service": $(json_escape "$(service_summary "${xray_service}")"),
       "backend_socket": $(json_escape "${TROJAN_XHTTP_SOCKET}")
     },
     "hysteria2_salamander": {
+      "priority": 2,
       "external": "8443/udp",
       "service": $(json_escape "$(service_summary hysteria2)")
     },
     "amneziawg": {
+      "priority": 1,
+      "protocol_version": "3.1",
       "external": $(json_escape "${awg_port}/udp"),
       "service": $(json_escape "$(service_summary awg-quick@awg0)"),
       "profile": $(json_escape "${awg_profile}"),
@@ -5965,6 +6384,13 @@ generate_install_report() {
     "url_shape": $(json_escape "https://${DOMAIN:-DOMAIN}/s/<token>"),
     "payload": "sub.txt contains Trojan and Hysteria2 links; awg.conf is downloadable separately",
     "token_policy": "unguessable per-subscription tokens are never included in install reports"
+  },
+  "engine_updates": {
+    "awg31_timer": "vpn-awg-auto-update.timer",
+    "xray_hysteria_timer": "vpn-core-auto-update.timer",
+    "channel": "stable",
+    "rollback": true,
+    "scheduled_reboot": false
   },
   "bot_export": {
     "helper": "vpn-bot-export",
@@ -6023,11 +6449,18 @@ validate_stack() {
   check_pass "Trojan-capable Xray active (${xray_service})" systemctl is-active --quiet "${xray_service}"
   check_pass "hysteria2 active" systemctl is-active --quiet hysteria2
   check_pass "awg-quick@awg0 active" systemctl is-active --quiet awg-quick@awg0
+  check_pass "AmneziaWG 3.1 tools" bash -c 'awg --version 2>/dev/null | grep -Eq '\''v3\.1\.'\'''
+  check_pass "AWG 3.1 header protection configured" grep -Eq '^HeaderProtectionKey[[:space:]]*=' "${AWG_CONFIG}"
+  check_pass "AWG 3.1 content padding configured" grep -Eq '^ContentPaddingAddition[[:space:]]*=' "${AWG_CONFIG}"
+  check_pass "AWG 3.1 random trailers configured" grep -Eq '^RandomTrailers[[:space:]]*=[[:space:]]*on$' "${AWG_CONFIG}"
   check_pass "prometheus active" systemctl is-active --quiet prometheus
   check_pass "node exporter active" systemctl is-active --quiet prometheus-node-exporter
   check_pass "grafana active" systemctl is-active --quiet grafana-server
   check_pass "hourly logrotate timer active" systemctl is-active --quiet logrotate.timer
   check_pass "storage maintenance timer active" systemctl is-active --quiet vpn-storage-maintenance.timer
+  check_pass "AWG stable update timer active" systemctl is-active --quiet vpn-awg-auto-update.timer
+  check_pass "Xray/Hysteria stable update timer active" systemctl is-active --quiet vpn-core-auto-update.timer
+  check_absent "scheduled reboot timer absent" systemctl is-enabled --quiet vpn-soft-reboot.timer
   check_pass "journald capped at 200M" grep -Eq '^SystemMaxUse=200M$' /etc/systemd/journald.conf.d/limits.conf
   check_pass "logrotate configuration valid" logrotate --debug /etc/logrotate.conf
   # shellcheck disable=SC2016
@@ -6315,7 +6748,15 @@ apply_upgrade_overlay() {
   systemctl daemon-reload
   systemctl restart systemd-journald || true
   systemctl enable --now logrotate.timer vpn-storage-maintenance.timer
-  systemctl enable vpn-soft-reboot.timer vpn-stack-healthcheck.timer
+  systemctl disable --now vpn-soft-reboot.timer >/dev/null 2>&1 || true
+  systemctl enable --now vpn-stack-healthcheck.timer vpn-core-auto-update.timer
+  if grep -Eq '^HeaderProtectionKey[[:space:]]*=' "${AWG_CONFIG}" \
+    && grep -Eq '^RandomTrailers[[:space:]]*=[[:space:]]*on$' "${AWG_CONFIG}"; then
+    systemctl enable --now vpn-awg-auto-update.timer
+  else
+    systemctl disable --now vpn-awg-auto-update.timer >/dev/null 2>&1 || true
+    warn "AWG auto-update remains disabled because the existing contour is not a validated AWG 3.1 profile."
+  fi
   systemctl enable --now vpn-cert-notify.timer
 
   if systemctl cat prometheus.service >/dev/null 2>&1; then
@@ -6664,7 +7105,7 @@ prepare_vless_to_trojan_migration() {
       listen: $listen,
       protocol: "trojan",
       settings: {clients: $clients},
-      streamSettings: {network: "xhttp", xhttpSettings: {path: $path, mode: "stream-one"}},
+      streamSettings: {network: "xhttp", xhttpSettings: {path: $path, mode: "auto"}},
       sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]}
     }]
   ' "${XRAY_DIR}/config.json" >"${bundle}/xray.candidate.json"
@@ -6677,7 +7118,7 @@ prepare_vless_to_trojan_migration() {
     label="$(label_name "TROJAN" "${name}")"
     encoded_path="$(uri_encode "${path}")"
     fragment="$(uri_encode "${label}")"
-    printf 'trojan://%s@%s:443?security=tls&type=xhttp&path=%s&mode=stream-one&sni=%s&host=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1#%s\n' \
+    printf 'trojan://%s@%s:443?security=tls&type=xhttp&path=%s&mode=auto&sni=%s&host=%s&alpn=h2#%s\n' \
       "${password}" "${domain}" "${encoded_path}" "${domain}" "${domain}" "${fragment}" \
       >"${bundle}/links/${label}.txt"
     chmod 0600 "${bundle}/links/${label}.txt"

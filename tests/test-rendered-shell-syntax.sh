@@ -29,7 +29,8 @@ extract_heredoc 'cat >/usr/local/bin/vpn-bot-export <<'"'"'EOF'"'"'' "${tmp_dir}
 extract_heredoc 'cat >/usr/local/bin/vpn-cert-notify <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-cert-notify"
 extract_heredoc 'cat >/usr/local/bin/vpn-help <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-help"
 extract_heredoc 'cat >/usr/local/sbin/vpn-storage-maintenance.sh <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-storage-maintenance"
-extract_heredoc 'cat >/usr/local/sbin/vpn-soft-reboot.sh <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-soft-reboot"
+extract_heredoc 'cat >/usr/local/sbin/vpn-awg-auto-update.sh <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-awg-auto-update"
+extract_heredoc 'cat >/usr/local/sbin/vpn-core-auto-update.sh <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-core-auto-update"
 extract_heredoc 'cat >/usr/local/sbin/vpn-stack-healthcheck.sh <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-stack-healthcheck"
 
 printf 'rendered shell syntax tests passed\n'

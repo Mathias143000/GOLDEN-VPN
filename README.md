@@ -4,9 +4,9 @@ Golden install script for a fresh Ubuntu/Debian VPS.
 
 It deploys:
 
-- Trojan XHTTP TLS on `443/tcp` behind nginx and the domain certificate
-- Hysteria2 Salamander on `8443/udp`
-- AmneziaWG 2.0 on `51820/udp`
+- primary: AmneziaWG 3.1 on `51820/udp`
+- backup №2: Hysteria2 Salamander on `8443/udp`
+- TCP/TLS fallback: Trojan XHTTP TLS in `auto` mode on `443/tcp` behind nginx and the domain certificate
 - randomized static decoy HTTPS site on `https://DOMAIN/`
 - Grafana, Prometheus, and Node Exporter on localhost only
 
@@ -18,6 +18,9 @@ Before running the installer:
 - keep Cloudflare proxy status as DNS only / grey cloud
 - run as `root`
 - use a Cloudflare token with DNS edit access for the zone
+- use an AWG 3.1-capable client (AmneziaVPN `5.0.1.5+`, DefaultVPN `2.0.1.1+`, or a current native AWG client)
+
+AWG 3.1 profiles are not compatible with AWG 2.0 clients. Router clients that do not support AWG 3.1 need Hysteria2/Trojan or a separately retained AWG 2.0 service; a clean Golden install does not create a legacy AWG 2.0 contour.
 
 ## Two-Stage Bootstrap Install
 
@@ -113,11 +116,21 @@ Optional tuning variables:
 
 ```bash
 export AWG_OBFS_PROFILE="random-balanced"   # dns, quic-lite, video-call, mobile-low-mtu, random-balanced, custom
-export AWG_MTU="1280"                       # or auto
+export AWG_MTU="1320"                       # tested baseline; auto or 1280 fallback are also supported
 export AWG_ENDPOINT_PORT="51820"
 export AWG_DNS="1.1.1.1, 8.8.8.8"
 export AWG_ALLOWED_IPS="0.0.0.0/0, ::/0"
 export AWG_KEEPALIVE="25"
+# AWG 3.1 defaults already enable header protection, content padding,
+# timing ranges and random trailers. Advanced explicit overrides:
+export AWG_CONTENT_PADDING_ADDITION="16-96"
+export AWG_REKEY_AFTER_TIME="110-130"
+export AWG_REKEY_TIMEOUT="4-7"
+export AWG_REJECT_AFTER_TIME="170-190"
+export AWG_KEEPALIVE_TIMEOUT="8-12"
+export AWG_MAX_HANDSHAKE_ATTEMPTS="15-20"
+export AWG_RANDOM_TRAILERS="on"
+export AWG_DISABLE_COOKIES="off"             # keep DoS cookie protection enabled
 
 export DECOY_PROFILE="random"               # network-monitor, software-status, edge-docs, availability-lab, random
 export DECOY_SEED="optional-repeatable-seed"
@@ -457,7 +470,26 @@ Captures are saved under:
 /var/log/vpn-stack/awg-captures/
 ```
 
-AmneziaWG parameters are randomized from the selected profile. Supported profiles are `dns`, `quic-lite`, `video-call`, `mobile-low-mtu`, `random-balanced`, and `custom`; default is `random-balanced`. The installer writes `/opt/vpn-stack/awg-params.env` and `/opt/vpn-stack/awg-tuning-report.json`. Use `AWG_MTU=auto` for a PMTU probe with safe fallback to `1280`, or set an explicit value from `1200..1420`. Tcpdump is not run automatically during install; use `vpn-awg analyze 20`, `vpn-awg capture 30`, or `vpn-awg analyze-live 20` only when you intentionally want packet-size diagnostics.
+Golden installs AmneziaWG 3.1 and refuses to continue if the installed tools or kernel module reject the 3.1 runtime fields. Header protection, content padding, timing ranges and random trailers are enabled; cookie replies remain enabled for denial-of-service resistance. `J/S/H/I1-I5` values are randomized from the selected profile. Supported profiles are `dns`, `quic-lite`, `video-call`, `mobile-low-mtu`, `random-balanced`, and `custom`; default is `random-balanced`. The installer writes `/opt/vpn-stack/awg-params.env` and `/opt/vpn-stack/awg-tuning-report.json`. Default MTU is `1320`; `AWG_MTU=auto` performs a server-side PMTU probe with fallback to `1280`, and an explicit value may be set from `1200..1420`. Tcpdump is never run automatically.
+
+## Protocol engine updates
+
+Stable engine updates are checked daily without rebooting the VPS:
+
+```bash
+systemctl status vpn-awg-auto-update.timer
+systemctl status vpn-core-auto-update.timer
+systemctl start vpn-awg-auto-update.service
+systemctl start vpn-core-auto-update.service
+journalctl -u vpn-awg-auto-update.service --no-pager
+journalctl -u vpn-core-auto-update.service --no-pager
+```
+
+`vpn-awg-auto-update` updates only official Amnezia PPA packages after saving exact rollback packages and current AWG profiles. It reloads and validates AWG 3.1, and restores the prior packages if activation fails. `vpn-core-auto-update` uses the official stable-channel installers for Xray and Hysteria, saves both binaries first, tests the Xray config, restarts only their custom Golden services, checks the Unix socket and UDP listener, and restores the prior binaries on failure. Each updater retains the five newest successful backup directories. Pre-release Xray builds and incompatible AWG major upgrades are not installed automatically.
+
+The Trojan XHTTP profile uses `mode=auto`, real domain TLS, nginx HTTP/2, the secret XHTTP path, and the Xray Unix socket. Client links do not force a `fp` value; the client may use its own supported TLS implementation. No extra Xray mux or speculative manual `extra` tuning is enabled. The decoy is a multi-page static HTTPS site with local CSS and no external assets, forms, analytics or scripts.
+
+The old daily `vpn-soft-reboot.timer` is removed and disabled. Boot healthcheck remains enabled.
 
 ## Disk and log protection
 
