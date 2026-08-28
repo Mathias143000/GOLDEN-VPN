@@ -45,7 +45,7 @@ The commands above install only the bootstrap download prerequisites. Bootstrap 
 
 The installer asks for `DOMAIN`, `EMAIL`, `SERVER_LOCATION`, and `CF_Token`. It also offers an optional `Advanced tuning? [y/N]` block for `AWG_OBFS_PROFILE`, `AWG_MTU`, `DECOY_PROFILE`, and `DECOY_SEED`.
 
-After the reboot, reconnect by SSH. The installer adds a guarded block to `/root/.bashrc`, so an interactive root login automatically shows the colored stage2 progress and recent logs with `vpn-install-status auto`. No command input is required after reboot.
+After input collection, an interactive install switches to a compact screen containing only the current stage, progress bar, and important warnings/errors. Complete package, download, and build output remains in `/var/log/vpn-stack-resume-install.log`. After the reboot, reconnect by SSH. The installer adds a guarded block to `/root/.bashrc`, so an interactive root login automatically shows the same filtered stage2 view with `vpn-install-status auto`. No command input is required after reboot.
 
 Manual watcher:
 

@@ -62,6 +62,7 @@ PUBLIC_IPV4=""
 EXT_IFACE=""
 SWAP_RESULT="not checked"
 DKMS_KERNEL_REBOOT_PROMPTED=0
+COMPACT_INSTALL_UI=0
 
 BASE_PACKAGES=(
   curl
@@ -249,15 +250,28 @@ progress() {
   bar="$(printf '%*s' "${filled}" '' | tr ' ' '#')$(printf '%*s' "${empty}" '' | tr ' ' '-')"
   log "[${bar}] ${percent}% (${INSTALL_STEP}/${INSTALL_TOTAL_STEPS}) ${message}"
 
-  if [[ -t 1 && "${TERM:-}" != "dumb" ]]; then
-    if ((percent < 34)); then
-      color=$'\033[31m'
-    elif ((percent < 67)); then
-      color=$'\033[33m'
-    else
-      color=$'\033[32m'
-    fi
-    reset=$'\033[0m'
+  if ((percent < 34)); then
+    color=$'\033[31m'
+  elif ((percent < 67)); then
+    color=$'\033[33m'
+  else
+    color=$'\033[32m'
+  fi
+  reset=$'\033[0m'
+
+  if [[ "${COMPACT_INSTALL_UI}" == "1" ]] && have_tty; then
+    {
+      printf '\033[H'
+      printf 'Golden VPN installer\n\n'
+      printf '%s[%s]%s %s%% (%s/%s) %s\n' \
+        "${color}" "${bar}" "${reset}" "${percent}" "${INSTALL_STEP}" "${INSTALL_TOTAL_STEPS}" "${message}"
+      printf 'Updated: %s\n' "$(date -Is)"
+      printf 'Full log: %s\n\n' "${RESUME_INSTALL_LOG}"
+      printf 'Important messages:\n'
+      important_log_tail "${RESUME_INSTALL_LOG}" 12
+      printf '\033[J'
+    } >/dev/tty
+  elif [[ -t 1 && "${TERM:-}" != "dumb" ]]; then
     tty_lines="$(tput lines 2>/dev/null || printf '999')"
     printf '\0337\033[%s;1H\033[2K%s[%s]%s %s%% (%s/%s) %s\0338' \
       "${tty_lines}" "${color}" "${bar}" "${reset}" "${percent}" "${INSTALL_STEP}" "${INSTALL_TOTAL_STEPS}" "${message}"
@@ -275,9 +289,47 @@ progress() {
   fi
 }
 
+important_log_tail() {
+  local file="$1" lines="${2:-12}" output
+  if [[ ! -r "${file}" ]]; then
+    printf 'None.\n'
+    return 0
+  fi
+  output="$(awk '
+    BEGIN { IGNORECASE=1 }
+    /\[vpn-stack\] (WARNING|ERROR):/ ||
+    /resume install (failed|succeeded)/ ||
+    /(^|[^[:alpha:]])(error|failed|failure|fatal|giving up|could not|invalid)([^[:alpha:]]|$)/ { print }
+  ' "${file}" | tail -n "${lines}" || true)"
+  if [[ -n "${output}" ]]; then
+    printf '%s\n' "${output}"
+  else
+    printf 'None.\n'
+  fi
+}
+
+enable_compact_install_ui() {
+  local mode="${1:-append}"
+  [[ -t 1 && "${TERM:-}" != "dumb" ]] || return 0
+  have_tty || return 0
+  install -d -m 0755 "$(dirname "${RESUME_INSTALL_LOG}")"
+  if [[ "${mode}" == "reset" ]]; then
+    : >"${RESUME_INSTALL_LOG}"
+  else
+    touch "${RESUME_INSTALL_LOG}"
+  fi
+  chmod 0600 "${RESUME_INSTALL_LOG}" || true
+  COMPACT_INSTALL_UI=1
+  printf '\033[2J\033[H' >/dev/tty
+  exec >>"${RESUME_INSTALL_LOG}" 2>&1
+}
+
 on_error() {
   local line="$1"
   warn "Installation failed near line ${line}. Check the messages above."
+  if [[ "${COMPACT_INSTALL_UI}" == "1" ]] && have_tty; then
+    important_log_tail "${RESUME_INSTALL_LOG}" 12 >/dev/tty
+  fi
 }
 trap 'on_error "$LINENO"' ERR
 
@@ -765,6 +817,25 @@ render_bar() {
   fi
 }
 
+important_log_tail() {
+  local lines="${1:-22}" output
+  if [[ ! -r "${log_file}" ]]; then
+    echo "No warnings or errors yet."
+    return 0
+  fi
+  output="$(awk '
+    BEGIN { IGNORECASE=1 }
+    /\[vpn-stack\] (WARNING|ERROR):/ ||
+    /resume install (failed|succeeded)/ ||
+    /(^|[^[:alpha:]])(error|failed|failure|fatal|giving up|could not|invalid)([^[:alpha:]]|$)/ { print }
+  ' "${log_file}" | tail -n "${lines}" || true)"
+  if [[ -n "${output}" ]]; then
+    printf '%s\n' "${output}"
+  else
+    echo "None."
+  fi
+}
+
 render_watch_content() {
   local lines="${1:-22}"
   echo "Golden VPN installer watch"
@@ -775,12 +846,9 @@ render_watch_content() {
   systemctl is-active "${service}" 2>/dev/null || true
   printf 'Timer: '
   systemctl is-active "${timer}" 2>/dev/null || true
-  printf 'Log: %s\n\n' "${log_file}"
-  if [[ -r "${log_file}" ]]; then
-    tail -n "${lines}" "${log_file}" || true
-  else
-    echo "Waiting for log file..."
-  fi
+  printf 'Full log: %s\n\n' "${log_file}"
+  echo "Important messages:"
+  important_log_tail "${lines}"
 }
 
 render_watch_screen() {
@@ -6582,6 +6650,8 @@ bootstrap_install() {
   export VPN_STACK_IGNORE_SAVED_ENV=1
   require_root_and_env
   prompt_advanced_tuning
+  install_resume_status_helper
+  enable_compact_install_ui reset
 
   progress "Installing bootstrap packages"
   install_bootstrap_packages
@@ -7667,6 +7737,7 @@ main() {
   local storage_required_mb
   progress "Checking input variables and kernel readiness"
   require_root_and_env
+  enable_compact_install_ui append
   storage_required_mb="$(install_required_free_mb)"
   if ((storage_required_mb < INSTALL_MIN_FREE_MB)); then
     log "Installed base package stage detected; using ${storage_required_mb} MB retry reserve instead of the clean-install ${INSTALL_MIN_FREE_MB} MB reserve."
