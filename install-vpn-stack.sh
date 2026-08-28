@@ -1295,6 +1295,13 @@ install_acme_certificate() {
     rm -f "${acme_installer}"
   fi
 
+  if [[ -s "${CERT_DIR}/fullchain.pem" && -s "${CERT_DIR}/privkey.pem" ]] \
+    && openssl x509 -checkend 2592000 -noout -in "${CERT_DIR}/fullchain.pem" >/dev/null 2>&1 \
+    && openssl pkey -check -noout -in "${CERT_DIR}/privkey.pem" >/dev/null 2>&1; then
+    log "Existing certificate is valid for at least 30 days."
+    return
+  fi
+
   export CF_Token
   if [[ -z "${CF_Zone_ID:-}" && -z "${CF_Account_ID:-}" ]]; then
     CF_Zone_ID="$(cloudflare_zone_from_domain "${DOMAIN}" || true)"
@@ -1317,14 +1324,19 @@ install_acme_certificate() {
     "${acme[@]}" --register-account -m "${EMAIL}" --server letsencrypt || true
   fi
 
-  if [[ -s "${CERT_DIR}/fullchain.pem" && -s "${CERT_DIR}/privkey.pem" ]] \
-    && openssl x509 -checkend 2592000 -noout -in "${CERT_DIR}/fullchain.pem" >/dev/null 2>&1 \
-    && openssl pkey -check -noout -in "${CERT_DIR}/privkey.pem" >/dev/null 2>&1; then
-    log "Existing certificate is valid for at least 30 days."
-    return
-  fi
+  if ! "${acme[@]}" --issue --dns dns_cf -d "${DOMAIN}" --keylength ec-256 --server "${acme_server}"; then
+    if [[ "${acme_server}" != "zerossl" || "${VPN_STACK_DISABLE_LE_FALLBACK:-0}" == "1" ]]; then
+      die "Certificate issuance through ${acme_server} failed."
+    fi
 
-  "${acme[@]}" --issue --dns dns_cf -d "${DOMAIN}" --keylength ec-256 --server "${acme_server}"
+    warn "ZeroSSL certificate issuance failed. Retrying with Let's Encrypt DNS-01."
+    acme_server="letsencrypt"
+    "${acme[@]}" --set-default-ca --server letsencrypt
+    "${acme[@]}" --register-account -m "${EMAIL}" --server letsencrypt \
+      || warn "Explicit Let's Encrypt account registration failed; acme.sh will retry it during issuance."
+    "${acme[@]}" --issue --dns dns_cf -d "${DOMAIN}" --keylength ec-256 --server letsencrypt \
+      || die "Certificate issuance failed through both ZeroSSL and Let's Encrypt."
+  fi
   "${acme[@]}" --install-cert -d "${DOMAIN}" --ecc \
     --fullchain-file "${CERT_DIR}/fullchain.pem" \
     --key-file "${CERT_DIR}/privkey.pem" \
