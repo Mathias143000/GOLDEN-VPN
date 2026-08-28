@@ -53,6 +53,7 @@ AWG_PROTOCOL_VERSION="3.1"
 AWG_TOOLS_SOURCE_TAG="v3.1.20260812"
 BOOTSTRAP_MIN_FREE_MB=1024
 INSTALL_MIN_FREE_MB=5120
+INSTALL_RESUME_MIN_FREE_MB=3072
 UPGRADE_MIN_FREE_MB=256
 MIN_FREE_INODE_PERCENT=5
 INSTALL_TOTAL_STEPS=25
@@ -191,6 +192,23 @@ storage_hint() {
     df -h "${path}" 2>/dev/null || true
     df -ih "${path}" 2>/dev/null || true
   } >&2
+}
+
+base_package_stage_complete() {
+  local package status
+  command -v dpkg-query >/dev/null 2>&1 || return 1
+  for package in jq nginx grafana prometheus; do
+    status="$(dpkg-query -W -f='${db:Status-Abbrev}' "${package}" 2>/dev/null || true)"
+    [[ "${status}" == ii* ]] || return 1
+  done
+}
+
+install_required_free_mb() {
+  if base_package_stage_complete; then
+    printf '%s\n' "${INSTALL_RESUME_MIN_FREE_MB}"
+  else
+    printf '%s\n' "${INSTALL_MIN_FREE_MB}"
+  fi
 }
 
 require_install_storage() {
@@ -7646,9 +7664,14 @@ upgrade_check() {
 }
 
 main() {
+  local storage_required_mb
   progress "Checking input variables and kernel readiness"
   require_root_and_env
-  require_install_storage "${INSTALL_MIN_FREE_MB}" "Full installation"
+  storage_required_mb="$(install_required_free_mb)"
+  if ((storage_required_mb < INSTALL_MIN_FREE_MB)); then
+    log "Installed base package stage detected; using ${storage_required_mb} MB retry reserve instead of the clean-install ${INSTALL_MIN_FREE_MB} MB reserve."
+  fi
+  require_install_storage "${storage_required_mb}" "Full installation"
   install_resume_status_helper
   prompt_advanced_tuning
   check_dkms_kernel_ready

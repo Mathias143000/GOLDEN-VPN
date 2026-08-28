@@ -493,7 +493,7 @@ The old daily `vpn-soft-reboot.timer` is removed and disabled. Boot healthcheck 
 
 ## Disk and log protection
 
-Preflight requires at least 5 GB free on `/` and 5% free inodes before a full install; bootstrap requires 1 GB. The full-install reserve accounts for packages, monitoring data, and creation of the 2 GB fallback swap file. The installed limits are:
+Preflight requires at least 5 GB free on `/` and 5% free inodes before a full install; bootstrap requires 1 GB. The full-install reserve accounts for packages, monitoring data, and creation of the 2 GB fallback swap file. A resumed stage2 attempt may use a 3 GB reserve only after `jq`, nginx, Grafana, and Prometheus are confirmed installed; a clean attempt never receives the reduced threshold. The installed limits are:
 
 ```text
 journald: 200 MB / 7 days, vacuumed immediately and hourly
