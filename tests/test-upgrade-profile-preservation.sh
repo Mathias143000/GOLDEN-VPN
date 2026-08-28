@@ -161,4 +161,6 @@ for forbidden in \
   fi
 done
 
+grep -Fq 'wait_for_expected_listeners 180' <<<"${upgrade_code}"
+
 printf 'upgrade profile preservation tests passed\n'

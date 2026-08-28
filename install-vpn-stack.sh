@@ -8,7 +8,7 @@ export APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND:-none}"
 
 : "${APT_LOCK_TIMEOUT:=1800}"
 
-GOLDEN_VPN_VERSION="2026.08.28-awg31"
+GOLDEN_VPN_VERSION="2026.08.29-hysteria-profiles"
 
 STACK_DIR="/opt/vpn-stack"
 KEY_DIR="/root/vpn-keys"
@@ -776,11 +776,15 @@ lock_held() {
 }
 
 service_active() {
-  command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${service}" 2>/dev/null
+  [[ -e "${service_unit}" ]] \
+    && command -v systemctl >/dev/null 2>&1 \
+    && systemctl is-active --quiet "${service}" 2>/dev/null
 }
 
 timer_active() {
-  command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${timer}" 2>/dev/null
+  [[ -e "${timer_unit}" ]] \
+    && command -v systemctl >/dev/null 2>&1 \
+    && systemctl is-active --quiet "${timer}" 2>/dev/null
 }
 
 resume_units_present() {
@@ -788,11 +792,11 @@ resume_units_present() {
 }
 
 has_state() {
-  lock_held || service_active || timer_active || resume_units_present || [[ -r "${env_file}" || -x "${installer}" ]]
+  lock_held || resume_units_present || [[ -r "${env_file}" || -x "${installer}" ]]
 }
 
 auto_watch_needed() {
-  lock_held || service_active || timer_active || resume_units_present
+  lock_held || resume_units_present || service_active || timer_active
 }
 
 render_bar() {
@@ -1009,6 +1013,10 @@ cleanup_resume_install_state() {
     [[ -e "${path}" ]] && had_state=1
   done
 
+  # Never stop the currently running resume service from inside itself. Stop
+  # only its timer/guard so systemd cannot retain a ghost active timer after
+  # their unit files are removed.
+  systemctl stop "${RESUME_INSTALL_TIMER}" "${SSH_GUARD_SERVICE}" >/dev/null 2>&1 || true
   systemctl disable "${RESUME_INSTALL_SERVICE}" "${RESUME_INSTALL_TIMER}" "${SSH_GUARD_SERVICE}" >/dev/null 2>&1 || true
   rm -f "${RESUME_INSTALL_UNIT}" "${RESUME_INSTALL_TIMER_UNIT}" "${RESUME_INSTALL_RUNNER}" "${RESUME_INSTALL_SCRIPT}" "${RESUME_INSTALL_ENV}" "${SSH_GUARD_UNIT}" "${SSH_GUARD_SCRIPT}"
   rmdir "${RESUME_INSTALL_DIR}" 2>/dev/null || true
@@ -1080,6 +1088,7 @@ set -e
 
 if [[ "\${status}" -eq 0 ]]; then
   printf '%s resume install succeeded; removing one-time unit and saved env\n' "\$(date -Is)"
+  systemctl stop "\${timer}" "\${ssh_guard_service}" >/dev/null 2>&1 || true
   systemctl disable "\${service}" "\${timer}" "\${ssh_guard_service}" >/dev/null 2>&1 || true
   rm -f "\${unit}" "\${timer_unit}" "\${env_file}" "\${installer}" "\${runner}" "\${ssh_guard_unit}" "\${ssh_guard_script}"
   rmdir "\${resume_dir}" 2>/dev/null || true
@@ -1087,6 +1096,7 @@ if [[ "\${status}" -eq 0 ]]; then
   systemctl daemon-reload >/dev/null 2>&1 || true
 else
   printf '%s resume install failed; disabling one-time unit and keeping env/log for manual retry\n' "\$(date -Is)"
+  systemctl stop "\${timer}" "\${ssh_guard_service}" >/dev/null 2>&1 || true
   systemctl disable "\${service}" "\${timer}" "\${ssh_guard_service}" >/dev/null 2>&1 || true
   rm -f "\${unit}" "\${timer_unit}" "\${runner}" "\${ssh_guard_unit}" "\${ssh_guard_script}"
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -2359,6 +2369,8 @@ ConditionPathExists=${HYSTERIA_PROFILE_DIR}/config-mimic.yaml
 [Service]
 Type=simple
 User=root
+RuntimeDirectory=mimic
+RuntimeDirectoryMode=0755
 ExecStart=${hysteria_bin} server -c ${HYSTERIA_PROFILE_DIR}/config-mimic.yaml
 Restart=on-failure
 RestartSec=3s
@@ -7390,6 +7402,8 @@ apply_upgrade_overlay() {
     systemctl enable grafana-server.service
     systemctl restart grafana-server.service
   fi
+
+  wait_for_expected_listeners 180
 }
 
 write_upgrade_report() {

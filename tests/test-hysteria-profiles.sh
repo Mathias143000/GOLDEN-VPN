@@ -57,4 +57,7 @@ grep -Fq '${label}-gecko.txt' "${helper}"
 # shellcheck disable=SC2016
 grep -Fq '${label}-mimic.yaml' "${helper}"
 
+grep -Fq 'RuntimeDirectory=mimic' "${installer}"
+grep -Fq 'RuntimeDirectoryMode=0755' "${installer}"
+
 printf 'hysteria profile tests passed\n'

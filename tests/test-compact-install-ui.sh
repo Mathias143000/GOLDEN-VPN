@@ -18,6 +18,12 @@ grep -Fq 'Important messages:' "${status_helper}"
 # shellcheck disable=SC2016
 grep -Fq 'important_log_tail "${lines}"' "${status_helper}"
 grep -Fq 'enable_compact_install_ui reset' "${installer}"
+grep -Fq '[[ -e "${service_unit}" ]]' "${status_helper}"
+grep -Fq '[[ -e "${timer_unit}" ]]' "${status_helper}"
+if grep -Fq 'lock_held || service_active || timer_active' "${status_helper}"; then
+  printf 'vpn-install-status must ignore ghost systemd state after one-shot unit removal\n' >&2
+  exit 1
+fi
 grep -Fq 'enable_compact_install_ui append' "${installer}"
 # shellcheck disable=SC2016
 grep -Fq 'exec >>"${RESUME_INSTALL_LOG}" 2>&1' "${installer}"
