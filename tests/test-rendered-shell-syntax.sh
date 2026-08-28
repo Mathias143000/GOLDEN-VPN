@@ -17,8 +17,14 @@ extract_heredoc() {
   bash -n "${output}"
 }
 
+status_helper="${tmp_dir}/vpn-install-status"
 # shellcheck disable=SC2016
-extract_heredoc 'cat >"${INSTALL_STATUS_HELPER}" <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-install-status"
+extract_heredoc 'cat >"${INSTALL_STATUS_HELPER}" <<'"'"'EOF'"'"'' "${status_helper}"
+if grep -Fq 'tput clear' "${status_helper}"; then
+  printf 'vpn-install-status must not clear the terminal during watch updates\n' >&2
+  exit 1
+fi
+grep -Fq 'WATCH_LAST_FRAME' "${status_helper}"
 extract_heredoc 'cat >/usr/local/sbin/amneziawg-ensure-module.sh <<'"'"'EOF'"'"'' "${tmp_dir}/amneziawg-ensure-module"
 # shellcheck disable=SC2016
 extract_heredoc 'cat >"${TROJAN_HELPER_PATH}" <<'"'"'EOF'"'"'' "${tmp_dir}/vpn-trojan"

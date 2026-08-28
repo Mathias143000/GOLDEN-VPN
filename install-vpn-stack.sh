@@ -673,6 +673,8 @@ env_file="/etc/golden-vpn-installer/install.env"
 installer="/root/vpn-stack-resume/install-vpn-stack.sh"
 service_unit="/etc/systemd/system/vpn-stack-resume-install.service"
 timer_unit="/etc/systemd/system/vpn-stack-resume-install.timer"
+WATCH_SCREEN_INITIALIZED=0
+WATCH_LAST_FRAME=""
 
 load_progress() {
   STEP="?"
@@ -736,13 +738,8 @@ render_bar() {
   fi
 }
 
-render_watch_screen() {
+render_watch_content() {
   local lines="${1:-22}"
-  if [[ -n "${TERM:-}" ]] && command -v tput >/dev/null 2>&1; then
-    tput clear 2>/dev/null || printf '\033[H\033[2J'
-  else
-    printf '\033[H\033[2J'
-  fi
   echo "Golden VPN installer watch"
   echo
   render_bar
@@ -757,6 +754,27 @@ render_watch_screen() {
   else
     echo "Waiting for log file..."
   fi
+}
+
+render_watch_screen() {
+  local lines="${1:-22}" frame
+  frame="$(render_watch_content "${lines}")"
+
+  # Do not repaint an unchanged screen. Clearing the terminal every second
+  # causes visible flashes in SSH clients, especially on slower links.
+  if [[ "${frame}" == "${WATCH_LAST_FRAME}" ]]; then
+    return 0
+  fi
+
+  if ((WATCH_SCREEN_INITIALIZED == 0)); then
+    printf '\033[2J\033[H'
+    WATCH_SCREEN_INITIALIZED=1
+  else
+    printf '\033[H'
+  fi
+  printf '%s\n' "${frame}"
+  printf '\033[J'
+  WATCH_LAST_FRAME="${frame}"
 }
 
 show_status() {
