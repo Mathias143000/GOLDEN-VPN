@@ -184,6 +184,15 @@ root_free_inode_percent() {
   df -Pi / | awk 'NR == 2 {gsub(/%/, "", $5); print 100 - $5}'
 }
 
+storage_hint() {
+  local path="$1"
+  {
+    echo "Storage diagnostics for ${path}:"
+    df -h "${path}" 2>/dev/null || true
+    df -ih "${path}" 2>/dev/null || true
+  } >&2
+}
+
 require_install_storage() {
   local required_mb="$1" stage="$2" free_mb free_inode_percent
   free_mb="$(root_free_mb)"
