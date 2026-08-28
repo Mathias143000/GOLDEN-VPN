@@ -28,6 +28,8 @@ printf 'test.example.com\n' >"${stack_dir}/domain.txt"
 printf '[Interface]\nPrivateKey = awg-secret\n' >"${key_root}/awg/AWG-NL-alpha.conf"
 printf 'trojan://trojan-secret@example.invalid#alpha\n' >"${key_root}/trojan/TROJAN-NL-alpha.txt"
 printf 'hysteria2://hysteria-secret@example.invalid#alpha\n' >"${key_root}/hysteria/HYSTERIA-NL-alpha.txt"
+printf 'server: "example.invalid:23456"\nauth: "alpha:hysteria-secret"\nmimic:\n  enabled: true\n' \
+  >"${key_root}/hysteria/HYSTERIA-NL-alpha-mimic.yaml"
 
 export VPN_BOT_EXPORT_ALLOW_NON_ROOT=1
 export VPN_BOT_STACK_DIR="${stack_dir}"
@@ -39,12 +41,12 @@ python3 - "${inventory}" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
 assert con.execute("select format_version from export_meta").fetchone()[0] == "golden-vpn.typed-keys.v1"
-assert con.execute("select count(*) from typed_keys").fetchone()[0] == 3
+assert con.execute("select count(*) from typed_keys").fetchone()[0] == 4
 assert dict(con.execute("select key_type, count(*) from typed_keys group by key_type")) == {
-    "awg": 1, "hysteria": 1, "trojan": 1
+    "awg": 1, "hysteria": 2, "trojan": 1
 }
-assert con.execute("select count(*) from typed_keys where plan_code='plan_30'").fetchone()[0] == 3
-assert con.execute("select count(*) from typed_keys where key_status='issued'").fetchone()[0] == 3
+assert con.execute("select count(*) from typed_keys where plan_code='plan_30'").fetchone()[0] == 4
+assert con.execute("select count(*) from typed_keys where key_status='issued'").fetchone()[0] == 4
 PY
 [[ "$(stat -c '%a' "${inventory}")" == "600" ]]
 

@@ -29,6 +29,9 @@ grep -Fq -- '--allow-downgrades' "${tmp_dir}/awg-update"
 grep -Fq 'releases/latest' "${tmp_dir}/core-update"
 grep -Fq 'run -test -config' "${tmp_dir}/core-update"
 grep -Fq 'restoring previous Xray and Hysteria binaries' "${tmp_dir}/core-update"
+grep -Fq 'hysteria2-gecko.service' "${tmp_dir}/core-update"
+grep -Fq 'hysteria2-mimic.service' "${tmp_dir}/core-update"
+grep -Fq 'hysteria-gecko-port.txt' "${tmp_dir}/core-update"
 if grep -Fq -- '--beta' "${tmp_dir}/core-update"; then exit 1; fi
 if grep -Fq 'systemctl reboot' "${tmp_dir}/awg-update" "${tmp_dir}/core-update"; then exit 1; fi
 

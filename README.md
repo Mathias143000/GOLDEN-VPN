@@ -5,7 +5,7 @@ Golden install script for a fresh Ubuntu/Debian VPS.
 It deploys:
 
 - primary: AmneziaWG 3.1 on `51820/udp`
-- backup №2: Hysteria2 Salamander on `8443/udp`
+- backup №2: Hysteria2 Salamander on `8443/udp`, plus Gecko and optional Linux-only Mimic profiles on persistent random per-server ports
 - TCP/TLS fallback: Trojan XHTTP TLS in `auto` mode on `443/tcp` behind nginx and the domain certificate
 - randomized static decoy HTTPS site on `https://DOMAIN/`
 - Grafana, Prometheus, and Node Exporter on localhost only
@@ -229,7 +229,20 @@ Create clients:
 ```bash
 vpn-trojan phone1
 vpn-hysteria phone1
+vpn-hysteria phone1 salamander
+vpn-hysteria phone1 gecko
+vpn-hysteria phone1 mimic
 vpn-awg phone1
+```
+
+`salamander` is the default when the second argument is omitted. Gecko uses a separate persistent random UDP port in `20000..59999`. Mimic uses another persistent random port and is exposed as fake TCP, but it is available only when the server supports the official Mimic packages, Linux kernel 6.1+, eBPF, and the Mimic module. Mimic client files are Linux-only YAML configs; Hiddify Android cannot import them.
+
+Running a second profile command for an existing Hysteria name reuses the existing username/password. It does not rotate or remove the original Salamander URI. Saved files are:
+
+```text
+/root/vpn-keys/hysteria/HYSTERIA-<LOCATION>-<name>.txt
+/root/vpn-keys/hysteria/HYSTERIA-<LOCATION>-<name>-gecko.txt
+/root/vpn-keys/hysteria/HYSTERIA-<LOCATION>-<name>-mimic.yaml
 ```
 
 Create one Hiddify-style static subscription bundle:
@@ -485,7 +498,9 @@ journalctl -u vpn-awg-auto-update.service --no-pager
 journalctl -u vpn-core-auto-update.service --no-pager
 ```
 
-`vpn-awg-auto-update` updates only official Amnezia PPA packages after saving exact rollback packages and current AWG profiles. It reloads and validates AWG 3.1, and restores the prior packages if activation fails. `vpn-core-auto-update` uses the official stable-channel installers for Xray and Hysteria, saves both binaries first, tests the Xray config, restarts only their custom Golden services, checks the Unix socket and UDP listener, and restores the prior binaries on failure. Each updater retains the five newest successful backup directories. Pre-release Xray builds and incompatible AWG major upgrades are not installed automatically.
+`vpn-awg-auto-update` updates only official Amnezia PPA packages after saving exact rollback packages and current AWG profiles. It reloads and validates AWG 3.1, and restores the prior packages if activation fails. `vpn-core-auto-update` uses the official stable-channel installers for Xray and Hysteria, saves both binaries first, tests the Xray config, restarts every installed Golden Hysteria profile service, checks the Unix socket and all configured UDP listeners, and restores the prior binaries on failure. Each updater retains the five newest successful backup directories. Pre-release Xray builds and incompatible AWG major upgrades are not installed automatically. Mimic packages are installed or refreshed only during an explicit Golden install/upgrade because a kernel-module update is not safe to apply unattended.
+
+`upgrade` keeps the existing Hysteria user registry, Salamander config, credentials, and previously issued client files byte-for-byte unchanged. It adds Gecko/Mimic state outside the protected legacy Hysteria directory, validates the new listeners, and restores the previous Hysteria binary and prior profile state if profile activation fails.
 
 The Trojan XHTTP profile uses `mode=auto`, real domain TLS, nginx HTTP/2, the secret XHTTP path, and the Xray Unix socket. Client links do not force a `fp` value; the client may use its own supported TLS implementation. No extra Xray mux or speculative manual `extra` tuning is enabled. The decoy is a multi-page static HTTPS site with local CSS and no external assets, forms, analytics or scripts.
 

@@ -14,6 +14,7 @@ STACK_DIR="/opt/vpn-stack"
 KEY_DIR="/root/vpn-keys"
 XRAY_DIR="${STACK_DIR}/xray"
 HYSTERIA_DIR="${STACK_DIR}/hysteria"
+HYSTERIA_PROFILE_DIR="${STACK_DIR}/hysteria-profiles"
 LOG_DIR="/var/log/vpn-stack"
 CERT_DIR="/etc/letsencrypt/live/${DOMAIN:-}"
 SUBSCRIPTION_DIR="${STACK_DIR}/subscriptions"
@@ -51,6 +52,9 @@ AWG_CONFIG="/etc/amnezia/amneziawg/awg0.conf"
 AWG_DEFAULT_PORT=51820
 AWG_PROTOCOL_VERSION="3.1"
 AWG_TOOLS_SOURCE_TAG="v3.1.20260812"
+HYSTERIA_SALAMANDER_PORT=8443
+HYSTERIA_PORT_MIN=20000
+HYSTERIA_PORT_MAX=59999
 BOOTSTRAP_MIN_FREE_MB=1024
 INSTALL_MIN_FREE_MB=5120
 INSTALL_RESUME_MIN_FREE_MB=3072
@@ -1435,7 +1439,7 @@ install_acme_certificate() {
   "${acme[@]}" --install-cert -d "${DOMAIN}" --ecc \
     --fullchain-file "${CERT_DIR}/fullchain.pem" \
     --key-file "${CERT_DIR}/privkey.pem" \
-    --reloadcmd "systemctl reload nginx >/dev/null 2>&1 || true; systemctl restart hysteria2 >/dev/null 2>&1 || true; /usr/local/bin/vpn-cert-notify renewed >/dev/null 2>&1 || true"
+    --reloadcmd "systemctl reload nginx >/dev/null 2>&1 || true; systemctl restart hysteria2 hysteria2-gecko hysteria2-mimic >/dev/null 2>&1 || true; /usr/local/bin/vpn-cert-notify renewed >/dev/null 2>&1 || true"
 
   openssl x509 -noout -subject -issuer -dates -in "${CERT_DIR}/fullchain.pem"
   openssl pkey -check -noout -in "${CERT_DIR}/privkey.pem"
@@ -2189,26 +2193,185 @@ install_hysteria() {
   need_command hysteria
 }
 
-hysteria_render_config() {
-  local clients_json="${STACK_DIR}/hysteria-clients.json"
-  local obfs
-  obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
+random_free_hysteria_port() {
+  local candidate attempt
+  for attempt in $(seq 1 200); do
+    candidate="$(shuf -i "${HYSTERIA_PORT_MIN}-${HYSTERIA_PORT_MAX}" -n 1)"
+    [[ "${candidate}" != "${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}" ]] || continue
+    if ! ss -H -lntup 2>/dev/null | awk -v port=":${candidate}" '$5 ~ (port "$") {found=1} END {exit found ? 0 : 1}'; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  die "Could not select a free Hysteria profile port."
+}
 
+ensure_hysteria_profile_state() {
+  local file port other
+  install -d -m 0700 "${HYSTERIA_DIR}" "${HYSTERIA_PROFILE_DIR}"
+  for file in hysteria-obfs-gecko.txt hysteria-obfs-mimic.txt; do
+    [[ -s "${STACK_DIR}/${file}" ]] || rand_hex 24 >"${STACK_DIR}/${file}"
+    chmod 0600 "${STACK_DIR}/${file}"
+  done
+  for file in hysteria-gecko-port.txt hysteria-mimic-port.txt; do
+    if [[ -s "${STACK_DIR}/${file}" ]]; then
+      port="$(<"${STACK_DIR}/${file}")"
+      if [[ ! "${port}" =~ ^[0-9]+$ ]] || ((port < 1024 || port > 65535)); then
+        die "Invalid saved Hysteria port in ${STACK_DIR}/${file}."
+      fi
+      continue
+    fi
+    port="$(random_free_hysteria_port)"
+    if [[ "${file}" == "hysteria-mimic-port.txt" ]]; then
+      other="$(cat "${STACK_DIR}/hysteria-gecko-port.txt" 2>/dev/null || true)"
+      while [[ "${port}" == "${other}" ]]; do port="$(random_free_hysteria_port)"; done
+    fi
+    printf '%s\n' "${port}" >"${STACK_DIR}/${file}"
+    chmod 0600 "${STACK_DIR}/${file}"
+  done
+}
+
+hysteria_render_profile_config() {
+  local profile="$1" output="$2" port obfs obfs_type
+  case "${profile}" in
+    salamander)
+      port="${HYSTERIA_SALAMANDER_PORT}"
+      obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
+      ;;
+    gecko)
+      port="$(<"${STACK_DIR}/hysteria-gecko-port.txt")"
+      obfs="$(<"${STACK_DIR}/hysteria-obfs-gecko.txt")"
+      ;;
+    mimic)
+      port="$(<"${STACK_DIR}/hysteria-mimic-port.txt")"
+      obfs="$(<"${STACK_DIR}/hysteria-obfs-mimic.txt")"
+      ;;
+    *) die "Unknown Hysteria profile: ${profile}" ;;
+  esac
+  [[ "${profile}" == gecko ]] && obfs_type=gecko || obfs_type=salamander
   {
-    printf 'listen: :8443\n'
-    printf 'tls:\n'
-    printf '  cert: %s/fullchain.pem\n' "${CERT_DIR}"
-    printf '  key: %s/privkey.pem\n' "${CERT_DIR}"
-    printf 'auth:\n'
-    printf '  type: userpass\n'
-    printf '  userpass:\n'
-    jq -r 'to_entries[] | "    \(.key): \(.value)"' "${clients_json}"
-    printf 'obfs:\n'
-    printf '  type: salamander\n'
-    printf '  salamander:\n'
-    printf '    password: %s\n' "${obfs}"
-  } >"${HYSTERIA_DIR}/config.yaml"
-  chmod 0600 "${HYSTERIA_DIR}/config.yaml"
+    printf 'listen: :%s\n' "${port}"
+    printf 'tls:\n  cert: %s/fullchain.pem\n  key: %s/privkey.pem\n' "${CERT_DIR}" "${CERT_DIR}"
+    printf 'auth:\n  type: userpass\n  userpass:\n'
+    jq -r 'to_entries[] | "    \(.key): \(.value)"' "${STACK_DIR}/hysteria-clients.json"
+    printf 'obfs:\n  type: %s\n  %s:\n    password: %s\n' \
+      "${obfs_type}" "${obfs_type}" "${obfs}"
+    if [[ "${profile}" == gecko ]]; then
+      printf '    minPacketSize: 512\n    maxPacketSize: 1200\n'
+    elif [[ "${profile}" == mimic ]]; then
+      printf 'mimic:\n  enabled: true\n  xdpMode: skb\n'
+    fi
+  } >"${output}"
+  chmod 0600 "${output}"
+}
+
+install_mimic_optional() {
+  local codename arch kernel api cli_name cli_url cli_sha_url dkms_name dkms_url dkms_sha_url tmp
+  printf '0\n' >"${STACK_DIR}/hysteria-mimic-available.txt"
+  chmod 0600 "${STACK_DIR}/hysteria-mimic-available.txt"
+
+  if command -v mimic >/dev/null 2>&1 && modprobe mimic; then
+    printf '1\n' >"${STACK_DIR}/hysteria-mimic-available.txt"
+    return 0
+  fi
+
+  kernel="$(uname -r | sed 's/-.*//')"
+  if [[ "$(printf '%s\n%s\n' 6.1 "${kernel}" | sort -V | head -n1)" != "6.1" ]]; then
+    warn "Mimic requires Linux kernel 6.1 or newer; profile creation will remain unavailable."
+    return 0
+  fi
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  codename="${VERSION_CODENAME:-}"
+  arch="$(dpkg --print-architecture)"
+  case "${codename}:${arch}" in
+    noble:amd64|bookworm:amd64|trixie:amd64) ;;
+    *)
+      warn "Mimic has no supported prebuilt package for ${codename:-unknown}/${arch}; profile creation will remain unavailable."
+      return 0
+      ;;
+  esac
+
+  api="$(curl -fsSL -H 'Accept: application/vnd.github+json' -H 'User-Agent: Golden-VPN-installer' \
+    https://api.github.com/repos/hack3ric/mimic/releases/latest)"
+  cli_name="$(jq -r --arg prefix "${codename}_mimic_" --arg suffix "_${arch}.deb" \
+    '[.assets[] | select(.name|startswith($prefix)) | select(.name|endswith($suffix)) |
+      select((.name|contains("dkms"))|not) | select((.name|contains("dbgsym"))|not)][0].name // empty' <<<"${api}")"
+  dkms_name="$(jq -r --arg prefix "${codename}_mimic-dkms_" --arg suffix "_${arch}.deb" \
+    '[.assets[] | select(.name|startswith($prefix)) | select(.name|endswith($suffix)) |
+      select((.name|contains("dbgsym"))|not)][0].name // empty' <<<"${api}")"
+  [[ -n "${cli_name}" && -n "${dkms_name}" ]] || { warn "Could not locate official Mimic packages."; return 0; }
+  cli_url="$(jq -r --arg name "${cli_name}" '.assets[] | select(.name==$name) | .browser_download_url' <<<"${api}")"
+  cli_sha_url="$(jq -r --arg name "${cli_name}.sha256" '.assets[] | select(.name==$name) | .browser_download_url' <<<"${api}")"
+  dkms_url="$(jq -r --arg name "${dkms_name}" '.assets[] | select(.name==$name) | .browser_download_url' <<<"${api}")"
+  dkms_sha_url="$(jq -r --arg name "${dkms_name}.sha256" '.assets[] | select(.name==$name) | .browser_download_url' <<<"${api}")"
+  [[ -n "${cli_url}" && -n "${cli_sha_url}" && -n "${dkms_url}" && -n "${dkms_sha_url}" ]] \
+    || { warn "Official Mimic checksum assets are incomplete."; return 0; }
+
+  tmp="$(mktemp -d)"
+  if ! curl -fsSL "${cli_url}" -o "${tmp}/${cli_name}" \
+    || ! curl -fsSL "${cli_sha_url}" -o "${tmp}/${cli_name}.sha256" \
+    || ! curl -fsSL "${dkms_url}" -o "${tmp}/${dkms_name}" \
+    || ! curl -fsSL "${dkms_sha_url}" -o "${tmp}/${dkms_name}.sha256" \
+    || ! (cd "${tmp}" && sha256sum -c "${cli_name}.sha256" "${dkms_name}.sha256") \
+    || ! apt_get install -y "${tmp}/${cli_name}" "${tmp}/${dkms_name}"; then
+    warn "Mimic package installation or checksum verification failed; other VPN contours remain available."
+    rm -rf "${tmp}"
+    return 0
+  fi
+  rm -rf "${tmp}"
+  if command -v mimic >/dev/null 2>&1 && modprobe mimic; then
+    printf '1\n' >"${STACK_DIR}/hysteria-mimic-available.txt"
+  else
+    warn "Mimic binary/module activation failed; Mimic listener will remain disabled."
+  fi
+}
+
+write_hysteria_additional_units() {
+  local hysteria_bin
+  hysteria_bin="$(command -v hysteria)"
+  cat >/etc/systemd/system/hysteria2-gecko.service <<EOF
+[Unit]
+Description=Hysteria2 Gecko server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${hysteria_bin} server -c ${HYSTERIA_PROFILE_DIR}/config-gecko.yaml
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 /etc/systemd/system/hysteria2-gecko.service
+
+  cat >/etc/systemd/system/hysteria2-mimic.service <<EOF
+[Unit]
+Description=Hysteria2 Mimic server
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=${HYSTERIA_PROFILE_DIR}/config-mimic.yaml
+
+[Service]
+Type=simple
+User=root
+ExecStart=${hysteria_bin} server -c ${HYSTERIA_PROFILE_DIR}/config-mimic.yaml
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 /etc/systemd/system/hysteria2-mimic.service
+}
+
+hysteria_render_config() {
+  hysteria_render_profile_config salamander "${HYSTERIA_DIR}/config.yaml"
 }
 
 write_hysteria_link() {
@@ -2227,7 +2390,7 @@ write_hysteria_link() {
 }
 
 configure_hysteria() {
-  log "Configuring Hysteria2 Salamander."
+  log "Configuring Hysteria2 Salamander, Gecko, and optional Mimic listeners."
   install -d -m 0700 "${HYSTERIA_DIR}" "${KEY_DIR}/hysteria"
   local password obfs
   password="$(rand_hex 18)"
@@ -2237,7 +2400,12 @@ configure_hysteria() {
   jq -n --arg password "${password}" '{"main-hysteria-client": $password}' >"${STACK_DIR}/hysteria-clients.json"
   chmod 0600 "${STACK_DIR}/hysteria-auth.txt" "${STACK_DIR}/hysteria-obfs.txt" "${STACK_DIR}/hysteria-clients.json"
 
+  ensure_hysteria_profile_state
   hysteria_render_config
+  hysteria_render_profile_config gecko "${HYSTERIA_PROFILE_DIR}/config-gecko.yaml"
+  if [[ "$(<"${STACK_DIR}/hysteria-mimic-available.txt")" == "1" ]]; then
+    hysteria_render_profile_config mimic "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml"
+  fi
   write_hysteria_link "main-hysteria-client" "${password}" >/dev/null
 
   cat >/etc/systemd/system/hysteria2.service <<EOF
@@ -2258,6 +2426,8 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
   chmod 0644 /etc/systemd/system/hysteria2.service
+
+  write_hysteria_additional_units
 }
 
 install_amneziawg() {
@@ -2931,7 +3101,7 @@ swap_report_label() {
 }
 
 configure_firewall() {
-  local awg_port="${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}"
+  local awg_port="${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}" gecko_port mimic_port
   if [[ -f "${STACK_DIR}/awg-params.env" ]]; then
     # shellcheck disable=SC1091
     source "${STACK_DIR}/awg-params.env"
@@ -2943,6 +3113,16 @@ configure_firewall() {
   ensure_ssh_firewall_access
   ufw allow 443/tcp
   ufw allow 8443/udp
+  if [[ -s "${STACK_DIR}/hysteria-gecko-port.txt" ]]; then
+    gecko_port="$(<"${STACK_DIR}/hysteria-gecko-port.txt")"
+    ufw allow "${gecko_port}/udp"
+  fi
+  if [[ "$(cat "${STACK_DIR}/hysteria-mimic-available.txt" 2>/dev/null || printf 0)" == 1 ]] \
+    && [[ -s "${STACK_DIR}/hysteria-mimic-port.txt" ]]; then
+    mimic_port="$(<"${STACK_DIR}/hysteria-mimic-port.txt")"
+    ufw allow "${mimic_port}/udp"
+    ufw allow "${mimic_port}/tcp"
+  fi
   ufw allow "${awg_port}/udp"
   ufw --force enable
 }
@@ -3062,9 +3242,13 @@ set -Eeuo pipefail
 
 STACK_DIR="/opt/vpn-stack"
 CONFIG="/opt/vpn-stack/hysteria/config.yaml"
+GECKO_CONFIG="/opt/vpn-stack/hysteria-profiles/config-gecko.yaml"
+MIMIC_CONFIG="/opt/vpn-stack/hysteria-profiles/config-mimic.yaml"
 CLIENTS="/opt/vpn-stack/hysteria-clients.json"
 KEY_DIR="/root/vpn-keys/hysteria"
 SERVICE="hysteria2.service"
+GECKO_SERVICE="hysteria2-gecko.service"
+MIMIC_SERVICE="hysteria2-mimic.service"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 uri_encode() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
@@ -3072,8 +3256,12 @@ rand_hex() { openssl rand -hex "$1"; }
 usage() {
   cat <<'USAGE'
 Usage:
-  vpn-hysteria <name>    Create a Hysteria2 client
-  vpn-hysteria help      Show this help
+  vpn-hysteria <name> [salamander]  Create/show the default Hysteria2 URI
+  vpn-hysteria <name> gecko         Create/show a Gecko Hysteria2 URI
+  vpn-hysteria <name> mimic         Create/show a Linux-only Mimic YAML
+  vpn-hysteria help                 Show this help
+
+Existing names keep their current username/password when another profile is issued.
 USAGE
 }
 print_qr() {
@@ -3109,11 +3297,28 @@ label_name() {
   fi
 }
 
-render_config() {
-  local obfs
-  obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
+render_profile_config() {
+  local profile="$1" output="$2" port obfs obfs_type
+  case "${profile}" in
+    salamander)
+      port=8443
+      obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
+      obfs_type=salamander
+      ;;
+    gecko)
+      port="$(<"${STACK_DIR}/hysteria-gecko-port.txt")"
+      obfs="$(<"${STACK_DIR}/hysteria-obfs-gecko.txt")"
+      obfs_type=gecko
+      ;;
+    mimic)
+      port="$(<"${STACK_DIR}/hysteria-mimic-port.txt")"
+      obfs="$(<"${STACK_DIR}/hysteria-obfs-mimic.txt")"
+      obfs_type=salamander
+      ;;
+    *) die "Unknown profile: ${profile}" ;;
+  esac
   {
-    printf 'listen: :8443\n'
+    printf 'listen: :%s\n' "${port}"
     printf 'tls:\n'
     printf '  cert: /etc/letsencrypt/live/%s/fullchain.pem\n' "$(<"${STACK_DIR}/domain.txt")"
     printf '  key: /etc/letsencrypt/live/%s/privkey.pem\n' "$(<"${STACK_DIR}/domain.txt")"
@@ -3122,11 +3327,32 @@ render_config() {
     printf '  userpass:\n'
     jq -r 'to_entries[] | "    \(.key): \(.value)"' "${CLIENTS}"
     printf 'obfs:\n'
-    printf '  type: salamander\n'
-    printf '  salamander:\n'
+    printf '  type: %s\n' "${obfs_type}"
+    printf '  %s:\n' "${obfs_type}"
     printf '    password: %s\n' "${obfs}"
-  } >"${CONFIG}"
-  chmod 0600 "${CONFIG}"
+    if [[ "${profile}" == gecko ]]; then
+      printf '    minPacketSize: 512\n    maxPacketSize: 1200\n'
+    elif [[ "${profile}" == mimic ]]; then
+      printf 'mimic:\n  enabled: true\n  xdpMode: skb\n'
+    fi
+  } >"${output}"
+  chmod 0600 "${output}"
+}
+
+render_configs() {
+  render_profile_config salamander "${CONFIG}"
+  render_profile_config gecko "${GECKO_CONFIG}"
+  if [[ "$(cat "${STACK_DIR}/hysteria-mimic-available.txt" 2>/dev/null || printf 0)" == 1 ]]; then
+    render_profile_config mimic "${MIMIC_CONFIG}"
+  fi
+}
+
+restart_profiles() {
+  systemctl restart "${SERVICE}"
+  systemctl restart "${GECKO_SERVICE}"
+  if [[ -f "${MIMIC_CONFIG}" ]]; then
+    systemctl restart "${MIMIC_SERVICE}"
+  fi
 }
 
 [[ "${EUID}" -eq 0 ]] || die "Run as root."
@@ -3136,38 +3362,87 @@ case "${1:-}" in
     exit 0
     ;;
 esac
-[[ $# -eq 1 ]] || die "Usage: vpn-hysteria <name>"
+[[ $# -ge 1 && $# -le 2 ]] || die "Usage: vpn-hysteria <name> [salamander|gecko|mimic]"
 name="$1"
+profile="${2:-salamander}"
+[[ "${profile}" == salamander || "${profile}" == gecko || "${profile}" == mimic ]] \
+  || die "Profile must be salamander, gecko, or mimic."
 [[ "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || die "Use only letters, digits, dot, underscore, dash."
 [[ -f "${CLIENTS}" ]] || die "Missing ${CLIENTS}"
 label="$(label_name "HYSTERIA" "${name}")"
 
 if jq -e --arg name "${name}" 'has($name)' "${CLIENTS}" >/dev/null; then
-  die "Client already exists: ${name}"
+  password="$(jq -r --arg name "${name}" '.[$name]' "${CLIENTS}")"
+else
+  password="$(rand_hex 18)"
+  tmp="$(mktemp)"
+  backup="$(mktemp)"
+  cp "${CLIENTS}" "${backup}"
+  jq --arg name "${name}" --arg password "${password}" '.[$name] = $password' "${CLIENTS}" >"${tmp}"
+  install -m 0600 "${tmp}" "${CLIENTS}"
+  rm -f "${tmp}"
+  if ! render_configs || ! restart_profiles; then
+    install -m 0600 "${backup}" "${CLIENTS}"
+    render_configs || true
+    restart_profiles || true
+    rm -f "${backup}"
+    die "Could not activate Hysteria user; registry was restored."
+  fi
+  rm -f "${backup}"
 fi
-if [[ -f "${KEY_DIR}/${label}.txt" ]]; then
-  die "Client key file already exists: ${KEY_DIR}/${label}.txt"
-fi
-
-password="$(rand_hex 18)"
-tmp="$(mktemp)"
-jq --arg name "${name}" --arg password "${password}" '.[$name] = $password' "${CLIENTS}" >"${tmp}"
-install -m 0600 "${tmp}" "${CLIENTS}"
-rm -f "${tmp}"
-render_config
-systemctl restart "${SERVICE}"
 
 domain="$(<"${STACK_DIR}/domain.txt")"
-obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
-tag="$(uri_encode "${label}")"
-link="hysteria2://${name}:${password}@${domain}:8443?obfs=salamander&obfs-password=${obfs}&sni=${domain}#${tag}"
 install -d -m 0700 "${KEY_DIR}"
-printf '%s\n' "${link}" >"${KEY_DIR}/${label}.txt"
-chmod 0600 "${KEY_DIR}/${label}.txt"
-printf 'Client: %s\n' "${label}"
-print_qr "${link}"
-printf 'Link:\n%s\n' "${link}"
-printf 'Saved: %s\n' "${KEY_DIR}/${label}.txt"
+case "${profile}" in
+  salamander)
+    obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
+    tag="$(uri_encode "${label}")"
+    link="hysteria2://${name}:${password}@${domain}:8443?obfs=salamander&obfs-password=${obfs}&sni=${domain}#${tag}"
+    out="${KEY_DIR}/${label}.txt"
+    printf '%s\n' "${link}" >"${out}"
+    chmod 0600 "${out}"
+    print_qr "${link}"
+    printf 'Link:\n%s\n' "${link}"
+    ;;
+  gecko)
+    obfs="$(<"${STACK_DIR}/hysteria-obfs-gecko.txt")"
+    port="$(<"${STACK_DIR}/hysteria-gecko-port.txt")"
+    tag="$(uri_encode "${label}-GECKO")"
+    link="hysteria2://${name}:${password}@${domain}:${port}?obfs=gecko&obfs-password=${obfs}&sni=${domain}#${tag}"
+    out="${KEY_DIR}/${label}-gecko.txt"
+    printf '%s\n' "${link}" >"${out}"
+    chmod 0600 "${out}"
+    print_qr "${link}"
+    printf 'Link:\n%s\n' "${link}"
+    ;;
+  mimic)
+    [[ "$(cat "${STACK_DIR}/hysteria-mimic-available.txt" 2>/dev/null || printf 0)" == 1 ]] \
+      || die "Mimic is unavailable on this server; it requires supported Linux packages, kernel >= 6.1, and eBPF."
+    obfs="$(<"${STACK_DIR}/hysteria-obfs-mimic.txt")"
+    port="$(<"${STACK_DIR}/hysteria-mimic-port.txt")"
+    out="${KEY_DIR}/${label}-mimic.yaml"
+    cat >"${out}" <<EOF_MIMIC
+server: "${domain}:${port}"
+auth: "${name}:${password}"
+tls:
+  sni: ${domain}
+obfs:
+  type: salamander
+  salamander:
+    password: ${obfs}
+mimic:
+  enabled: true
+socks5:
+  listen: 127.0.0.1:1080
+EOF_MIMIC
+    chmod 0600 "${out}"
+    printf 'Linux Hysteria2 client config:\n'
+    cat "${out}"
+    printf '\nMimic must be installed on the Linux client and Hysteria must run as root.\n'
+    ;;
+esac
+printf 'Client: %s (%s)\n' "${label}" "${profile}"
+printf 'Saved: %s\n' "${out}"
 EOF
   chmod 0755 /usr/local/bin/vpn-hysteria
 }
@@ -3865,7 +4140,7 @@ publish_permissions() {
 }
 
 render_hysteria_config() {
-  local obfs
+  local obfs profile port output obfs_type
   obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
   {
     printf 'listen: :8443\n'
@@ -3882,6 +4157,34 @@ render_hysteria_config() {
     printf '    password: %s\n' "${obfs}"
   } >"${HYSTERIA_CONFIG}"
   chmod 0600 "${HYSTERIA_CONFIG}"
+
+  install -d -m 0700 "${STACK_DIR}/hysteria-profiles"
+  for profile in gecko mimic; do
+    [[ -s "${STACK_DIR}/hysteria-${profile}-port.txt" ]] || continue
+    [[ -s "${STACK_DIR}/hysteria-obfs-${profile}.txt" ]] || continue
+    if [[ "${profile}" == mimic ]] \
+      && [[ "$(cat "${STACK_DIR}/hysteria-mimic-available.txt" 2>/dev/null || printf 0)" != 1 ]]; then
+      continue
+    fi
+    port="$(<"${STACK_DIR}/hysteria-${profile}-port.txt")"
+    obfs="$(<"${STACK_DIR}/hysteria-obfs-${profile}.txt")"
+    output="${STACK_DIR}/hysteria-profiles/config-${profile}.yaml"
+    [[ "${profile}" == gecko ]] && obfs_type=gecko || obfs_type=salamander
+    {
+      printf 'listen: :%s\n' "${port}"
+      printf 'tls:\n  cert: /etc/letsencrypt/live/%s/fullchain.pem\n' "$(domain_name)"
+      printf '  key: /etc/letsencrypt/live/%s/privkey.pem\n' "$(domain_name)"
+      printf 'auth:\n  type: userpass\n  userpass:\n'
+      jq -r 'to_entries[] | "    \(.key): \(.value)"' "${HYSTERIA_CLIENTS}"
+      printf 'obfs:\n  type: %s\n  %s:\n    password: %s\n' "${obfs_type}" "${obfs_type}" "${obfs}"
+      if [[ "${profile}" == gecko ]]; then
+        printf '    minPacketSize: 512\n    maxPacketSize: 1200\n'
+      else
+        printf 'mimic:\n  enabled: true\n  xdpMode: skb\n'
+      fi
+    } >"${output}"
+    chmod 0600 "${output}"
+  done
 }
 
 write_portal_files() {
@@ -4105,6 +4408,9 @@ revoke_hysteria() {
   rm -f "${tmp}"
   render_hysteria_config
   systemctl restart "${HYSTERIA_SERVICE}" || true
+  systemctl restart hysteria2-gecko.service >/dev/null 2>&1 || true
+  [[ ! -f "${STACK_DIR}/hysteria-profiles/config-mimic.yaml" ]] \
+    || systemctl restart hysteria2-mimic.service >/dev/null 2>&1 || true
 }
 
 revoke_subscription() {
@@ -4126,6 +4432,8 @@ revoke_subscription() {
   rm -rf "${WEB_ROOT:?}/${token}"
   archive_file "${KEY_ROOT}/trojan/${trojan_label}.txt" "${KEY_ROOT}/trojan/revoked"
   archive_file "${KEY_ROOT}/hysteria/${hysteria_label}.txt" "${KEY_ROOT}/hysteria/revoked"
+  archive_file "${KEY_ROOT}/hysteria/${hysteria_label}-gecko.txt" "${KEY_ROOT}/hysteria/revoked"
+  archive_file "${KEY_ROOT}/hysteria/${hysteria_label}-mimic.yaml" "${KEY_ROOT}/hysteria/revoked"
   archive_file "${KEY_ROOT}/awg/${awg_label}.conf" "${KEY_ROOT}/awg/revoked"
 
   archive_dir="${SUB_DIR}/revoked/$(date +%Y%m%d-%H%M%S)-${token}"
@@ -4302,7 +4610,8 @@ TYPE_DIRS = {
     "trojan": KEY_ROOT / "trojan",
     "hysteria": KEY_ROOT / "hysteria",
 }
-TYPE_SUFFIXES = {"awg": ".conf", "trojan": ".txt", "hysteria": ".txt"}
+TYPE_SUFFIXES = {"awg": (".conf",), "trojan": (".txt",), "hysteria": (".txt", ".yaml")}
+TYPE_BATCH_SUFFIX = {"awg": ".conf", "trojan": ".txt", "hysteria": ".txt"}
 TYPE_HELPERS = {"awg": "vpn-awg", "trojan": "vpn-trojan", "hysteria": "vpn-hysteria"}
 
 
@@ -4526,13 +4835,13 @@ def typed_key_files(key_type: str) -> list[tuple[str, Path]]:
     result: list[tuple[str, Path]] = []
     for current_type in selected:
         directory = TYPE_DIRS[current_type]
-        suffix = TYPE_SUFFIXES[current_type]
+        suffixes = TYPE_SUFFIXES[current_type]
         if not directory.is_dir():
             continue
         result.extend(
             (current_type, path)
             for path in sorted(directory.iterdir())
-            if path.is_file() and path.suffix == suffix
+            if path.is_file() and path.suffix in suffixes
         )
     return result
 
@@ -4688,7 +4997,7 @@ def validate_batch_name(prefix: str) -> str:
 
 def expected_key_path(key_type: str, name: str) -> Path:
     label = f"{key_type.upper()}-{server_location()}-{name}"
-    return TYPE_DIRS[key_type] / f"{label}{TYPE_SUFFIXES[key_type]}"
+    return TYPE_DIRS[key_type] / f"{label}{TYPE_BATCH_SUFFIX[key_type]}"
 
 
 def command_batch(args: argparse.Namespace) -> None:
@@ -5214,7 +5523,14 @@ HELP
 topic_hysteria() {
   local name="${1:-}"
   if [[ -n "${name}" ]]; then
-    show_key_if_exists "/root/vpn-keys/hysteria/$(label_name "HYSTERIA" "${name}").txt"
+    local label
+    label="$(label_name "HYSTERIA" "${name}")"
+    for file in \
+      "/root/vpn-keys/hysteria/${label}.txt" \
+      "/root/vpn-keys/hysteria/${label}-gecko.txt" \
+      "/root/vpn-keys/hysteria/${label}-mimic.yaml"; do
+      [[ ! -f "${file}" ]] || { printf '\n%s:\n' "${file}"; cat "${file}"; }
+    done
     return 0
   fi
   cat <<'HELP'
@@ -5222,6 +5538,14 @@ topic_hysteria() {
 
 Create a client:
   vpn-hysteria phone1
+  vpn-hysteria phone1 salamander
+  vpn-hysteria phone1 gecko
+  vpn-hysteria phone1 mimic
+
+Salamander is the default and works with ordinary Hysteria2 clients.
+Gecko creates a separate URI on a persistent random UDP port.
+Mimic creates a Linux-only YAML and requires Mimic, root, eBPF, and kernel 6.1+.
+Issuing another profile for an existing name reuses its username/password.
 
 Show saved client material:
   vpn-help 2 phone1
@@ -5229,6 +5553,8 @@ Show saved client material:
 
 Saved path:
   /root/vpn-keys/hysteria/HYSTERIA-<LOCATION>-<name>.txt
+  /root/vpn-keys/hysteria/HYSTERIA-<LOCATION>-<name>-gecko.txt
+  /root/vpn-keys/hysteria/HYSTERIA-<LOCATION>-<name>-mimic.yaml
 HELP
 }
 
@@ -5985,6 +6311,8 @@ rollback() {
   install -m 0755 "${backup_dir}/hysteria" "${hysteria_bin}" || true
   systemctl restart "${xray_service}" >/dev/null 2>&1 || true
   systemctl restart hysteria2.service >/dev/null 2>&1 || true
+  [[ ! -f "${stack_dir}/hysteria-profiles/config-gecko.yaml" ]] || systemctl restart hysteria2-gecko.service >/dev/null 2>&1 || true
+  [[ ! -f "${stack_dir}/hysteria-profiles/config-mimic.yaml" ]] || systemctl restart hysteria2-mimic.service >/dev/null 2>&1 || true
   for service in hysteria-server.service hysteria.service hysteria@server.service; do
     systemctl disable --now "${service}" >/dev/null 2>&1 || true
   done
@@ -6007,10 +6335,22 @@ done
 "${xray_bin}" run -test -config "${xray_config}" >/dev/null
 systemctl restart "${xray_service}"
 systemctl restart hysteria2.service
+if [[ -f "${stack_dir}/hysteria-profiles/config-gecko.yaml" ]]; then systemctl restart hysteria2-gecko.service; fi
+if [[ -f "${stack_dir}/hysteria-profiles/config-mimic.yaml" ]]; then systemctl restart hysteria2-mimic.service; fi
 systemctl is-active --quiet "${xray_service}"
 systemctl is-active --quiet hysteria2.service
+if [[ -f "${stack_dir}/hysteria-profiles/config-gecko.yaml" ]]; then systemctl is-active --quiet hysteria2-gecko.service; fi
+if [[ -f "${stack_dir}/hysteria-profiles/config-mimic.yaml" ]]; then systemctl is-active --quiet hysteria2-mimic.service; fi
 test -S /dev/shm/xray-trojan-xhttp.sock
 ss -H -lun | awk '$5 ~ /:8443$/ {found=1} END {exit found ? 0 : 1}'
+if [[ -s "${stack_dir}/hysteria-gecko-port.txt" ]]; then
+  gecko_port="$(<"${stack_dir}/hysteria-gecko-port.txt")"
+  ss -H -lun | awk -v port=":${gecko_port}" '$5 ~ (port "$") {found=1} END {exit found ? 0 : 1}'
+fi
+if [[ -f "${stack_dir}/hysteria-profiles/config-mimic.yaml" ]]; then
+  mimic_port="$(<"${stack_dir}/hysteria-mimic-port.txt")"
+  ss -H -lun | awk -v port=":${mimic_port}" '$5 ~ (port "$") {found=1} END {exit found ? 0 : 1}'
+fi
 
 trap - ERR
 "${xray_bin}" version 2>/dev/null | sed -n '1p' >"${backup_dir}/xray-version.after.txt" || true
@@ -6058,6 +6398,8 @@ services=(
   xray-vless-xhttp-tls
   xray-vless-reality-xhttp
   hysteria2
+  hysteria2-gecko
+  hysteria2-mimic
   prometheus
   prometheus-node-exporter
   grafana-server
@@ -6068,6 +6410,9 @@ services=(
 printf '%s healthcheck start\n' "$(date -Is)" >>"${log_file}"
 for svc in "${services[@]}"; do
   systemctl cat "${svc}.service" >/dev/null 2>&1 || continue
+  if [[ "${svc}" == hysteria2-mimic && ! -f /opt/vpn-stack/hysteria-profiles/config-mimic.yaml ]]; then
+    continue
+  fi
   if ! systemctl is-active --quiet "${svc}"; then
     printf '%s restarting %s\n' "$(date -Is)" "${svc}" >>"${log_file}"
     systemctl restart "${svc}" >>"${log_file}" 2>&1 || true
@@ -6138,6 +6483,8 @@ enable_and_start_services() {
   systemctl enable nginx
   systemctl enable xray-trojan-xhttp-tls
   systemctl enable hysteria2
+  systemctl enable hysteria2-gecko
+  if [[ -f "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml" ]]; then systemctl enable hysteria2-mimic; fi
   systemctl enable amneziawg-ensure-module
   systemctl enable awg-quick@awg0
   systemctl enable prometheus
@@ -6154,6 +6501,8 @@ enable_and_start_services() {
   systemctl restart xray-trojan-xhttp-tls
   systemctl restart nginx
   systemctl restart hysteria2
+  systemctl restart hysteria2-gecko
+  if [[ -f "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml" ]]; then systemctl restart hysteria2-mimic; fi
   systemctl restart amneziawg-ensure-module
   systemctl restart awg-quick@awg0
   systemctl restart prometheus
@@ -6261,9 +6610,11 @@ socket_label() {
 wait_for_expected_listeners() {
   local timeout="${1:-90}"
   local deadline=$((SECONDS + timeout))
-  local awg_port
+  local awg_port gecko_port mimic_port
   local -a missing
   awg_port="$(current_awg_port)"
+  gecko_port="$(cat "${STACK_DIR}/hysteria-gecko-port.txt" 2>/dev/null || true)"
+  mimic_port="$(cat "${STACK_DIR}/hysteria-mimic-port.txt" 2>/dev/null || true)"
 
   log "Waiting up to ${timeout}s for expected listening ports."
   while true; do
@@ -6271,6 +6622,10 @@ wait_for_expected_listeners() {
 
     listen_any_port tcp 443 || missing+=("443/tcp")
     listen_any_port udp 8443 || missing+=("8443/udp")
+    [[ -z "${gecko_port}" ]] || listen_any_port udp "${gecko_port}" || missing+=("${gecko_port}/udp Gecko")
+    if [[ -f "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml" ]]; then
+      listen_any_port udp "${mimic_port}" || missing+=("${mimic_port}/udp Mimic")
+    fi
     listen_any_port udp "${awg_port}" || missing+=("${awg_port}/udp")
     [[ -S "${TROJAN_XHTTP_SOCKET}" ]] || missing+=("${TROJAN_XHTTP_SOCKET}")
     listen_local_port tcp 3000 || missing+=("127.0.0.1:3000")
@@ -6292,10 +6647,22 @@ wait_for_expected_listeners() {
 }
 
 print_install_summary() {
-  local dashboard_status awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_result xray_service
+  local dashboard_status awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_result xray_service gecko_port mimic_port gecko_status mimic_status
   load_installed_context
   xray_service="$(installed_trojan_xray_service)"
   awg_port="$(current_awg_port)"
+  gecko_port="$(cat "${STACK_DIR}/hysteria-gecko-port.txt" 2>/dev/null || printf unavailable)"
+  mimic_port="$(cat "${STACK_DIR}/hysteria-mimic-port.txt" 2>/dev/null || printf unavailable)"
+  if [[ "${gecko_port}" =~ ^[0-9]+$ ]]; then
+    gecko_status="$(listen_label any udp "${gecko_port}")"
+  else
+    gecko_status="unavailable"
+  fi
+  if [[ -f "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml" && "${mimic_port}" =~ ^[0-9]+$ ]]; then
+    mimic_status="enabled; listener $(listen_label any udp "${mimic_port}")"
+  else
+    mimic_status="unavailable"
+  fi
   swap_result="$(swap_report_label)"
   if [[ -s /var/lib/grafana/dashboards/node-exporter-full-1860.json ]]; then
     dashboard_status="provisioned from local JSON"
@@ -6322,7 +6689,8 @@ External interface: ${EXT_IFACE}
 
 Contours:
   AmneziaWG 3.1 (№1)  : service $(service_summary awg-quick@awg0); external ${awg_port}/udp $(listen_label any udp "${awg_port}"); interface awg0
-  Hysteria2 (№2)      : service $(service_summary hysteria2); external 8443/udp $(listen_label any udp 8443); Salamander
+  Hysteria2 (№2)      : Salamander 8443/udp $(listen_label any udp 8443); Gecko ${gecko_port}/udp ${gecko_status}
+  Hysteria2 Mimic     : service $(service_summary hysteria2-mimic); ${mimic_port}/udp+fake-tcp; Linux-only ${mimic_status}
   Trojan TLS fallback : service $(service_summary "${xray_service}"); external 443/tcp via nginx $(listen_label any tcp 443); backend ${TROJAN_XHTTP_SOCKET} $(socket_label "${TROJAN_XHTTP_SOCKET}")
   Decoy HTTPS site    : nginx $(service_summary nginx); https://${DOMAIN}/; randomized static site on 443/tcp
 
@@ -6389,6 +6757,8 @@ Initial client files:
 Create more clients:
   vpn-trojan phone1
   vpn-hysteria phone1
+  vpn-hysteria phone1 gecko
+  vpn-hysteria phone1 mimic
   vpn-awg phone1
 
 Subscription bundles:
@@ -6418,10 +6788,12 @@ EOF
 }
 
 generate_install_report() {
-  local awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_active dashboard_status swap_result xray_service
+  local awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_active dashboard_status swap_result xray_service gecko_port mimic_port
   load_installed_context
   xray_service="$(installed_trojan_xray_service)"
   awg_port="$(current_awg_port)"
+  gecko_port="$(cat "${STACK_DIR}/hysteria-gecko-port.txt" 2>/dev/null || printf unavailable)"
+  mimic_port="$(cat "${STACK_DIR}/hysteria-mimic-port.txt" 2>/dev/null || printf unavailable)"
   swap_result="$(swap_report_label)"
   awg_profile="$(grep -E '^AWG_OBFS_PROFILE=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')"
   awg_effective="$(grep -E '^AWG_EFFECTIVE_PROFILE=' "${STACK_DIR}/awg-params.env" 2>/dev/null | cut -d= -f2- || printf 'unknown')"
@@ -6463,6 +6835,18 @@ generate_install_report() {
       "priority": 2,
       "external": "8443/udp",
       "service": $(json_escape "$(service_summary hysteria2)")
+    },
+    "hysteria2_gecko": {
+      "priority": 2,
+      "external": $(json_escape "${gecko_port}/udp"),
+      "service": $(json_escape "$(service_summary hysteria2-gecko)"),
+      "experimental": true
+    },
+    "hysteria2_mimic": {
+      "priority": 2,
+      "external": $(json_escape "${mimic_port}/udp+fake-tcp"),
+      "service": $(json_escape "$(service_summary hysteria2-mimic)"),
+      "linux_client_only": true
     },
     "amneziawg": {
       "priority": 1,
@@ -6532,10 +6916,12 @@ EOF
 }
 
 validate_stack() {
-  local failed=0 awg_port xray_service
+  local failed=0 awg_port xray_service gecko_port mimic_port
   load_installed_context
   awg_port="$(current_awg_port)"
   xray_service="$(installed_trojan_xray_service)"
+  gecko_port="$(cat "${STACK_DIR}/hysteria-gecko-port.txt" 2>/dev/null || true)"
+  mimic_port="$(cat "${STACK_DIR}/hysteria-mimic-port.txt" 2>/dev/null || true)"
 
   check_pass() {
     local label="$1"
@@ -6562,6 +6948,9 @@ validate_stack() {
   printf 'Golden VPN validation\n\n'
   check_pass "443/tcp public listener" listen_any_port tcp 443
   check_pass "8443/udp public listener" listen_any_port udp 8443
+  if [[ -n "${gecko_port}" ]]; then
+    check_pass "${gecko_port}/udp Gecko listener" listen_any_port udp "${gecko_port}"
+  fi
   check_pass "${awg_port}/udp public listener" listen_any_port udp "${awg_port}"
   check_pass "Trojan XHTTP unix socket" test -S "${TROJAN_XHTTP_SOCKET}"
   check_pass "Grafana localhost 3000" listen_local_port tcp 3000
@@ -6573,6 +6962,15 @@ validate_stack() {
   check_pass "nginx active" systemctl is-active --quiet nginx
   check_pass "Trojan-capable Xray active (${xray_service})" systemctl is-active --quiet "${xray_service}"
   check_pass "hysteria2 active" systemctl is-active --quiet hysteria2
+  if [[ -s "${HYSTERIA_PROFILE_DIR}/config-gecko.yaml" ]]; then
+    check_pass "hysteria2-gecko active" systemctl is-active --quiet hysteria2-gecko
+  fi
+  if [[ -s "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml" ]]; then
+    check_pass "hysteria2-mimic active" systemctl is-active --quiet hysteria2-mimic
+    check_pass "${mimic_port}/udp Mimic listener" listen_any_port udp "${mimic_port}"
+    # shellcheck disable=SC2016
+    check_pass "Mimic kernel module loaded" bash -c 'lsmod | awk '\''$1 == "mimic" {found=1} END {exit found ? 0 : 1}'\'''
+  fi
   check_pass "awg-quick@awg0 active" systemctl is-active --quiet awg-quick@awg0
   check_pass "AmneziaWG 3.1 tools" bash -c 'awg --version 2>/dev/null | grep -Eq '\''v3\.1\.'\'''
   check_pass "AWG 3.1 header protection configured" grep -Eq '^HeaderProtectionKey[[:space:]]*=' "${AWG_CONFIG}"
@@ -6606,17 +7004,24 @@ validate_stack() {
 }
 
 final_checks() {
-  local awg_port xray_service
+  local awg_port xray_service gecko_port mimic_port port_pattern
   awg_port="$(current_awg_port)"
   xray_service="$(installed_trojan_xray_service)"
+  gecko_port="$(cat "${STACK_DIR}/hysteria-gecko-port.txt" 2>/dev/null || true)"
+  mimic_port="$(cat "${STACK_DIR}/hysteria-mimic-port.txt" 2>/dev/null || true)"
+  port_pattern=":443|:8443|:${awg_port}|:3000|:9090|:9100"
+  [[ -z "${gecko_port}" ]] || port_pattern+="|:${gecko_port}"
+  [[ ! -s "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml" || -z "${mimic_port}" ]] || port_pattern+="|:${mimic_port}"
   log "Final listening socket check."
   set +e
-  ss -lntup | grep -E ":443|:8443|:${awg_port}|:3000|:9090|:9100"
+  ss -lntup | grep -E "${port_pattern}"
   ls -l "${TROJAN_XHTTP_SOCKET}"
 
   systemctl status nginx --no-pager
   systemctl status "${xray_service}" --no-pager
   systemctl status hysteria2 --no-pager
+  systemctl status hysteria2-gecko --no-pager
+  [[ ! -s "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml" ]] || systemctl status hysteria2-mimic --no-pager
   systemctl status awg-quick@awg0 --no-pager -l
   systemctl status prometheus --no-pager
   systemctl status prometheus-node-exporter --no-pager
@@ -6861,7 +7266,94 @@ install_upgrade_helpers() {
   install_resume_status_helper
 }
 
+upgrade_hysteria_profiles() {
+  local backup_dir="$1" hysteria_bin gecko_port mimic_port state_roots state_archive path
+  local -a profile_state_paths=(
+    "${HYSTERIA_PROFILE_DIR}"
+    "${STACK_DIR}/hysteria-obfs-gecko.txt"
+    "${STACK_DIR}/hysteria-obfs-mimic.txt"
+    "${STACK_DIR}/hysteria-gecko-port.txt"
+    "${STACK_DIR}/hysteria-mimic-port.txt"
+    "${STACK_DIR}/hysteria-mimic-available.txt"
+    "/etc/systemd/system/hysteria2-gecko.service"
+    "/etc/systemd/system/hysteria2-mimic.service"
+  )
+  hysteria_bin="$(command -v hysteria)"
+  [[ -x "${hysteria_bin}" ]] || die "Installed Hysteria binary is missing."
+  install -m 0755 "${hysteria_bin}" "${backup_dir}/hysteria-binary.before"
+  state_roots="${backup_dir}/hysteria-profile-state.roots"
+  state_archive="${backup_dir}/hysteria-profile-state.tar"
+  : >"${state_roots}"
+  for path in "${profile_state_paths[@]}"; do
+    [[ ! -e "${path}" ]] || printf '%s\n' "${path#/}" >>"${state_roots}"
+  done
+  if [[ -s "${state_roots}" ]]; then
+    tar -C / -cpf "${state_archive}" -T "${state_roots}"
+    chmod 0600 "${state_roots}" "${state_archive}"
+  else
+    chmod 0600 "${state_roots}"
+  fi
+
+  if ! (
+    set -Eeuo pipefail
+    install_hysteria
+    install_mimic_optional
+    ensure_hysteria_profile_state
+    hysteria_render_profile_config gecko "${HYSTERIA_PROFILE_DIR}/config-gecko.yaml"
+    if [[ "$(<"${STACK_DIR}/hysteria-mimic-available.txt")" == 1 ]]; then
+      hysteria_render_profile_config mimic "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml"
+    else
+      rm -f "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml"
+    fi
+    write_hysteria_additional_units
+    gecko_port="$(<"${STACK_DIR}/hysteria-gecko-port.txt")"
+    ufw allow "${gecko_port}/udp"
+    if [[ -f "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml" ]]; then
+      mimic_port="$(<"${STACK_DIR}/hysteria-mimic-port.txt")"
+      ufw allow "${mimic_port}/udp"
+      ufw allow "${mimic_port}/tcp"
+    fi
+    systemctl daemon-reload
+    systemctl enable --now hysteria2.service hysteria2-gecko.service
+    if [[ -f "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml" ]]; then
+      systemctl enable --now hysteria2-mimic.service
+    fi
+    systemctl restart hysteria2.service hysteria2-gecko.service
+    systemctl is-active --quiet hysteria2.service
+    systemctl is-active --quiet hysteria2-gecko.service
+    ss -H -lun | awk -v port=":${gecko_port}" '$5 ~ (port "$") {found=1} END {exit found ? 0 : 1}'
+    if [[ -f "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml" ]]; then
+      systemctl restart hysteria2-mimic.service
+      systemctl is-active --quiet hysteria2-mimic.service
+      ss -H -lun | awk -v port=":${mimic_port}" '$5 ~ (port "$") {found=1} END {exit found ? 0 : 1}'
+    fi
+  ); then
+    return 0
+  fi
+
+  warn "Hysteria profile upgrade failed; restoring the previous Hysteria binary and Salamander service."
+  install -m 0755 "${backup_dir}/hysteria-binary.before" "${hysteria_bin}" || true
+  systemctl disable --now hysteria2-gecko.service hysteria2-mimic.service >/dev/null 2>&1 || true
+  rm -rf -- "${HYSTERIA_PROFILE_DIR}"
+  rm -f -- \
+    "${STACK_DIR}/hysteria-obfs-gecko.txt" \
+    "${STACK_DIR}/hysteria-obfs-mimic.txt" \
+    "${STACK_DIR}/hysteria-gecko-port.txt" \
+    "${STACK_DIR}/hysteria-mimic-port.txt" \
+    "${STACK_DIR}/hysteria-mimic-available.txt" \
+    /etc/systemd/system/hysteria2-gecko.service \
+    /etc/systemd/system/hysteria2-mimic.service
+  if [[ -s "${state_roots}" && -s "${state_archive}" ]]; then
+    tar -C / -xpf "${state_archive}"
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl restart hysteria2.service >/dev/null 2>&1 || true
+  die "Hysteria profile upgrade rolled back. Existing users and Salamander files were preserved."
+}
+
 apply_upgrade_overlay() {
+  local backup_dir="$1"
+  upgrade_hysteria_profiles "${backup_dir}"
   install_upgrade_helpers
 
   if [[ -d /etc/prometheus && -d /etc/grafana ]]; then
@@ -6931,7 +7423,7 @@ upgrade_existing_stack() {
   after="${backup_dir}/profiles.after.tsv"
   log "Profile backup created: ${backup_dir}"
 
-  if ! (set -Eeuo pipefail; apply_upgrade_overlay); then
+  if ! (set -Eeuo pipefail; apply_upgrade_overlay "${backup_dir}"); then
     die "Upgrade overlay failed. VPN credentials were not intentionally changed; backup retained at ${backup_dir}."
   fi
 
@@ -7771,6 +8263,7 @@ main() {
   configure_nginx
   progress "Installing Hysteria2"
   install_hysteria
+  install_mimic_optional
   progress "Configuring Hysteria2"
   configure_hysteria
   progress "Installing AmneziaWG"

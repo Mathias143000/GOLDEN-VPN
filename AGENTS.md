@@ -40,6 +40,9 @@ TLS notifications: vpn-cert-notify plus daily systemd timer and acme.sh renewal 
 Engine updates: rollback-protected daily stable checks for AWG, Xray, and Hysteria
 Stability: no scheduled daily server reboot; boot healthcheck remains enabled
 Upgrade invariant: existing Xray clients, Hysteria users, AWG peers, client files, and subscription bundles remain byte-for-byte unchanged
+Hysteria profiles: Salamander default plus Gecko and optional Linux-only Mimic on persistent random per-server ports
+Hysteria profile issuance: existing usernames/passwords are reused; issuing Gecko/Mimic never rotates the Salamander credential
+Mimic lifecycle: explicit install/upgrade only; no unattended kernel-module package update
 ```
 
 ### 0.0.1 Two-stage installer flow
