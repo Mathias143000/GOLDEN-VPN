@@ -2262,6 +2262,7 @@ hysteria_render_profile_config() {
   [[ "${profile}" == gecko ]] && obfs_type=gecko || obfs_type=salamander
   {
     printf 'listen: :%s\n' "${port}"
+    printf 'quic:\n  disablePathMTUDiscovery: true\n'
     printf 'tls:\n  cert: %s/fullchain.pem\n  key: %s/privkey.pem\n' "${CERT_DIR}" "${CERT_DIR}"
     printf 'auth:\n  type: userpass\n  userpass:\n'
     jq -r 'to_entries[] | "    \(.key): \(.value)"' "${STACK_DIR}/hysteria-clients.json"
@@ -3010,9 +3011,13 @@ DisableCookies = ${AWG_DISABLE_COOKIES}
 PostUp = iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o ${EXT_IFACE} -j MASQUERADE
 PostUp = iptables -A FORWARD -i awg0 -j ACCEPT
 PostUp = iptables -A FORWARD -o awg0 -j ACCEPT
+PostUp = iptables -t mangle -A FORWARD -i awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1150
+PostUp = iptables -t mangle -A FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1150
 PostDown = iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o ${EXT_IFACE} -j MASQUERADE
 PostDown = iptables -D FORWARD -i awg0 -j ACCEPT
 PostDown = iptables -D FORWARD -o awg0 -j ACCEPT
+PostDown = iptables -t mangle -D FORWARD -i awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1150
+PostDown = iptables -t mangle -D FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1150
 
 [Peer]
 PublicKey = ${client_public}
@@ -4211,6 +4216,8 @@ render_hysteria_config() {
   obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
   {
     printf 'listen: :8443\n'
+    printf 'quic:\n'
+    printf '  disablePathMTUDiscovery: true\n'
     printf 'tls:\n'
     printf '  cert: /etc/letsencrypt/live/%s/fullchain.pem\n' "$(domain_name)"
     printf '  key: /etc/letsencrypt/live/%s/privkey.pem\n' "$(domain_name)"
@@ -4239,6 +4246,7 @@ render_hysteria_config() {
     [[ "${profile}" == gecko ]] && obfs_type=gecko || obfs_type=salamander
     {
       printf 'listen: :%s\n' "${port}"
+      printf 'quic:\n  disablePathMTUDiscovery: true\n'
       printf 'tls:\n  cert: /etc/letsencrypt/live/%s/fullchain.pem\n' "$(domain_name)"
       printf '  key: /etc/letsencrypt/live/%s/privkey.pem\n' "$(domain_name)"
       printf 'auth:\n  type: userpass\n  userpass:\n'

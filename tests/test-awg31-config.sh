@@ -63,6 +63,7 @@ grep -Fq 'ListenPort = ${AWG_INTERNAL_LISTEN_PORT}' "${installer}"
 grep -Fq -- '--dst-type LOCAL -j REDIRECT --to-ports 51820' "${installer}"
 grep -Fq -- '--ctorigdstport 443 -j ACCEPT' "${installer}"
 grep -Fq 'AWG_ENDPOINT_PORT is fixed at 443/udp' "${installer}"
+[[ "$(grep -Fc -- '--set-mss 1150' "${installer}")" -eq 4 ]]
 
 cat >"${tmp_dir}/before.rules" <<'EOF_RULES'
 *filter
