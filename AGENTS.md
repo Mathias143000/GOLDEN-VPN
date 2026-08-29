@@ -24,7 +24,7 @@ Decoy manifest: /opt/vpn-stack/decoy-manifest.json
 AWG 3.1: header protection, content padding, timing ranges, random trailers, full J/S/H/I1-I5
 AWG profiles: dns, quic-lite, video-call, mobile-low-mtu, random-balanced, custom
 AWG_MTU=auto with PMTU probe and 1280 fallback
-AWG overrides: AWG_JC/JMIN/JMAX/S1-S4/H1-H4/I1-I5/MTU/DNS/ALLOWED_IPS/KEEPALIVE/ENDPOINT_PORT
+AWG overrides: AWG_JC/JMIN/JMAX/S1-S4/H1-H4/I1-I5/MTU/DNS/ALLOWED_IPS/KEEPALIVE; client endpoint is fixed at 443/udp
 AWG helpers: list, show, revoke, rotate, profile, show-config, explain, analyze, capture, analyze-live
 Decoy profiles: network-monitor, software-status, edge-docs, availability-lab
 Decoy controls: DECOY_PROFILE, DECOY_SEED, DECOY_BRAND, DECOY_REGION
@@ -222,7 +222,7 @@ current audited migration keeps USA, France, and Estonia; Sweden and Netherlands
 Фактическая архитектура скрипта:
 
 ```text
-AmneziaWG 3.1 (№1) → 51820/udp
+AmneziaWG 3.1 (№1) → 443/udp
 Hysteria2 Salamander (№2) → 8443/udp
 Trojan XHTTP TLS fallback → 443/tcp через nginx HTTPS location + Xray unix socket, XHTTP mode auto
 Decoy HTTPS site → встроенный статический генератор HTML/CSS

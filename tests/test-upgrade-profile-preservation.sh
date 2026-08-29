@@ -162,5 +162,6 @@ for forbidden in \
 done
 
 grep -Fq 'wait_for_expected_listeners 180' <<<"${upgrade_code}"
+grep -Fq 'install -m 0700 "${BASH_SOURCE[0]}" /root/install-vpn-stack.sh' <<<"${upgrade_code}"
 
 printf 'upgrade profile preservation tests passed\n'

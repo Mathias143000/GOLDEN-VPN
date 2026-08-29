@@ -8,7 +8,7 @@ export APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND:-none}"
 
 : "${APT_LOCK_TIMEOUT:=1800}"
 
-GOLDEN_VPN_VERSION="2026.08.29-hysteria-profiles"
+GOLDEN_VPN_VERSION="2026.08.29-awg443"
 
 STACK_DIR="/opt/vpn-stack"
 KEY_DIR="/root/vpn-keys"
@@ -49,7 +49,8 @@ INSTALLER_VERSION_FILE="${STACK_DIR}/installer-version.txt"
 DECOY_MANIFEST="${STACK_DIR}/decoy-manifest.json"
 AWG_TUNING_REPORT="${STACK_DIR}/awg-tuning-report.json"
 AWG_CONFIG="/etc/amnezia/amneziawg/awg0.conf"
-AWG_DEFAULT_PORT=51820
+AWG_DEFAULT_PORT=443
+AWG_INTERNAL_LISTEN_PORT=51820
 AWG_PROTOCOL_VERSION="3.1"
 AWG_TOOLS_SOURCE_TAG="v3.1.20260812"
 HYSTERIA_SALAMANDER_PORT=8443
@@ -2796,6 +2797,7 @@ generate_awg_tuning() {
 
   awg_port="${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}"
   validate_int_range AWG_ENDPOINT_PORT "${awg_port}" 1 65535
+  [[ "${awg_port}" == "443" ]] || die "AWG_ENDPOINT_PORT is fixed at 443/udp in the Golden profile."
   awg_dns="${AWG_DNS:-1.1.1.1, 8.8.8.8}"
   awg_allowed_ips="${AWG_ALLOWED_IPS:-0.0.0.0/0, ::/0}"
   awg_keepalive="${AWG_KEEPALIVE:-25}"
@@ -2919,7 +2921,7 @@ DisableCookies = ${AWG_DISABLE_COOKIES}
 [Peer]
 PublicKey = ${server_public}
 PresharedKey = ${psk}
-Endpoint = ${DOMAIN}:${AWG_ENDPOINT_PORT:-51820}
+Endpoint = ${DOMAIN}:${AWG_ENDPOINT_PORT:-443}
 AllowedIPs = ${AWG_ALLOWED_IPS:-0.0.0.0/0, ::/0}
 PersistentKeepalive = ${AWG_KEEPALIVE:-25}
 EOF
@@ -2970,14 +2972,14 @@ EOF
   i3="${AWG_I3}"
   i4="${AWG_I4}"
   i5="${AWG_I5}"
-  log "AWG profile: ${awg_profile} (effective ${awg_effective_profile}), MTU ${awg_mtu}, UDP port ${awg_port}."
+  log "AWG profile: ${awg_profile} (effective ${awg_effective_profile}), MTU ${awg_mtu}, external UDP/${awg_port}, internal UDP/${AWG_INTERNAL_LISTEN_PORT}."
   printf '%s\n' "${server_public}" >"${STACK_DIR}/awg-server-public-key.txt"
   chmod 0600 "${STACK_DIR}/awg-server-public-key.txt"
 
   cat >/etc/amnezia/amneziawg/awg0.conf <<EOF
 [Interface]
 Address = 10.66.66.1/24
-ListenPort = ${awg_port}
+ListenPort = ${AWG_INTERNAL_LISTEN_PORT}
 PrivateKey = ${server_private}
 MTU = ${awg_mtu}
 Jc = ${jc}
@@ -3112,6 +3114,56 @@ swap_report_label() {
   fi
 }
 
+render_awg_udp443_ufw_rules() {
+  local input="$1" output="$2"
+  awk '
+    $0 == "# golden-vpn-awg-udp443" {skip_nat=1; next}
+    skip_nat && $0 == "COMMIT" {skip_nat=0; skip_nat_blank=1; next}
+    skip_nat {next}
+    skip_nat_blank && $0 == "" {skip_nat_blank=0; next}
+    {skip_nat_blank=0}
+    $0 == "# golden-vpn-awg-udp443-input" {skip_filter=1; next}
+    skip_filter {skip_filter=0; next}
+    /^\*filter$/ && !nat_inserted {
+      print "# golden-vpn-awg-udp443"
+      print "*nat"
+      print ":PREROUTING ACCEPT [0:0]"
+      print "-A PREROUTING -p udp --dport 443 -m addrtype --dst-type LOCAL -j REDIRECT --to-ports 51820"
+      print "COMMIT"
+      print ""
+      nat_inserted=1
+    }
+    {
+      print
+      if ($0 == ":ufw-before-forward - [0:0]" && !filter_inserted) {
+        print "# golden-vpn-awg-udp443-input"
+        print "-A ufw-before-input -p udp --dport 51820 -m conntrack --ctorigdstport 443 -j ACCEPT"
+        filter_inserted=1
+      }
+    }
+  ' "${input}" >"${output}"
+}
+
+configure_awg_udp443_gateway() {
+  local rules="/etc/ufw/before.rules" tmp
+  [[ -f "${rules}" ]] || die "Missing UFW rules file: ${rules}"
+  tmp="$(mktemp /etc/ufw/.before.rules.XXXXXX)"
+  render_awg_udp443_ufw_rules "${rules}" "${tmp}"
+  install -m 0640 "${tmp}" "${rules}"
+  rm -f "${tmp}"
+  iptables-restore --test <"${rules}"
+}
+
+activate_awg_udp443_gateway() {
+  while iptables -t nat -C PREROUTING -p udp --dport 443 -j REDIRECT --to-ports 51820 >/dev/null 2>&1; do
+    iptables -t nat -D PREROUTING -p udp --dport 443 -j REDIRECT --to-ports 51820
+  done
+  while iptables -t nat -C PREROUTING -p udp --dport 443 -m addrtype --dst-type LOCAL -j REDIRECT --to-ports 51820 >/dev/null 2>&1; do
+    iptables -t nat -D PREROUTING -p udp --dport 443 -m addrtype --dst-type LOCAL -j REDIRECT --to-ports 51820
+  done
+  iptables -t nat -A PREROUTING -p udp --dport 443 -m addrtype --dst-type LOCAL -j REDIRECT --to-ports 51820
+}
+
 configure_firewall() {
   local awg_port="${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}" gecko_port mimic_port
   if [[ -f "${STACK_DIR}/awg-params.env" ]]; then
@@ -3136,7 +3188,10 @@ configure_firewall() {
     ufw allow "${mimic_port}/tcp"
   fi
   ufw allow "${awg_port}/udp"
+  ufw --force delete allow "${AWG_INTERNAL_LISTEN_PORT}/udp" >/dev/null 2>&1 || true
+  configure_awg_udp443_gateway
   ufw --force enable
+  activate_awg_udp443_gateway
 }
 
 install_helper_trojan() {
@@ -3468,7 +3523,7 @@ STACK_DIR="/opt/vpn-stack"
 CONFIG="/etc/amnezia/amneziawg/awg0.conf"
 KEY_DIR="/root/vpn-keys/awg"
 PARAMS="${STACK_DIR}/awg-params.env"
-DEFAULT_PORT=51820
+DEFAULT_PORT=443
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 awg_genpsk() {
@@ -4016,7 +4071,7 @@ DisableCookies = ${AWG_DISABLE_COOKIES}
 [Peer]
 PublicKey = ${server_public}
 PresharedKey = ${psk}
-Endpoint = ${domain}:${AWG_ENDPOINT_PORT:-51820}
+Endpoint = ${domain}:${AWG_ENDPOINT_PORT:-443}
 AllowedIPs = ${AWG_ALLOWED_IPS:-0.0.0.0/0, ::/0}
 PersistentKeepalive = ${AWG_KEEPALIVE:-25}
 EOF_CLIENT
@@ -4819,7 +4874,7 @@ def command_audit(args: argparse.Namespace) -> None:
         "awg": {
             "source_dir": str(source),
             "protocol_version": params.get("AWG_PROTOCOL_VERSION", "unknown"),
-            "endpoint_port": params.get("AWG_ENDPOINT_PORT", "51820"),
+            "endpoint_port": params.get("AWG_ENDPOINT_PORT", "443"),
             "profile": params.get("AWG_OBFS_PROFILE", "unknown"),
             "mtu": params.get("AWG_MTU", "unknown"),
             "key_count": len(keys),
@@ -6548,6 +6603,13 @@ current_awg_port() {
   printf '%s\n' "${port}"
 }
 
+current_awg_listen_port() {
+  local port
+  port="$(awk -F= 'tolower($1) ~ /^[[:space:]]*listenport[[:space:]]*$/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${AWG_CONFIG}" 2>/dev/null || true)"
+  [[ "${port}" =~ ^[0-9]+$ ]] || port="${AWG_INTERNAL_LISTEN_PORT}"
+  printf '%s\n' "${port}"
+}
+
 service_summary() {
   local unit="$1"
   local active enabled
@@ -6624,7 +6686,7 @@ wait_for_expected_listeners() {
   local deadline=$((SECONDS + timeout))
   local awg_port gecko_port mimic_port
   local -a missing
-  awg_port="$(current_awg_port)"
+  awg_port="$(current_awg_listen_port)"
   gecko_port="$(cat "${STACK_DIR}/hysteria-gecko-port.txt" 2>/dev/null || true)"
   mimic_port="$(cat "${STACK_DIR}/hysteria-mimic-port.txt" 2>/dev/null || true)"
 
@@ -6659,10 +6721,11 @@ wait_for_expected_listeners() {
 }
 
 print_install_summary() {
-  local dashboard_status awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_result xray_service gecko_port mimic_port gecko_status mimic_status
+  local dashboard_status awg_port awg_listen_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_result xray_service gecko_port mimic_port gecko_status mimic_status
   load_installed_context
   xray_service="$(installed_trojan_xray_service)"
   awg_port="$(current_awg_port)"
+  awg_listen_port="$(current_awg_listen_port)"
   gecko_port="$(cat "${STACK_DIR}/hysteria-gecko-port.txt" 2>/dev/null || printf unavailable)"
   mimic_port="$(cat "${STACK_DIR}/hysteria-mimic-port.txt" 2>/dev/null || printf unavailable)"
   if [[ "${gecko_port}" =~ ^[0-9]+$ ]]; then
@@ -6700,7 +6763,7 @@ Server location: ${SERVER_LOCATION}
 External interface: ${EXT_IFACE}
 
 Contours:
-  AmneziaWG 3.1 (№1)  : service $(service_summary awg-quick@awg0); external ${awg_port}/udp $(listen_label any udp "${awg_port}"); interface awg0
+  AmneziaWG 3.1 (№1)  : service $(service_summary awg-quick@awg0); external ${awg_port}/udp via protected redirect; internal ${awg_listen_port}/udp $(listen_label any udp "${awg_listen_port}"); interface awg0
   Hysteria2 (№2)      : Salamander 8443/udp $(listen_label any udp 8443); Gecko ${gecko_port}/udp ${gecko_status}
   Hysteria2 Mimic     : service $(service_summary hysteria2-mimic); ${mimic_port}/udp+fake-tcp; Linux-only ${mimic_status}
   Trojan TLS fallback : service $(service_summary "${xray_service}"); external 443/tcp via nginx $(listen_label any tcp 443); backend ${TROJAN_XHTTP_SOCKET} $(socket_label "${TROJAN_XHTTP_SOCKET}")
@@ -6800,10 +6863,11 @@ EOF
 }
 
 generate_install_report() {
-  local awg_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_active dashboard_status swap_result xray_service gecko_port mimic_port
+  local awg_port awg_listen_port awg_profile awg_effective awg_mtu decoy_profile decoy_seed cert_issuer cert_expiry swap_active dashboard_status swap_result xray_service gecko_port mimic_port
   load_installed_context
   xray_service="$(installed_trojan_xray_service)"
   awg_port="$(current_awg_port)"
+  awg_listen_port="$(current_awg_listen_port)"
   gecko_port="$(cat "${STACK_DIR}/hysteria-gecko-port.txt" 2>/dev/null || printf unavailable)"
   mimic_port="$(cat "${STACK_DIR}/hysteria-mimic-port.txt" 2>/dev/null || printf unavailable)"
   swap_result="$(swap_report_label)"
@@ -6864,6 +6928,8 @@ generate_install_report() {
       "priority": 1,
       "protocol_version": "3.1",
       "external": $(json_escape "${awg_port}/udp"),
+      "internal_listener": $(json_escape "${awg_listen_port}/udp"),
+      "gateway": "local-destination-only REDIRECT",
       "service": $(json_escape "$(service_summary awg-quick@awg0)"),
       "profile": $(json_escape "${awg_profile}"),
       "effective_profile": $(json_escape "${awg_effective}"),
@@ -6928,9 +6994,10 @@ EOF
 }
 
 validate_stack() {
-  local failed=0 awg_port xray_service gecko_port mimic_port
+  local failed=0 awg_port awg_listen_port xray_service gecko_port mimic_port
   load_installed_context
   awg_port="$(current_awg_port)"
+  awg_listen_port="$(current_awg_listen_port)"
   xray_service="$(installed_trojan_xray_service)"
   gecko_port="$(cat "${STACK_DIR}/hysteria-gecko-port.txt" 2>/dev/null || true)"
   mimic_port="$(cat "${STACK_DIR}/hysteria-mimic-port.txt" 2>/dev/null || true)"
@@ -6963,7 +7030,12 @@ validate_stack() {
   if [[ -n "${gecko_port}" ]]; then
     check_pass "${gecko_port}/udp Gecko listener" listen_any_port udp "${gecko_port}"
   fi
-  check_pass "${awg_port}/udp public listener" listen_any_port udp "${awg_port}"
+  check_pass "${awg_listen_port}/udp AWG internal listener" listen_any_port udp "${awg_listen_port}"
+  if [[ "${awg_port}" == 443 && "${awg_listen_port}" == "${AWG_INTERNAL_LISTEN_PORT}" ]]; then
+    check_pass "443/udp AWG local-destination redirect" iptables -t nat -C PREROUTING -p udp --dport 443 -m addrtype --dst-type LOCAL -j REDIRECT --to-ports "${AWG_INTERNAL_LISTEN_PORT}"
+    check_pass "AWG post-redirect UFW acceptance" iptables -C ufw-before-input -p udp --dport "${AWG_INTERNAL_LISTEN_PORT}" -m conntrack --ctorigdstport 443 -j ACCEPT
+    check_absent "direct ${AWG_INTERNAL_LISTEN_PORT}/udp UFW exposure absent" bash -c "ufw status | grep -Eq '^${AWG_INTERNAL_LISTEN_PORT}/udp[[:space:]]+ALLOW'"
+  fi
   check_pass "Trojan XHTTP unix socket" test -S "${TROJAN_XHTTP_SOCKET}"
   check_pass "Grafana localhost 3000" listen_local_port tcp 3000
   check_pass "Prometheus localhost 9090" listen_local_port tcp 9090
@@ -7016,12 +7088,13 @@ validate_stack() {
 }
 
 final_checks() {
-  local awg_port xray_service gecko_port mimic_port port_pattern
+  local awg_port awg_listen_port xray_service gecko_port mimic_port port_pattern
   awg_port="$(current_awg_port)"
+  awg_listen_port="$(current_awg_listen_port)"
   xray_service="$(installed_trojan_xray_service)"
   gecko_port="$(cat "${STACK_DIR}/hysteria-gecko-port.txt" 2>/dev/null || true)"
   mimic_port="$(cat "${STACK_DIR}/hysteria-mimic-port.txt" 2>/dev/null || true)"
-  port_pattern=":443|:8443|:${awg_port}|:3000|:9090|:9100"
+  port_pattern=":443|:8443|:${awg_port}|:${awg_listen_port}|:3000|:9090|:9100"
   [[ -z "${gecko_port}" ]] || port_pattern+="|:${gecko_port}"
   [[ ! -s "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml" || -z "${mimic_port}" ]] || port_pattern+="|:${mimic_port}"
   log "Final listening socket check."
@@ -7368,6 +7441,14 @@ apply_upgrade_overlay() {
   upgrade_hysteria_profiles "${backup_dir}"
   install_upgrade_helpers
 
+  if [[ "$(current_awg_port)" == 443 && "$(current_awg_listen_port)" == "${AWG_INTERNAL_LISTEN_PORT}" ]]; then
+    configure_awg_udp443_gateway
+    ufw allow 443/udp
+    ufw --force delete allow "${AWG_INTERNAL_LISTEN_PORT}/udp" >/dev/null 2>&1 || true
+    ufw reload
+    activate_awg_udp443_gateway
+  fi
+
   if [[ -d /etc/prometheus && -d /etc/grafana ]]; then
     configure_monitoring
   else
@@ -7449,6 +7530,9 @@ upgrade_existing_stack() {
     die "Profile preservation check failed. Inspect ${backup_dir}/profiles.diff and restore from profiles.tar if needed."
   fi
 
+  if [[ "$(readlink -f "${BASH_SOURCE[0]}")" != "/root/install-vpn-stack.sh" ]]; then
+    install -m 0700 "${BASH_SOURCE[0]}" /root/install-vpn-stack.sh
+  fi
   printf '%s\n' "${GOLDEN_VPN_VERSION}" >"${INSTALLER_VERSION_FILE}"
   printf '%s\n' "${SERVER_LOCATION}" >"${STACK_DIR}/server-location.txt"
   chmod 0600 "${INSTALLER_VERSION_FILE}"

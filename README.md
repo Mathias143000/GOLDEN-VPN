@@ -4,7 +4,7 @@ Golden install script for a fresh Ubuntu/Debian VPS.
 
 It deploys:
 
-- primary: AmneziaWG 3.1 on `51820/udp`
+- primary: AmneziaWG 3.1 on `443/udp`
 - backup №2: Hysteria2 Salamander on `8443/udp`, plus Gecko and optional Linux-only Mimic profiles on persistent random per-server ports
 - TCP/TLS fallback: Trojan XHTTP TLS in `auto` mode on `443/tcp` behind nginx and the domain certificate
 - randomized static decoy HTTPS site on `https://DOMAIN/`
@@ -21,6 +21,8 @@ Before running the installer:
 - use an AWG 3.1-capable client (AmneziaVPN `5.0.1.5+`, DefaultVPN `2.0.1.1+`, or a current native AWG client)
 
 AWG 3.1 profiles are not compatible with AWG 2.0 clients. Router clients that do not support AWG 3.1 need Hysteria2/Trojan or a separately retained AWG 2.0 service; a clean Golden install does not create a legacy AWG 2.0 contour.
+
+Golden issues one AWG profile only: clients use `DOMAIN:443/udp`. The host keeps an internal AWG listener on `51820/udp` behind a local-destination-only redirect; direct public access to `51820/udp` is blocked.
 
 ## Two-Stage Bootstrap Install
 
@@ -117,7 +119,7 @@ Optional tuning variables:
 ```bash
 export AWG_OBFS_PROFILE="random-balanced"   # dns, quic-lite, video-call, mobile-low-mtu, random-balanced, custom
 export AWG_MTU="1320"                       # tested baseline; auto or 1280 fallback are also supported
-export AWG_ENDPOINT_PORT="51820"
+# AWG client endpoint is fixed at 443/udp.
 export AWG_DNS="1.1.1.1, 8.8.8.8"
 export AWG_ALLOWED_IPS="0.0.0.0/0, ::/0"
 export AWG_KEEPALIVE="25"
