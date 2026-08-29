@@ -58,12 +58,17 @@ done
 grep -Fq '# Protocol = AmneziaWG 3.1' <<<"${client_config}"
 grep -Fq 'MTU = 1320' <<<"${client_config}"
 grep -Fq 'Endpoint = awg31.example.test:443' <<<"${client_config}"
+grep -Fq 'DNS = 1.1.1.1' <<<"${client_config}"
+grep -Fq 'AllowedIPs = 0.0.0.0/0' <<<"${client_config}"
 # shellcheck disable=SC2016
 grep -Fq 'ListenPort = ${AWG_INTERNAL_LISTEN_PORT}' "${installer}"
 grep -Fq -- '--dst-type LOCAL -j REDIRECT --to-ports 51820' "${installer}"
 grep -Fq -- '--ctorigdstport 443 -j ACCEPT' "${installer}"
 grep -Fq 'AWG_ENDPOINT_PORT is fixed at 443/udp' "${installer}"
 [[ "$(grep -Fc -- '--set-mss 1150' "${installer}")" -eq 4 ]]
+[[ "$(grep -Fc -- '--to-destination 1.1.1.1:53' "${installer}")" -eq 4 ]]
+[[ "$(grep -Fc -- '--dport 443 -j REJECT --reject-with icmp-port-unreachable' "${installer}")" -eq 2 ]]
+grep -Fq 'AWG_ALLOWED_IPS:-0.0.0.0/0}' "${installer}"
 
 cat >"${tmp_dir}/before.rules" <<'EOF_RULES'
 *filter

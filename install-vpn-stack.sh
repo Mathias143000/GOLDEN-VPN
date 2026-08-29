@@ -2799,8 +2799,8 @@ generate_awg_tuning() {
   awg_port="${AWG_ENDPOINT_PORT:-${AWG_DEFAULT_PORT}}"
   validate_int_range AWG_ENDPOINT_PORT "${awg_port}" 1 65535
   [[ "${awg_port}" == "443" ]] || die "AWG_ENDPOINT_PORT is fixed at 443/udp in the Golden profile."
-  awg_dns="${AWG_DNS:-1.1.1.1, 8.8.8.8}"
-  awg_allowed_ips="${AWG_ALLOWED_IPS:-0.0.0.0/0, ::/0}"
+  awg_dns="${AWG_DNS:-1.1.1.1}"
+  awg_allowed_ips="${AWG_ALLOWED_IPS:-0.0.0.0/0}"
   awg_keepalive="${AWG_KEEPALIVE:-25}"
   validate_int_range AWG_KEEPALIVE "${awg_keepalive}" 0 65535
 
@@ -2891,7 +2891,7 @@ write_awg_client_config() {
 [Interface]
 PrivateKey = ${client_private}
 Address = ${client_ip}/32
-DNS = ${AWG_DNS:-1.1.1.1, 8.8.8.8}
+DNS = ${AWG_DNS:-1.1.1.1}
 MTU = ${AWG_MTU:-1320}
 Jc = ${AWG_JC}
 Jmin = ${AWG_JMIN}
@@ -2923,7 +2923,7 @@ DisableCookies = ${AWG_DISABLE_COOKIES}
 PublicKey = ${server_public}
 PresharedKey = ${psk}
 Endpoint = ${DOMAIN}:${AWG_ENDPOINT_PORT:-443}
-AllowedIPs = ${AWG_ALLOWED_IPS:-0.0.0.0/0, ::/0}
+AllowedIPs = ${AWG_ALLOWED_IPS:-0.0.0.0/0}
 PersistentKeepalive = ${AWG_KEEPALIVE:-25}
 EOF
   chmod 0600 "${out_file}"
@@ -3013,11 +3013,17 @@ PostUp = iptables -A FORWARD -i awg0 -j ACCEPT
 PostUp = iptables -A FORWARD -o awg0 -j ACCEPT
 PostUp = iptables -t mangle -A FORWARD -i awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1150
 PostUp = iptables -t mangle -A FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1150
+PostUp = iptables -t nat -A PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination 1.1.1.1:53
+PostUp = iptables -t nat -A PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination 1.1.1.1:53
+PostUp = iptables -I FORWARD 1 -i awg0 -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
 PostDown = iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o ${EXT_IFACE} -j MASQUERADE
 PostDown = iptables -D FORWARD -i awg0 -j ACCEPT
 PostDown = iptables -D FORWARD -o awg0 -j ACCEPT
 PostDown = iptables -t mangle -D FORWARD -i awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1150
 PostDown = iptables -t mangle -D FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1150
+PostDown = iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination 1.1.1.1:53
+PostDown = iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination 1.1.1.1:53
+PostDown = iptables -D FORWARD -i awg0 -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
 
 [Peer]
 PublicKey = ${client_public}
@@ -3648,8 +3654,8 @@ load_params() {
   # shellcheck disable=SC1090
   source "${PARAMS}"
   AWG_ENDPOINT_PORT="${AWG_ENDPOINT_PORT:-${DEFAULT_PORT}}"
-  AWG_DNS="${AWG_DNS:-1.1.1.1, 8.8.8.8}"
-  AWG_ALLOWED_IPS="${AWG_ALLOWED_IPS:-0.0.0.0/0, ::/0}"
+  AWG_DNS="${AWG_DNS:-1.1.1.1}"
+  AWG_ALLOWED_IPS="${AWG_ALLOWED_IPS:-0.0.0.0/0}"
   AWG_KEEPALIVE="${AWG_KEEPALIVE:-25}"
 }
 
@@ -4045,7 +4051,7 @@ if ! cat >"${out}" <<EOF_CLIENT
 [Interface]
 PrivateKey = ${client_private}
 Address = ${client_ip}/32
-DNS = ${AWG_DNS:-1.1.1.1, 8.8.8.8}
+DNS = ${AWG_DNS:-1.1.1.1}
 MTU = ${AWG_MTU:-1320}
 Jc = ${AWG_JC}
 Jmin = ${AWG_JMIN}
@@ -4077,7 +4083,7 @@ DisableCookies = ${AWG_DISABLE_COOKIES}
 PublicKey = ${server_public}
 PresharedKey = ${psk}
 Endpoint = ${domain}:${AWG_ENDPOINT_PORT:-443}
-AllowedIPs = ${AWG_ALLOWED_IPS:-0.0.0.0/0, ::/0}
+AllowedIPs = ${AWG_ALLOWED_IPS:-0.0.0.0/0}
 PersistentKeepalive = ${AWG_KEEPALIVE:-25}
 EOF_CLIENT
 then
@@ -8129,8 +8135,8 @@ write_awg_params_candidate() {
   endpoint_port="${endpoint##*:}"
   [[ "${listen_port}" =~ ^[0-9]+$ ]] || listen_port="${AWG_DEFAULT_PORT}"
   [[ "${endpoint_port}" =~ ^[0-9]+$ ]] || endpoint_port="${listen_port}"
-  [[ -n "${dns}" ]] || dns="1.1.1.1, 8.8.8.8"
-  [[ -n "${allowed}" ]] || allowed="0.0.0.0/0, ::/0"
+  [[ -n "${dns}" ]] || dns="1.1.1.1"
+  [[ -n "${allowed}" ]] || allowed="0.0.0.0/0"
   [[ "${keepalive}" =~ ^[0-9]+$ ]] || keepalive="25"
   {
     printf 'AWG_OBFS_PROFILE=%q\n' "custom"

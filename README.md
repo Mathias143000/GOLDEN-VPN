@@ -120,8 +120,8 @@ Optional tuning variables:
 export AWG_OBFS_PROFILE="random-balanced"   # dns, quic-lite, video-call, mobile-low-mtu, random-balanced, custom
 export AWG_MTU="1320"                       # tested baseline; auto or 1280 fallback are also supported
 # AWG client endpoint is fixed at 443/udp.
-export AWG_DNS="1.1.1.1, 8.8.8.8"
-export AWG_ALLOWED_IPS="0.0.0.0/0, ::/0"
+export AWG_DNS="1.1.1.1"
+export AWG_ALLOWED_IPS="0.0.0.0/0"
 export AWG_KEEPALIVE="25"
 # AWG 3.1 defaults already enable header protection, content padding,
 # timing ranges and random trailers. Advanced explicit overrides:
