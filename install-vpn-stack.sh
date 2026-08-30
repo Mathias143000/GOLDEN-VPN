@@ -54,6 +54,7 @@ AWG_INTERNAL_LISTEN_PORT=51820
 AWG_PROTOCOL_VERSION="3.1"
 AWG_TOOLS_SOURCE_TAG="v3.1.20260812"
 HYSTERIA_SALAMANDER_PORT=8443
+HYSTERIA_SALAMANDER_LISTEN="8443,20000-50000"
 HYSTERIA_PORT_MIN=20000
 HYSTERIA_PORT_MAX=59999
 BOOTSTRAP_MIN_FREE_MB=1024
@@ -2246,7 +2247,7 @@ hysteria_render_profile_config() {
   local profile="$1" output="$2" port obfs obfs_type
   case "${profile}" in
     salamander)
-      port="${HYSTERIA_SALAMANDER_PORT}"
+      port="${HYSTERIA_SALAMANDER_LISTEN}"
       obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
       ;;
     gecko)
@@ -2396,7 +2397,7 @@ write_hysteria_link() {
   obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
   label="$(label_name "HYSTERIA" "${name}")"
   tag="$(uri_encode "${label}")"
-  link="hysteria2://${name}:${password}@${domain}:8443?obfs=salamander&obfs-password=${obfs}&sni=${domain}#${tag}"
+  link="hysteria2://${name}:${password}@${domain}:${HYSTERIA_SALAMANDER_LISTEN}/?obfs=salamander&obfs-password=${obfs}&sni=${domain}#${tag}"
   install -d -m 0700 "${KEY_DIR}/hysteria"
   printf '%s\n' "${link}" >"${KEY_DIR}/hysteria/${label}.txt"
   chmod 0600 "${KEY_DIR}/hysteria/${label}.txt"
@@ -3379,7 +3380,7 @@ render_profile_config() {
   local profile="$1" output="$2" port obfs obfs_type
   case "${profile}" in
     salamander)
-      port=8443
+      port="8443,20000-50000"
       obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
       obfs_type=salamander
       ;;
@@ -3397,6 +3398,7 @@ render_profile_config() {
   esac
   {
     printf 'listen: :%s\n' "${port}"
+    printf 'quic:\n  disablePathMTUDiscovery: true\n'
     printf 'tls:\n'
     printf '  cert: /etc/letsencrypt/live/%s/fullchain.pem\n' "$(<"${STACK_DIR}/domain.txt")"
     printf '  key: /etc/letsencrypt/live/%s/privkey.pem\n' "$(<"${STACK_DIR}/domain.txt")"
@@ -3475,7 +3477,7 @@ case "${profile}" in
   salamander)
     obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
     tag="$(uri_encode "${label}")"
-    link="hysteria2://${name}:${password}@${domain}:8443?obfs=salamander&obfs-password=${obfs}&sni=${domain}#${tag}"
+    link="hysteria2://${name}:${password}@${domain}:8443,20000-50000/?obfs=salamander&obfs-password=${obfs}&sni=${domain}#${tag}"
     out="${KEY_DIR}/${label}.txt"
     printf '%s\n' "${link}" >"${out}"
     chmod 0600 "${out}"
@@ -4221,7 +4223,7 @@ render_hysteria_config() {
   local obfs profile port output obfs_type
   obfs="$(<"${STACK_DIR}/hysteria-obfs.txt")"
   {
-    printf 'listen: :8443\n'
+    printf 'listen: :8443,20000-50000\n'
     printf 'quic:\n'
     printf '  disablePathMTUDiscovery: true\n'
     printf 'tls:\n'
@@ -6423,14 +6425,14 @@ systemctl is-active --quiet hysteria2.service
 if [[ -f "${stack_dir}/hysteria-profiles/config-gecko.yaml" ]]; then systemctl is-active --quiet hysteria2-gecko.service; fi
 if [[ -f "${stack_dir}/hysteria-profiles/config-mimic.yaml" ]]; then systemctl is-active --quiet hysteria2-mimic.service; fi
 test -S /dev/shm/xray-trojan-xhttp.sock
-ss -H -lun | awk '$5 ~ /:8443$/ {found=1} END {exit found ? 0 : 1}'
+ss -H -lun | awk '$4 ~ /:8443$/ {found=1} END {exit found ? 0 : 1}'
 if [[ -s "${stack_dir}/hysteria-gecko-port.txt" ]]; then
   gecko_port="$(<"${stack_dir}/hysteria-gecko-port.txt")"
-  ss -H -lun | awk -v port=":${gecko_port}" '$5 ~ (port "$") {found=1} END {exit found ? 0 : 1}'
+  ss -H -lun | awk -v port=":${gecko_port}" '$4 ~ (port "$") {found=1} END {exit found ? 0 : 1}'
 fi
 if [[ -f "${stack_dir}/hysteria-profiles/config-mimic.yaml" ]]; then
   mimic_port="$(<"${stack_dir}/hysteria-mimic-port.txt")"
-  ss -H -lun | awk -v port=":${mimic_port}" '$5 ~ (port "$") {found=1} END {exit found ? 0 : 1}'
+  ss -H -lun | awk -v port=":${mimic_port}" '$4 ~ (port "$") {found=1} END {exit found ? 0 : 1}'
 fi
 
 trap - ERR
@@ -7420,11 +7422,11 @@ upgrade_hysteria_profiles() {
     systemctl restart hysteria2.service hysteria2-gecko.service
     systemctl is-active --quiet hysteria2.service
     systemctl is-active --quiet hysteria2-gecko.service
-    ss -H -lun | awk -v port=":${gecko_port}" '$5 ~ (port "$") {found=1} END {exit found ? 0 : 1}'
+    ss -H -lun | awk -v port=":${gecko_port}" '$4 ~ (port "$") {found=1} END {exit found ? 0 : 1}'
     if [[ -f "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml" ]]; then
       systemctl restart hysteria2-mimic.service
       systemctl is-active --quiet hysteria2-mimic.service
-      ss -H -lun | awk -v port=":${mimic_port}" '$5 ~ (port "$") {found=1} END {exit found ? 0 : 1}'
+      ss -H -lun | awk -v port=":${mimic_port}" '$4 ~ (port "$") {found=1} END {exit found ? 0 : 1}'
     fi
   ); then
     return 0

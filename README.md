@@ -5,7 +5,7 @@ Golden install script for a fresh Ubuntu/Debian VPS.
 It deploys:
 
 - primary: AmneziaWG 3.1 on `443/udp`
-- backup №2: Hysteria2 Salamander on `8443/udp`, plus Gecko and optional Linux-only Mimic profiles on persistent random per-server ports
+- backup №2: Hysteria2 Salamander with port hopping over `8443,20000-50000/udp`, plus Gecko and optional Linux-only Mimic profiles on persistent random per-server ports
 - TCP/TLS fallback: Trojan XHTTP TLS in `auto` mode on `443/tcp` behind nginx and the domain certificate
 - randomized static decoy HTTPS site on `https://DOMAIN/`
 - Grafana, Prometheus, and Node Exporter on localhost only

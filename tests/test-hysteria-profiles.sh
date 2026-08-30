@@ -24,9 +24,12 @@ printf '23456\n' >"${STACK_DIR}/hysteria-gecko-port.txt"
 printf '34567\n' >"${STACK_DIR}/hysteria-mimic-port.txt"
 cp "${STACK_DIR}/hysteria-clients.json" "${tmp_dir}/clients.before"
 
+hysteria_render_profile_config salamander "${HYSTERIA_DIR}/config.yaml"
 hysteria_render_profile_config gecko "${HYSTERIA_PROFILE_DIR}/config-gecko.yaml"
 hysteria_render_profile_config mimic "${HYSTERIA_PROFILE_DIR}/config-mimic.yaml"
 
+grep -Fq 'listen: :8443,20000-50000' "${HYSTERIA_DIR}/config.yaml"
+grep -Fq 'disablePathMTUDiscovery: true' "${HYSTERIA_DIR}/config.yaml"
 grep -Fq 'listen: :23456' "${HYSTERIA_PROFILE_DIR}/config-gecko.yaml"
 grep -Fq 'disablePathMTUDiscovery: true' "${HYSTERIA_PROFILE_DIR}/config-gecko.yaml"
 grep -Fq 'type: gecko' "${HYSTERIA_PROFILE_DIR}/config-gecko.yaml"
@@ -58,8 +61,11 @@ grep -Fq '.[$name]' "${helper}"
 grep -Fq '${label}-gecko.txt' "${helper}"
 # shellcheck disable=SC2016
 grep -Fq '${label}-mimic.yaml' "${helper}"
+grep -Fq 'port="8443,20000-50000"' "${helper}"
+grep -Fq 'disablePathMTUDiscovery: true' "${helper}"
 
 grep -Fq 'RuntimeDirectory=mimic' "${installer}"
 grep -Fq 'RuntimeDirectoryMode=0755' "${installer}"
+grep -Fq ':8443,20000-50000/?obfs=salamander' "${installer}"
 
 printf 'hysteria profile tests passed\n'
