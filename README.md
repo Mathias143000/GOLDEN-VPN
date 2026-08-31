@@ -2,6 +2,10 @@
 
 Golden install script for a fresh Ubuntu/Debian VPS.
 
+Resolved installation and production incidents are collected in
+[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md). It separates installer fixes,
+server operations, and client-side failures such as leaked DNS.
+
 It deploys:
 
 - primary: AmneziaWG 3.1 on `443/udp`
@@ -118,7 +122,7 @@ Optional tuning variables:
 
 ```bash
 export AWG_OBFS_PROFILE="random-balanced"   # dns, quic-lite, video-call, mobile-low-mtu, random-balanced, custom
-export AWG_MTU="1320"                       # tested baseline; auto or 1280 fallback are also supported
+export AWG_MTU="1420"                       # standard maximum; auto or 1280 fallback are also supported
 # AWG client endpoint is fixed at 443/udp.
 export AWG_DNS="1.1.1.1"
 export AWG_ALLOWED_IPS="0.0.0.0/0"
@@ -247,6 +251,26 @@ Running a second profile command for an existing Hysteria name reuses the existi
 /root/vpn-keys/hysteria/HYSTERIA-<LOCATION>-<name>-mimic.yaml
 ```
 
+Each URI-based Trojan or Hysteria profile gets a Hiddify/Sing-box JSON without changing its credential:
+
+```text
+/root/vpn-keys/hiddify-json/trojan/<label>.json
+/root/vpn-keys/hiddify-json/hysteria/<label>.json
+```
+
+The JSON contains an explicit encrypted-DNS policy: Cloudflare DoH through the selected proxy, DNS interception, and no plaintext fallback. AmneziaWG stays in its native `.conf` format because its DNS is already embedded in that profile and automatically carried inside the encrypted tunnel.
+
+When `vpn-trojan` or a URI-based `vpn-hysteria` profile finishes, it prints the Hiddify JSON in the terminal as well as the ordinary link and QR code. The JSON is saved with mode `0600`. Mimic remains a native Linux YAML profile and does not produce a JSON sidecar.
+
+The same URI-based profiles also get a complete Hiddify/Sing-box configuration:
+
+```text
+/root/vpn-keys/hiddify-json/trojan/<label>.json
+/root/vpn-keys/hiddify-json/hysteria/<label>.json
+```
+
+Import the matching JSON file as a local configuration in Hiddify. It includes a TUN inbound, DNS interception, Cloudflare DoH through the selected proxy, and direct DNS only for bootstrapping the VPN endpoint. Trojan XHTTP is emitted with explicit `mode: stream-one`; Hysteria2 keeps its username/password, obfuscation, and server port range. Existing credentials are never rotated during conversion. AmneziaWG is not converted because Hiddify does not consume the native AWG 3.1 fields through a Sing-box profile.
+
 Create one Hiddify-style static subscription bundle:
 
 ```bash
@@ -254,7 +278,7 @@ vpn-sub create phone1
 vpn-sub show phone1
 ```
 
-The subscription helper creates linked Trojan, Hysteria2, and AmneziaWG credentials. It prints a terminal QR code and a private import URL:
+The subscription helper creates linked Trojan, Hysteria2, and AmneziaWG credentials. It prints a terminal QR code and a private import URL. The Hiddify JSON bundle is available separately:
 
 ```text
 https://DOMAIN/s/<token>
@@ -265,6 +289,7 @@ Subscription URL shape:
 ```text
 Browser portal:  https://DOMAIN/s/<token>
 Client import:   https://DOMAIN/s/<token>
+Hiddify JSON:    https://DOMAIN/s/<token>/hiddify.json
 Plain payload:   https://DOMAIN/s/<token>/sub.txt
 Base64 payload:  https://DOMAIN/s/<token>/sub.base64
 AWG download:    https://DOMAIN/s/<token>/awg.conf
@@ -485,7 +510,7 @@ Captures are saved under:
 /var/log/vpn-stack/awg-captures/
 ```
 
-Golden installs AmneziaWG 3.1 and refuses to continue if the installed tools or kernel module reject the 3.1 runtime fields. Header protection, content padding, timing ranges and random trailers are enabled; cookie replies remain enabled for denial-of-service resistance. `J/S/H/I1-I5` values are randomized from the selected profile. Supported profiles are `dns`, `quic-lite`, `video-call`, `mobile-low-mtu`, `random-balanced`, and `custom`; default is `random-balanced`. The installer writes `/opt/vpn-stack/awg-params.env` and `/opt/vpn-stack/awg-tuning-report.json`. Default MTU is `1320`; `AWG_MTU=auto` performs a server-side PMTU probe with fallback to `1280`, and an explicit value may be set from `1200..1420`. Tcpdump is never run automatically.
+Golden installs AmneziaWG 3.1 and refuses to continue if the installed tools or kernel module reject the 3.1 runtime fields. Header protection, content padding, timing ranges and random trailers are enabled; cookie replies remain enabled for denial-of-service resistance. `J/S/H/I1-I5` values are randomized from the selected profile. Supported profiles are `dns`, `quic-lite`, `video-call`, `mobile-low-mtu`, `random-balanced`, and `custom`; default is `random-balanced`. The installer writes `/opt/vpn-stack/awg-params.env` and `/opt/vpn-stack/awg-tuning-report.json`. Default MTU is the standard maximum `1420`; `AWG_MTU=auto` performs a server-side PMTU probe with fallback to `1280`, and an explicit value may be set from `1200..1420`. Tcpdump is never run automatically.
 
 ## Protocol engine updates
 
@@ -611,13 +636,13 @@ Keep VLESS active through the migration grace period. Removing the legacy inboun
 
 ## Same-key AWG MTU and full-tuning migration
 
-To normalize an existing Golden AWG contour without rotating any key, first prepare a root-only candidate bundle. The tested mobile baseline is `1320`:
+To normalize an existing Golden AWG contour without rotating any key, first prepare a root-only candidate bundle. The standard maximum is `1420`:
 
 ```bash
-./install-vpn-stack.sh migrate-awg-mtu-prepare 1320
+./install-vpn-stack.sh migrate-awg-mtu-prepare 1420
 ```
 
-Preparation leaves live AWG untouched. It copies the exact preimage, reads the server's existing `Jc/Jmin/Jmax`, `S1-S4`, `H1-H4`, and `I1-I5`, writes MTU `1320` into candidate server/client configs, and synchronizes any missing full AWG 2.0 tuning fields into saved client configs. A normalized identity manifest proves that private keys, public keys, preshared keys, addresses, peers, endpoints, allowed IPs, and other non-tuning material did not change.
+Preparation leaves live AWG untouched. It copies the exact preimage, reads the server's existing `Jc/Jmin/Jmax`, `S1-S4`, `H1-H4`, and `I1-I5`, writes MTU `1420` into candidate server/client configs, and synchronizes any missing full AWG tuning fields into saved client configs. A normalized identity manifest proves that private keys, public keys, preshared keys, addresses, peers, endpoints, allowed IPs, and other non-tuning material did not change.
 
 After provider snapshot and bundle review:
 

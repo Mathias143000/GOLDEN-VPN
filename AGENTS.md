@@ -43,6 +43,7 @@ Upgrade invariant: existing Xray clients, Hysteria users, AWG peers, client file
 Hysteria profiles: Salamander default plus Gecko and optional Linux-only Mimic on persistent random per-server ports
 Hysteria profile issuance: existing usernames/passwords are reused; issuing Gecko/Mimic never rotates the Salamander credential
 Mimic lifecycle: explicit install/upgrade only; no unattended kernel-module package update
+Hiddify profiles: every URI-based Trojan/Hysteria key gets an importable Sing-box JSON with DNS hijack and DoH through the selected tunnel; subscriptions expose `/hiddify.json`; existing credentials remain unchanged
 ```
 
 ### 0.0.1 Two-stage installer flow
@@ -106,6 +107,7 @@ URL model:
 ```text
 Browser portal: https://DOMAIN/s/<token>
 Client import URL: https://DOMAIN/s/<token>
+Hiddify JSON profile: https://DOMAIN/s/<token>/hiddify.json
 Plain subscription payload: https://DOMAIN/s/<token>/sub.txt
 Base64 subscription payload: https://DOMAIN/s/<token>/sub.base64
 AmneziaWG download: https://DOMAIN/s/<token>/awg.conf
@@ -116,6 +118,7 @@ Subscription payload v1:
 
 ```text
 sub.txt contains trojan:// and hysteria2:// links
+hiddify.json contains a selector with Hysteria2 as default and Trojan XHTTP as fallback
 sub.base64 contains a base64 encoded version of sub.txt
 index.html is a clean static portal with copy/download links
 awg.conf is downloadable separately because many clients do not reliably import AWG from mixed subscription payloads
@@ -243,7 +246,7 @@ QR-коды в helper-командах
 ASCII-валидация EMAIL
 ZeroSSL primary + fallback CA через DNS-01
 AWG_OBFS_PROFILE=dns|quic-lite
-AWG_MTU по умолчанию 1280, допустимо 1200..1420
+AWG_MTU по умолчанию 1420, допустимо 1200..1420; auto использует 1280 только как fallback
 ручные AWG diagnostics: vpn-awg analyze, vpn-awg capture
 рандомный decoy site без внешних CDN/JS/forms/backend
 ```
@@ -367,7 +370,7 @@ AWG_ENDPOINT_PORT
 MTU надо улучшить:
 
 ```text
-текущий default 1280 оставить безопасным fallback
+оставить 1280 безопасным fallback для auto-MTU при недоступном ICMP
 добавить AWG_MTU=auto
 при auto сделать PMTU probe через ping -M do -s ...
 проверять несколько targets: 1.1.1.1, 8.8.8.8, DOMAIN

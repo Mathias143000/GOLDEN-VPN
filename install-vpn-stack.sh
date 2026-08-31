@@ -8,7 +8,7 @@ export APT_LISTCHANGES_FRONTEND="${APT_LISTCHANGES_FRONTEND:-none}"
 
 : "${APT_LOCK_TIMEOUT:=1800}"
 
-GOLDEN_VPN_VERSION="2026.08.29-awg443"
+GOLDEN_VPN_VERSION="2026.08.31-hiddify-json"
 
 STACK_DIR="/opt/vpn-stack"
 KEY_DIR="/root/vpn-keys"
@@ -21,6 +21,7 @@ SUBSCRIPTION_DIR="${STACK_DIR}/subscriptions"
 SUBSCRIPTION_WEB_DIR="/var/www/subscriptions"
 TROJAN_XHTTP_SOCKET="/dev/shm/xray-trojan-xhttp.sock"
 TROJAN_HELPER_PATH="/usr/local/bin/vpn-trojan"
+HIDDIFY_PROFILE_HELPER_PATH="/usr/local/bin/vpn-hiddify-profile"
 RESUME_INSTALL_DIR="/root/vpn-stack-resume"
 RESUME_INSTALL_SCRIPT="${RESUME_INSTALL_DIR}/install-vpn-stack.sh"
 RESUME_INSTALL_ENV_DIR="/etc/golden-vpn-installer"
@@ -507,7 +508,7 @@ prompt_advanced_tuning() {
   prompt_yes_no_default_no "Advanced tuning?" || return 0
 
   prompt_optional_var AWG_OBFS_PROFILE "AWG_OBFS_PROFILE" "${AWG_OBFS_PROFILE:-random-balanced}"
-  prompt_optional_var AWG_MTU "AWG_MTU" "${AWG_MTU:-1320}"
+  prompt_optional_var AWG_MTU "AWG_MTU" "${AWG_MTU:-1420}"
   prompt_optional_var DECOY_PROFILE "DECOY_PROFILE" "${DECOY_PROFILE:-random}"
   prompt_optional_var DECOY_SEED "DECOY_SEED" "${DECOY_SEED:-}"
 }
@@ -1392,6 +1393,28 @@ ensure_zerossl_account() {
     --eab-hmac-key "${ZEROSSL_EAB_HMAC_KEY}"
 }
 
+issue_acme_certificate_with_retries() {
+  local server="$1"
+  shift
+  local max_attempts="${VPN_STACK_ACME_ISSUE_ATTEMPTS:-3}"
+  local retry_delay="${VPN_STACK_ACME_RETRY_DELAY:-15}"
+  local attempt
+  local -a acme=("$@")
+
+  [[ "${max_attempts}" =~ ^[1-9][0-9]*$ ]] || die "VPN_STACK_ACME_ISSUE_ATTEMPTS must be a positive integer."
+  [[ "${retry_delay}" =~ ^[0-9]+$ ]] || die "VPN_STACK_ACME_RETRY_DELAY must be a non-negative integer."
+
+  for ((attempt=1; attempt<=max_attempts; attempt++)); do
+    if "${acme[@]}" --issue --dns dns_cf -d "${DOMAIN}" --keylength ec-256 --server "${server}"; then
+      return 0
+    fi
+    ((attempt < max_attempts)) || break
+    warn "Certificate issuance/download through ${server} failed (attempt ${attempt}/${max_attempts}); retrying the saved ACME order in ${retry_delay}s."
+    sleep "${retry_delay}"
+  done
+  return 1
+}
+
 install_acme_certificate() {
   log "Issuing ZeroSSL certificate with acme.sh DNS-01."
   local acme_server="zerossl"
@@ -1435,7 +1458,7 @@ install_acme_certificate() {
     "${acme[@]}" --register-account -m "${EMAIL}" --server letsencrypt || true
   fi
 
-  if ! "${acme[@]}" --issue --dns dns_cf -d "${DOMAIN}" --keylength ec-256 --server "${acme_server}"; then
+  if ! issue_acme_certificate_with_retries "${acme_server}" "${acme[@]}"; then
     if [[ "${acme_server}" != "zerossl" || "${VPN_STACK_DISABLE_LE_FALLBACK:-0}" == "1" ]]; then
       die "Certificate issuance through ${acme_server} failed."
     fi
@@ -1445,7 +1468,7 @@ install_acme_certificate() {
     "${acme[@]}" --set-default-ca --server letsencrypt
     "${acme[@]}" --register-account -m "${EMAIL}" --server letsencrypt \
       || warn "Explicit Let's Encrypt account registration failed; acme.sh will retry it during issuance."
-    "${acme[@]}" --issue --dns dns_cf -d "${DOMAIN}" --keylength ec-256 --server letsencrypt \
+    issue_acme_certificate_with_retries letsencrypt "${acme[@]}" \
       || die "Certificate issuance failed through both ZeroSSL and Let's Encrypt."
   fi
   "${acme[@]}" --install-cert -d "${DOMAIN}" --ecc \
@@ -2782,8 +2805,8 @@ generate_awg_tuning() {
       awg_mtu="1240"
       mtu_source="profile"
     else
-      awg_mtu="1320"
-      mtu_source="tested-baseline"
+      awg_mtu="1420"
+      mtu_source="standard-maximum"
     fi
   elif [[ "${awg_mtu_requested}" == "auto" ]]; then
     awg_mtu="$(detect_awg_auto_mtu)"
@@ -2888,12 +2911,12 @@ write_awg_client_config() {
 # Protocol = AmneziaWG ${AWG_PROTOCOL_VERSION:-3.1}
 # ObfuscationProfile = ${AWG_OBFS_PROFILE:-unknown}
 # EffectiveProfile = ${AWG_EFFECTIVE_PROFILE:-unknown}
-# MTU = ${AWG_MTU:-1320}
+# MTU = ${AWG_MTU:-1420}
 [Interface]
 PrivateKey = ${client_private}
 Address = ${client_ip}/32
 DNS = ${AWG_DNS:-1.1.1.1}
-MTU = ${AWG_MTU:-1320}
+MTU = ${AWG_MTU:-1420}
 Jc = ${AWG_JC}
 Jmin = ${AWG_JMIN}
 Jmax = ${AWG_JMAX}
@@ -3114,6 +3137,22 @@ EOF
   sysctl --system >/dev/null || true
 }
 
+configure_udp_buffers() {
+  local sysctl_file="${VPN_UDP_BUFFER_SYSCTL_FILE:-/etc/sysctl.d/97-golden-vpn-udp-buffers.conf}"
+  local sysctl_bin="${VPN_SYSCTL_BIN:-sysctl}"
+  install -d -m 0755 "$(dirname "${sysctl_file}")"
+  cat >"${sysctl_file}" <<'EOF'
+# Golden VPN high-throughput UDP socket limits.
+net.core.rmem_default = 4194304
+net.core.rmem_max = 16777216
+net.core.wmem_default = 4194304
+net.core.wmem_max = 16777216
+net.core.netdev_max_backlog = 4096
+EOF
+  chmod 0644 "${sysctl_file}"
+  "${sysctl_bin}" -p "${sysctl_file}" >/dev/null
+}
+
 swap_report_label() {
   if [[ "${SWAP_RESULT}" != "not checked" ]]; then
     printf '%s' "${SWAP_RESULT}"
@@ -3206,6 +3245,286 @@ configure_firewall() {
   activate_awg_udp443_gateway
 }
 
+install_helper_hiddify_profile() {
+  cat >"${HIDDIFY_PROFILE_HELPER_PATH}" <<'PY'
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import tempfile
+from urllib.parse import parse_qs, unquote, urlsplit
+
+OUTPUT_ROOT = Path("/root/vpn-keys/hiddify-json")
+DOH_IP = os.environ.get("GOLDEN_DOH_IP", "1.1.1.1")
+DOH_HOST = os.environ.get("GOLDEN_DOH_HOST", "cloudflare-dns.com")
+SAFE_LABEL = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def atomic_write(path, value):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            fd = -1
+            handle.write(value)
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def read_uri(source):
+    uri = source.resolve().read_text(encoding="utf-8").strip()
+    if not uri or "\n" in uri or "\r" in uri:
+        raise ValueError(f"expected exactly one URI in {source}")
+    return uri
+
+
+def split_authority(uri):
+    parsed = urlsplit(uri)
+    if "@" not in parsed.netloc:
+        raise ValueError("URI has no credentials")
+    userinfo, endpoint = parsed.netloc.rsplit("@", 1)
+    if endpoint.startswith("["):
+        closing = endpoint.find("]")
+        if closing < 0:
+            raise ValueError("invalid IPv6 endpoint")
+        host = endpoint[1:closing]
+        port_text = endpoint[closing + 1 :].lstrip(":")
+    else:
+        host, separator, port_text = endpoint.rpartition(":")
+        if not separator:
+            host, port_text = endpoint, ""
+    if not host:
+        raise ValueError("URI has no server")
+    return parsed, unquote(userinfo), host, port_text
+
+
+def query_value(query, name, default=""):
+    values = parse_qs(query, keep_blank_values=True).get(name)
+    return unquote(values[0]) if values else default
+
+
+def tls(server_name, alpn=None):
+    result = {
+        "enabled": True,
+        "server_name": server_name,
+        "insecure": False,
+    }
+    if alpn:
+        result["alpn"] = alpn
+    return result
+
+
+def trojan_outbound(uri, tag="proxy"):
+    parsed, password, server, port_text = split_authority(uri)
+    if parsed.scheme.lower() != "trojan":
+        raise ValueError("expected a Trojan URI")
+    port = int(port_text or "443")
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if query_value(parsed.query, "type", "") != "xhttp":
+        raise ValueError("only Trojan XHTTP profiles are supported")
+    server_name = query_value(parsed.query, "sni", server)
+    host = query_value(parsed.query, "host", server_name)
+    path = query_value(parsed.query, "path", "/")
+    return {
+        "type": "trojan",
+        "tag": tag,
+        "server": server,
+        "server_port": port,
+        "password": password,
+        "tls": {
+            **tls(server_name, ["h2"]),
+            "utls": {"enabled": True, "fingerprint": "chrome"},
+        },
+        "transport": {
+            "type": "xhttp",
+            "host": host,
+            "path": path,
+            "mode": "stream-one",
+        },
+    }
+
+
+def hysteria_outbound(uri, tag="proxy"):
+    parsed, credential, server, port_text = split_authority(uri)
+    if parsed.scheme.lower() not in {"hysteria2", "hy2"}:
+        raise ValueError("expected a Hysteria2 URI")
+    ports = []
+    for item in (port_text or "443").split(","):
+        item = item.strip().replace("-", ":")
+        if not re.fullmatch(r"[0-9]+(?::[0-9]+)?", item):
+            raise ValueError(f"invalid Hysteria2 port or range: {item}")
+        if ":" not in item:
+            item = f"{item}:{item}"
+        ports.append(item)
+    obfs_type = query_value(parsed.query, "obfs", "")
+    obfs_password = query_value(parsed.query, "obfs-password", "")
+    if obfs_type == "gecko":
+        raise ValueError("Hiddify core does not support Hysteria2 Gecko profiles")
+    server_name = query_value(parsed.query, "sni", server)
+    outbound = {
+        "type": "hysteria2",
+        "tag": tag,
+        "server": server,
+        "server_ports": ports,
+        "password": credential,
+        "tls": tls(server_name),
+    }
+    if obfs_type:
+        if obfs_type not in {"salamander", "gecko"}:
+            raise ValueError(f"unsupported Hysteria2 obfuscation: {obfs_type}")
+        outbound["obfs"] = {"type": obfs_type, "password": obfs_password}
+    return outbound
+
+
+def protocol_for(uri):
+    scheme = urlsplit(uri).scheme.lower()
+    if scheme == "trojan":
+        return "trojan"
+    if scheme in {"hysteria2", "hy2"}:
+        return "hysteria"
+    raise ValueError(f"unsupported key URI scheme: {scheme or 'missing'}")
+
+
+def dns_config(proxy_tag="proxy"):
+    return {
+        "servers": [
+            {
+                "type": "https",
+                "tag": "dns-remote",
+                "server": DOH_IP,
+                "server_port": 443,
+                "path": "/dns-query",
+                "detour": proxy_tag,
+                "tls": {"enabled": True, "server_name": DOH_HOST},
+            },
+            {
+                "type": "udp",
+                "tag": "dns-bootstrap",
+                "server": DOH_IP,
+                "server_port": 53,
+                "detour": "direct",
+            },
+        ],
+        "final": "dns-remote",
+        "strategy": "ipv4_only",
+        "independent_cache": True,
+    }
+
+
+def base_config(outbounds, final_tag="proxy"):
+    return {
+        "log": {"level": "warn", "timestamp": True},
+        "dns": dns_config(final_tag),
+        "inbounds": [
+            {
+                "type": "tun",
+                "tag": "tun-in",
+                "address": ["172.19.0.1/30"],
+                "auto_route": True,
+                "strict_route": True,
+                "stack": "mixed",
+            }
+        ],
+        "outbounds": outbounds + [{"type": "direct", "tag": "direct"}],
+        "route": {
+            "rules": [
+                {"action": "sniff"},
+                {"protocol": "dns", "action": "hijack-dns"},
+            ],
+            "final": final_tag,
+            "default_domain_resolver": "dns-bootstrap",
+        },
+    }
+
+
+def render_single(uri):
+    protocol = protocol_for(uri)
+    outbound = trojan_outbound(uri) if protocol == "trojan" else hysteria_outbound(uri)
+    return protocol, base_config([outbound])
+
+
+def wrap(source, output_dir=None):
+    label = source.stem
+    if not SAFE_LABEL.fullmatch(label):
+        raise ValueError(f"unsafe profile label: {label}")
+    uri = read_uri(source)
+    protocol, config = render_single(uri)
+    target_dir = Path(output_dir).resolve() if output_dir else OUTPUT_ROOT / protocol
+    output = target_dir / f"{label}.json"
+    atomic_write(output, json.dumps(config, ensure_ascii=False, indent=2) + "\n")
+    return output
+
+
+def bundle(trojan_source, hysteria_source, output):
+    trojan_uri = read_uri(trojan_source)
+    hysteria_uri = read_uri(hysteria_source)
+    selector = {
+        "type": "selector",
+        "tag": "proxy",
+        "outbounds": ["hysteria2", "trojan"],
+        "default": "hysteria2",
+    }
+    config = base_config([
+        selector,
+        hysteria_outbound(hysteria_uri, "hysteria2"),
+        trojan_outbound(trojan_uri, "trojan"),
+    ])
+    atomic_write(output.resolve(), json.dumps(config, ensure_ascii=False, indent=2) + "\n")
+    return output
+
+
+def iter_inputs(directory):
+    yield from sorted(Path(directory).glob("*.txt"))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Create Hiddify-compatible Sing-box JSON profiles")
+    commands = parser.add_subparsers(dest="command", required=True)
+    wrap_parser = commands.add_parser("wrap")
+    wrap_parser.add_argument("input")
+    wrap_parser.add_argument("--output-dir")
+    bulk_parser = commands.add_parser("bulk")
+    bulk_parser.add_argument("input_dir")
+    bulk_parser.add_argument("--output-dir")
+    bundle_parser = commands.add_parser("bundle")
+    bundle_parser.add_argument("trojan_input")
+    bundle_parser.add_argument("hysteria_input")
+    bundle_parser.add_argument("--output", required=True)
+    args = parser.parse_args()
+
+    if args.command == "wrap":
+        print(wrap(Path(args.input), args.output_dir))
+        return
+    if args.command == "bundle":
+        print(bundle(Path(args.trojan_input), Path(args.hysteria_input), Path(args.output)))
+        return
+    count = 0
+    for source in iter_inputs(args.input_dir):
+        try:
+            wrap(source, args.output_dir)
+        except ValueError:
+            continue
+        count += 1
+    print(f"wrapped={count}")
+
+
+if __name__ == "__main__":
+    main()
+PY
+  chmod 0755 "${HIDDIFY_PROFILE_HELPER_PATH}"
+}
+
 install_helper_trojan() {
   install -d -m 0755 "$(dirname "${TROJAN_HELPER_PATH}")"
   cat >"${TROJAN_HELPER_PATH}" <<'EOF'
@@ -3237,6 +3556,18 @@ print_qr() {
   else
     echo "QR code skipped: qrencode is not installed." >&2
   fi
+}
+
+print_encrypted_dns_json() {
+  local source="$1" protocol_dir="$2" stem hiddify_profile
+  /usr/local/bin/vpn-hiddify-profile wrap "${source}" >/dev/null
+  stem="$(basename "${source%.txt}")"
+  hiddify_profile="/root/vpn-keys/hiddify-json/${protocol_dir}/${stem}.json"
+  [[ -s "${hiddify_profile}" ]] || die "Hiddify JSON was not generated: ${hiddify_profile}"
+  printf '\nHiddify Sing-box JSON (DoH through tunnel):\n'
+  cat "${hiddify_profile}"
+  printf '\nSaved Hiddify JSON: %s\n' "${hiddify_profile}"
+  printf 'Hiddify: import this JSON file as a local configuration; do not paste the raw URI instead.\n'
 }
 
 
@@ -3306,6 +3637,7 @@ link="trojan://${password}@${domain}:443?security=tls&type=xhttp&path=${encoded_
 install -d -m 0700 "${KEY_DIR}"
 printf '%s\n' "${link}" >"${KEY_DIR}/${label}.txt"
 chmod 0600 "${KEY_DIR}/${label}.txt"
+print_encrypted_dns_json "${KEY_DIR}/${label}.txt" trojan
 printf 'Client: %s\n' "${label}"
 print_qr "${link}"
 printf 'Link:\n%s\n' "${link}"
@@ -3354,6 +3686,18 @@ print_qr() {
   else
     echo "QR code skipped: qrencode is not installed." >&2
   fi
+}
+
+print_encrypted_dns_json() {
+  local source="$1" protocol_dir="$2" stem hiddify_profile
+  /usr/local/bin/vpn-hiddify-profile wrap "${source}" >/dev/null
+  stem="$(basename "${source%.txt}")"
+  hiddify_profile="/root/vpn-keys/hiddify-json/${protocol_dir}/${stem}.json"
+  [[ -s "${hiddify_profile}" ]] || die "Hiddify JSON was not generated: ${hiddify_profile}"
+  printf '\nHiddify Sing-box JSON (DoH through tunnel):\n'
+  cat "${hiddify_profile}"
+  printf '\nSaved Hiddify JSON: %s\n' "${hiddify_profile}"
+  printf 'Hiddify: import this JSON file as a local configuration; do not paste the raw URI instead.\n'
 }
 
 
@@ -3481,6 +3825,7 @@ case "${profile}" in
     out="${KEY_DIR}/${label}.txt"
     printf '%s\n' "${link}" >"${out}"
     chmod 0600 "${out}"
+    print_encrypted_dns_json "${out}" hysteria
     print_qr "${link}"
     printf 'Link:\n%s\n' "${link}"
     ;;
@@ -3492,6 +3837,7 @@ case "${profile}" in
     out="${KEY_DIR}/${label}-gecko.txt"
     printf '%s\n' "${link}" >"${out}"
     chmod 0600 "${out}"
+    print_encrypted_dns_json "${out}" hysteria
     print_qr "${link}"
     printf 'Link:\n%s\n' "${link}"
     ;;
@@ -3655,10 +4001,55 @@ load_params() {
   [[ -f "${PARAMS}" ]] || die "Missing ${PARAMS}"
   # shellcheck disable=SC1090
   source "${PARAMS}"
+  recover_param_from_server AWG_HEADER_PROTECTION_KEY HeaderProtectionKey
+  recover_param_from_server AWG_CONTENT_PADDING_ADDITION ContentPaddingAddition
+  recover_param_from_server AWG_REKEY_AFTER_TIME RekeyAfterTime
+  recover_param_from_server AWG_REKEY_TIMEOUT RekeyTimeout
+  recover_param_from_server AWG_REJECT_AFTER_TIME RejectAfterTime
+  recover_param_from_server AWG_KEEPALIVE_TIMEOUT KeepaliveTimeout
+  recover_param_from_server AWG_MAX_HANDSHAKE_ATTEMPTS MaxHandshakeAttempts
+  recover_param_from_server AWG_RANDOM_TRAILERS RandomTrailers
+  recover_param_from_server AWG_DISABLE_COOKIES DisableCookies
   AWG_ENDPOINT_PORT="${AWG_ENDPOINT_PORT:-${DEFAULT_PORT}}"
   AWG_DNS="${AWG_DNS:-1.1.1.1}"
   AWG_ALLOWED_IPS="${AWG_ALLOWED_IPS:-0.0.0.0/0}"
   AWG_KEEPALIVE="${AWG_KEEPALIVE:-25}"
+}
+
+config_interface_value() {
+  local wanted="$1"
+  awk -F= -v wanted="${wanted}" '
+    BEGIN { in_interface=0 }
+    /^[[:space:]]*\[Interface\][[:space:]]*$/ { in_interface=1; next }
+    /^[[:space:]]*\[/ { if (in_interface) exit; next }
+    in_interface {
+      key=$1
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      if (tolower(key) == tolower(wanted)) {
+        value=substr($0, index($0, "=") + 1)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+        print value
+        exit
+      }
+    }
+  ' "${CONFIG}"
+}
+
+recover_param_from_server() {
+  local variable="$1" config_key="$2" value
+  [[ -n "${!variable:-}" ]] && return 0
+  value="$(config_interface_value "${config_key}")"
+  [[ -n "${value}" ]] \
+    || die "Missing ${variable} in ${PARAMS} and ${config_key} in the live AWG config."
+  printf -v "${variable}" '%s' "${value}"
+}
+
+archive_empty_client_file() {
+  local path="$1" failed_dir
+  [[ -f "${path}" && ! -s "${path}" ]] || return 0
+  failed_dir="${KEY_DIR}/.failed"
+  install -d -m 0700 "${failed_dir}"
+  mv -- "${path}" "${failed_dir}/$(basename "${path}").empty.$(date -u +%Y%m%dT%H%M%SZ)"
 }
 
 show_usage() {
@@ -4000,12 +4391,12 @@ name="$1"
 [[ -f "${CONFIG}" ]] || die "Missing ${CONFIG}"
 load_params
 label="$(label_name "AWG" "${name}")"
+archive_empty_client_file "${KEY_DIR}/${label}.conf"
+archive_empty_client_file "${KEY_DIR}/${name}.conf"
 if [[ -f "${KEY_DIR}/${label}.conf" || -f "${KEY_DIR}/${name}.conf" ]]; then
   die "Client config already exists for: ${label}"
 fi
 
-# shellcheck disable=SC1091
-source "${STACK_DIR}/awg-params.env"
 domain="$(<"${STACK_DIR}/domain.txt")"
 server_public="$(<"${STACK_DIR}/awg-server-public-key.txt")"
 client_ip="$(next_ip)" || die "No free IP left in 10.66.66.0/24."
@@ -4049,12 +4440,12 @@ if ! cat >"${out}" <<EOF_CLIENT
 # Protocol = AmneziaWG ${AWG_PROTOCOL_VERSION:-3.1}
 # ObfuscationProfile = ${AWG_OBFS_PROFILE:-unknown}
 # EffectiveProfile = ${AWG_EFFECTIVE_PROFILE:-unknown}
-# MTU = ${AWG_MTU:-1320}
+# MTU = ${AWG_MTU:-1420}
 [Interface]
 PrivateKey = ${client_private}
 Address = ${client_ip}/32
 DNS = ${AWG_DNS:-1.1.1.1}
-MTU = ${AWG_MTU:-1320}
+MTU = ${AWG_MTU:-1420}
 Jc = ${AWG_JC}
 Jmin = ${AWG_JMIN}
 Jmax = ${AWG_JMAX}
@@ -4091,6 +4482,7 @@ EOF_CLIENT
 then
   remove_runtime_peer "${client_public}"
   drop_peer_from_config_by_public "${client_public}" || true
+  archive_empty_client_file "${out}"
   storage_hint "${KEY_DIR}"
   die "Could not write ${out}; AWG peer was rolled back."
 fi
@@ -4271,7 +4663,8 @@ render_hysteria_config() {
 }
 
 write_portal_files() {
-  local name="$1" token="$2" trojan_link="$3" hysteria_link="$4" awg_file="$5"
+  local name="$1" token="$2" trojan_file="$3" hysteria_file="$4" awg_file="$5"
+  local trojan_link hysteria_link
   local pubdir base domain label safe_name safe_label
   domain="$(domain_name)"
   label="$(label_name "SUB" "${name}")"
@@ -4279,6 +4672,8 @@ write_portal_files() {
   safe_label="$(html_escape "${label}")"
   base="https://${domain}/s/${token}"
   pubdir="${WEB_ROOT}/${token}"
+  trojan_link="$(<"${trojan_file}")"
+  hysteria_link="$(<"${hysteria_file}")"
 
   install -d -m 0755 "${WEB_ROOT}"
   install -d -m 0750 "${pubdir}"
@@ -4287,6 +4682,8 @@ write_portal_files() {
     printf '%s\n' "${hysteria_link}"
   } >"${pubdir}/sub.txt"
   b64_nowrap <"${pubdir}/sub.txt" >"${pubdir}/sub.base64"
+  /usr/local/bin/vpn-hiddify-profile bundle "${trojan_file}" "${hysteria_file}" \
+    --output "${pubdir}/hiddify.json" >/dev/null
   cp "${awg_file}" "${pubdir}/awg.conf"
 
   cat >"${pubdir}/index.html" <<HTML
@@ -4321,6 +4718,7 @@ write_portal_files() {
       <code>${base}</code>
     </div>
     <div class="panel grid">
+      <a href="${base}/hiddify.json"><strong>Hiddify JSON</strong>Importable Sing-box profile with DoH through the tunnel</a>
       <a href="${base}/sub.txt"><strong>Client subscription</strong>Trojan TLS and Hysteria2 links</a>
       <a href="${base}/sub.base64"><strong>Base64 subscription</strong>Encoded subscription payload</a>
       <a href="${base}/awg.conf"><strong>AmneziaWG config</strong>Download configuration file</a>
@@ -4409,7 +4807,7 @@ create_subscription() {
   private_dir="${SUB_DIR}/${token}"
   install -d -m 0700 "${private_dir}"
 
-  write_portal_files "${name}" "${token}" "${trojan_link}" "${hysteria_link}" "${awg_file}"
+  write_portal_files "${name}" "${token}" "${trojan_file}" "${hysteria_file}" "${awg_file}"
 
   domain="$(domain_name)"
   base="https://${domain}/s/${token}"
@@ -4421,6 +4819,7 @@ create_subscription() {
     --arg token "${token}" \
     --arg created_at "${created_at}" \
     --arg portal "${base}" \
+    --arg hiddify_json "${base}/hiddify.json" \
     --arg sub_txt "${base}/sub.txt" \
     --arg sub_base64 "${base}/sub.base64" \
     --arg awg_conf "${base}/awg.conf" \
@@ -4436,12 +4835,13 @@ create_subscription() {
       status: "active",
       created_at: $created_at,
       labels: {trojan: $trojan_label, hysteria: $hysteria_label, awg: $awg_label},
-      urls: {portal: $portal, sub_txt: $sub_txt, sub_base64: $sub_base64, awg_conf: $awg_conf, awg_preview: $awg_preview}
+      urls: {portal: $portal, hiddify_json: $hiddify_json, sub_txt: $sub_txt, sub_base64: $sub_base64, awg_conf: $awg_conf, awg_preview: $awg_preview}
     }' >"${private_dir}/meta.json"
   chmod 0600 "${private_dir}/meta.json"
 
   printf '\nSubscription: %s\n' "${label}"
   printf 'Portal/import URL: %s\n' "${base}"
+  printf 'Hiddify JSON: %s/hiddify.json\n' "${base}"
   printf 'Plain payload: %s/sub.txt\n' "${base}"
   printf 'AmneziaWG config: %s/awg.conf\n' "${base}"
   print_qr "${base}"
@@ -4518,6 +4918,8 @@ revoke_subscription() {
   archive_file "${KEY_ROOT}/hysteria/${hysteria_label}-gecko.txt" "${KEY_ROOT}/hysteria/revoked"
   archive_file "${KEY_ROOT}/hysteria/${hysteria_label}-mimic.yaml" "${KEY_ROOT}/hysteria/revoked"
   archive_file "${KEY_ROOT}/awg/${awg_label}.conf" "${KEY_ROOT}/awg/revoked"
+  archive_file "${KEY_ROOT}/hiddify-json/trojan/${trojan_label}.json" "${KEY_ROOT}/hiddify-json/revoked"
+  archive_file "${KEY_ROOT}/hiddify-json/hysteria/${hysteria_label}.json" "${KEY_ROOT}/hiddify-json/revoked"
 
   archive_dir="${SUB_DIR}/revoked/$(date +%Y%m%d-%H%M%S)-${token}"
   install -d -m 0700 "$(dirname "${archive_dir}")"
@@ -4541,6 +4943,7 @@ show_subscription() {
     "Status: \(.status)",
     "Created: \(.created_at)",
     "Portal/import URL: \(.urls.portal)",
+    "Hiddify JSON: \(.urls.hiddify_json // \"not generated for this existing subscription\")",
     "Plain payload: \(.urls.sub_txt)",
     "Base64 payload: \(.urls.sub_base64)",
     "AmneziaWG config: \(.urls.awg_conf)",
@@ -5683,6 +6086,7 @@ Manage bundles:
 
 URL shape:
   https://DOMAIN/s/<token>
+  https://DOMAIN/s/<token>/hiddify.json
   https://DOMAIN/s/<token>/sub.txt
   https://DOMAIN/s/<token>/sub.base64
   https://DOMAIN/s/<token>/awg.conf
@@ -5895,6 +6299,7 @@ EOF
 install_helpers() {
   log "Installing helper commands."
   rm -f /usr/local/bin/vpn /usr/local/bin/vpn-vless /usr/local/bin/vpn-vless-xhttp /usr/local/bin/vpn-vless-reality
+  install_helper_hiddify_profile
   install_helper_trojan
   install_helper_hysteria
   install_helper_awg
@@ -5903,6 +6308,8 @@ install_helpers() {
   install_helper_cert_notify
   install_helper_help
   install_shell_startup_hook
+  [[ ! -d "${KEY_DIR}/trojan" ]] || "${HIDDIFY_PROFILE_HELPER_PATH}" bulk "${KEY_DIR}/trojan" >/dev/null
+  [[ ! -d "${KEY_DIR}/hysteria" ]] || "${HIDDIFY_PROFILE_HELPER_PATH}" bulk "${KEY_DIR}/hysteria" >/dev/null
 }
 
 configure_monitoring() {
@@ -6272,12 +6679,13 @@ for package in "${packages[@]}"; do
   [[ -n "${installed}" ]] || continue
   if ! (cd "${backup_dir}/debs" && apt-get download "${package}=${installed}" >/dev/null); then
     log "Update skipped: exact rollback package is unavailable for ${package}=${installed}."
-    exit 1
+    rm -rf -- "${backup_dir}"
+    exit 0
   fi
 done
 find "${backup_dir}/debs" -maxdepth 1 -type f -name '*.deb' -exec chmod 0600 {} +
 [[ "$(find "${backup_dir}/debs" -maxdepth 1 -type f -name '*.deb' | wc -l)" -ge 2 ]] \
-  || { log "Update skipped: exact rollback packages could not be saved."; exit 1; }
+  || { log "Update skipped: exact rollback packages could not be saved."; rm -rf -- "${backup_dir}"; exit 0; }
 
 rollback() {
   trap - ERR
@@ -6856,6 +7264,7 @@ Subscription bundles:
   Create: vpn-sub create phone1
   Show: vpn-sub show phone1
   Browser/import URL shape: https://${DOMAIN}/s/<token>
+  Hiddify JSON: https://${DOMAIN}/s/<token>/hiddify.json
   Plain payload: https://${DOMAIN}/s/<token>/sub.txt
   AmneziaWG download: https://${DOMAIN}/s/<token>/awg.conf
   Metadata root: ${SUBSCRIPTION_DIR}
@@ -6978,6 +7387,7 @@ generate_install_report() {
   "key_paths": {
     "trojan": $(json_escape "${KEY_DIR}/trojan"),
     "hysteria": $(json_escape "${KEY_DIR}/hysteria"),
+    "hiddify_json": $(json_escape "${KEY_DIR}/hiddify-json"),
     "awg": $(json_escape "${KEY_DIR}/awg")
   },
   "subscriptions": {
@@ -6985,7 +7395,7 @@ generate_install_report() {
     "metadata_root": $(json_escape "${SUBSCRIPTION_DIR}"),
     "public_root": $(json_escape "${SUBSCRIPTION_WEB_DIR}"),
     "url_shape": $(json_escape "https://${DOMAIN:-DOMAIN}/s/<token>"),
-    "payload": "sub.txt contains Trojan and Hysteria2 links; awg.conf is downloadable separately",
+    "payload": "hiddify.json is a Hiddify/Sing-box profile; sub.txt contains Trojan and Hysteria2 links; awg.conf is downloadable separately",
     "token_policy": "unguessable per-subscription tokens are never included in install reports"
   },
   "engine_updates": {
@@ -7348,6 +7758,7 @@ install_upgrade_helpers() {
   protocol="$(detect_installed_xray_protocol)"
   log "Installing profile-preserving helper updates."
 
+  install_helper_hiddify_profile
   [[ -s "${AWG_CONFIG}" ]] && install_helper_awg
   if [[ -s "${STACK_DIR}/hysteria-clients.json" ]]; then
     install_helper_hysteria
@@ -7365,6 +7776,8 @@ install_upgrade_helpers() {
 
   install_shell_startup_hook
   install_resume_status_helper
+  [[ ! -d "${KEY_DIR}/trojan" ]] || "${HIDDIFY_PROFILE_HELPER_PATH}" bulk "${KEY_DIR}/trojan" >/dev/null
+  [[ ! -d "${KEY_DIR}/hysteria" ]] || "${HIDDIFY_PROFILE_HELPER_PATH}" bulk "${KEY_DIR}/hysteria" >/dev/null
 }
 
 upgrade_hysteria_profiles() {
@@ -7454,6 +7867,7 @@ upgrade_hysteria_profiles() {
 
 apply_upgrade_overlay() {
   local backup_dir="$1"
+  configure_udp_buffers
   upgrade_hysteria_profiles "${backup_dir}"
   install_upgrade_helpers
 
@@ -8145,7 +8559,7 @@ write_awg_params_candidate() {
     printf 'AWG_EFFECTIVE_PROFILE=%q\n' "custom"
     printf 'AWG_TUNING_SOURCE=%q\n' "migration-preserved-server-obfuscation"
     printf 'AWG_MTU=%q\n' "${mtu}"
-    printf 'AWG_MTU_SOURCE=%q\n' "migration-tested-baseline"
+    printf 'AWG_MTU_SOURCE=%q\n' "migration-explicit"
     printf 'AWG_ENDPOINT_PORT=%q\n' "${endpoint_port}"
     printf 'AWG_DNS=%q\n' "${dns}"
     printf 'AWG_ALLOWED_IPS=%q\n' "${allowed}"
@@ -8174,7 +8588,7 @@ awg_mtu_migration_preflight() {
 }
 
 prepare_awg_mtu_migration() {
-  local mtu="${1:-1320}" stamp bundle values_json client candidate checksum_tmp first_client
+  local mtu="${1:-1420}" stamp bundle values_json client candidate checksum_tmp first_client
   awg_mtu_migration_preflight "${mtu}"
   values_json="$(awg_mtu_required_keys_json "${AWG_CONFIG}" "${mtu}")"
   install -d -m 0700 "${AWG_MTU_MIGRATION_ROOT}"
@@ -8301,7 +8715,7 @@ apply_awg_mtu_migration() {
   "requested_profile": "custom",
   "effective_profile": "custom",
   "mtu": ${mtu},
-  "mtu_source": "migration-tested-baseline",
+  "mtu_source": "migration-explicit",
   "params_path": $(json_escape "${STACK_DIR}/awg-params.env"),
   "note": "Existing server obfuscation J/S/H/I1-I5 was preserved and synchronized into saved client configs; credentials were not rotated."
 }
@@ -8386,6 +8800,7 @@ main() {
   configure_amneziawg
   progress "Configuring swap"
   configure_swap
+  configure_udp_buffers
   progress "Configuring firewall"
   configure_firewall
   progress "Installing VPN helper commands"

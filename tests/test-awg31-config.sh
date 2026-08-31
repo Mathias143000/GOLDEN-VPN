@@ -70,6 +70,18 @@ grep -Fq 'AWG_ENDPOINT_PORT is fixed at 443/udp' "${installer}"
 [[ "$(grep -Fc -- '--dport 443 -j REJECT --reject-with icmp-port-unreachable' "${installer}")" -eq 2 ]]
 grep -Fq 'AWG_ALLOWED_IPS:-0.0.0.0/0}' "${installer}"
 
+(
+  unset AWG_MTU
+  STACK_DIR="${tmp_dir}/default/opt/vpn-stack"
+  AWG_TUNING_REPORT="${STACK_DIR}/awg-tuning-report.json"
+  mkdir -p "${STACK_DIR}"
+  generate_awg_tuning
+  # shellcheck disable=SC1090,SC1091
+  source "${STACK_DIR}/awg-params.env"
+  [[ "${AWG_MTU}" == "1420" ]]
+  [[ "${AWG_MTU_SOURCE}" == "standard-maximum" ]]
+)
+
 cat >"${tmp_dir}/before.rules" <<'EOF_RULES'
 *filter
 :ufw-before-input - [0:0]

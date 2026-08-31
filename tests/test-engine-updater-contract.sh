@@ -26,6 +26,11 @@ grep -Fq 'profiles.tar.gz' "${tmp_dir}/awg-update"
 # shellcheck disable=SC2016
 grep -Fq '"${backup_dir}"/debs/*.deb' "${tmp_dir}/awg-update"
 grep -Fq -- '--allow-downgrades' "${tmp_dir}/awg-update"
+grep -Fq 'Update skipped: exact rollback package is unavailable' "${tmp_dir}/awg-update"
+grep -Fq 'Update skipped: exact rollback packages could not be saved.' "${tmp_dir}/awg-update"
+[[ "$(grep -Fc 'rm -rf -- "${backup_dir}"' "${tmp_dir}/awg-update")" -eq 2 ]]
+if grep -A2 -F 'Update skipped: exact rollback package is unavailable' "${tmp_dir}/awg-update" | grep -Fq 'exit 1'; then exit 1; fi
+if grep -F 'Update skipped: exact rollback packages could not be saved.' "${tmp_dir}/awg-update" | grep -Fq 'exit 1'; then exit 1; fi
 grep -Fq 'releases/latest' "${tmp_dir}/core-update"
 grep -Fq 'run -test -config' "${tmp_dir}/core-update"
 grep -Fq 'restoring previous Xray and Hysteria binaries' "${tmp_dir}/core-update"
